@@ -457,7 +457,7 @@ def _nearest_sister_pairs_for_level(
     return sorted(pairs)
 
 
-def build_duplication_sister_pairs(
+def build_fallback_sister_pairs(
     tree: Tree,
     reconciliation_events: Dict[str, str],
     min_clade_size: int = 5,
@@ -465,12 +465,12 @@ def build_duplication_sister_pairs(
     node_lookup = {node.name: node for node in tree.get_nonterminals() if node.name}
     duplication_pairs: List[Tuple[str, str, str]] = []
 
-    for duplication_node in tqdm(
-        sorted(node_name for node_name, event_type in reconciliation_events.items() if event_type == "Duplication"),
-        desc="Resolving duplication nodes",
+    for event_node in tqdm(
+        sorted(node_name for node_name, event_type in reconciliation_events.items() if event_type in ("Duplication", "Speciation", "Unknown")),
+        desc="Resolving event nodes",
         unit="node",
     ):
-        node = node_lookup.get(duplication_node)
+        node = node_lookup.get(event_node)
         if node is None or len(node.clades) != 2:
             continue
 
@@ -483,9 +483,184 @@ def build_duplication_sister_pairs(
         if len(left.get_terminals()) < min_clade_size or len(right.get_terminals()) < min_clade_size:
             continue
 
-        duplication_pairs.append((str(duplication_node), str(left_name), str(right_name)))
+        duplication_pairs.append((str(event_node), str(left_name), str(right_name)))
 
     return duplication_pairs
+
+
+def _ensure_node_names(tree: Tree, prefix: str = "InternalNode") -> None:
+    for idx, node in enumerate(tree.get_nonterminals(order="preorder"), start=1):
+        if not node.name:
+            node.name = f"{prefix}_{idx}"
+
+
+def _discover_layer_assignment_files(assignments_path: Path) -> List[Path]:
+    assignments_path = Path(assignments_path)
+    layer_files = sorted(assignments_path.parent.glob("tree_cluster_assignments_layer*.csv"))
+    if layer_files:
+        return layer_files
+    return [assignments_path]
+
+
+def _load_layer_assignments(layer_path: Path) -> Tuple[pd.DataFrame, int, float]:
+    df = pd.read_csv(layer_path)
+    if {"sequence_id", "cluster_id"}.issubset(df.columns):
+        layer_df = df[["sequence_id", "cluster_id"]].copy()
+        layer_df["cluster_id"] = pd.to_numeric(layer_df["cluster_id"], errors="coerce")
+        layer_df = layer_df.dropna(subset=["cluster_id"])
+        layer_df["cluster_id"] = layer_df["cluster_id"].astype(int)
+        layer_df["sequence_id"] = layer_df["sequence_id"].astype(str)
+        layer_index = int(df["layer_index"].iloc[0]) if "layer_index" in df.columns and not df.empty else 1
+        threshold = float(df["threshold"].iloc[0]) if "threshold" in df.columns and not df.empty else float("nan")
+        return layer_df, layer_index, threshold
+
+    if "sequence_id" not in df.columns:
+        raise ValueError(f"Missing sequence_id column in assignments file: {layer_path}")
+
+    for id_col in ("subfamily_id", "family_id", "group_id"):
+        if id_col in df.columns:
+            temp = df[["sequence_id", id_col]].copy()
+            temp["cluster_id"] = pd.to_numeric(temp[id_col], errors="coerce")
+            temp = temp.dropna(subset=["cluster_id"]) [["sequence_id", "cluster_id"]]
+            if temp.empty:
+                continue
+            temp["cluster_id"] = temp["cluster_id"].astype(int)
+            temp["sequence_id"] = temp["sequence_id"].astype(str)
+            return temp, 1, float("nan")
+
+    raise ValueError(f"No usable cluster_id columns found in assignments file: {layer_path}")
+
+
+def _normalize_event_type(event_value: Optional[str]) -> str:
+    label = str(event_value).strip().lower() if event_value is not None else ""
+    if label == "duplication":
+        return "Duplication"
+    if label == "speciation":
+        return "Speciation"
+    return "Unknown"
+
+
+def _build_layer_sister_pairs(
+    layer_assignments: pd.DataFrame,
+    topology_tree: Tree,
+    asr_tree: Tree,
+    reconciliation_events: Dict[str, str],
+    min_clade_size: int,
+) -> List[Dict[str, object]]:
+    topology_leaves = {leaf.name for leaf in topology_tree.get_terminals() if leaf.name}
+    asr_leaves = {leaf.name for leaf in asr_tree.get_terminals() if leaf.name}
+
+    grouped = layer_assignments.groupby("cluster_id")["sequence_id"].apply(list)
+    members_by_cluster: Dict[int, List[str]] = {}
+    for cluster_id, members in grouped.items():
+        present = [m for m in members if m in topology_leaves and m in asr_leaves]
+        if len(present) >= min_clade_size:
+            members_by_cluster[int(cluster_id)] = sorted(set(present))
+
+    if len(members_by_cluster) < 2:
+        return []
+
+    cluster_topology_lca: Dict[int, Clade] = {}
+    cluster_asr_lca_name: Dict[int, str] = {}
+    for cluster_id, members in members_by_cluster.items():
+        topo_lca = topology_tree.common_ancestor(members)
+        asr_lca = asr_tree.common_ancestor(members)
+        if not asr_lca.name:
+            continue
+        cluster_topology_lca[cluster_id] = topo_lca
+        cluster_asr_lca_name[cluster_id] = str(asr_lca.name)
+
+    if len(cluster_topology_lca) < 2:
+        return []
+
+    asr_sig_to_name = {signature: node_name for node_name, signature in _build_named_node_signatures(asr_tree).items()}
+
+    leaf_to_cluster: Dict[str, int] = {}
+    for cluster_id, members in members_by_cluster.items():
+        for member in members:
+            leaf_to_cluster[member] = cluster_id
+
+    asr_node_lookup = {n.name: n for n in asr_tree.get_nonterminals() if n.name}
+    for leaf in asr_tree.get_terminals():
+        if getattr(leaf, "name", None):
+            asr_node_lookup[leaf.name] = leaf
+
+    topology_depths = topology_tree.depths()
+    asr_depths = asr_tree.depths()
+
+    seen_pairs = set()
+    sister_rows: List[Dict[str, object]] = []
+    for parent in topology_tree.get_nonterminals(order="postorder"):
+        if len(parent.clades) != 2:
+            continue
+
+        child_cluster_ids: List[int] = []
+        valid_parent = True
+        for child in parent.clades:
+            child_member_ids = {
+                leaf_to_cluster[leaf.name]
+                for leaf in child.get_terminals()
+                if leaf.name in leaf_to_cluster
+            }
+            if len(child_member_ids) != 1:
+                valid_parent = False
+                break
+            child_cluster_ids.append(next(iter(child_member_ids)))
+
+        if not valid_parent or child_cluster_ids[0] == child_cluster_ids[1]:
+            continue
+
+        left_cluster, right_cluster = child_cluster_ids
+        if left_cluster not in cluster_topology_lca or right_cluster not in cluster_topology_lca:
+            continue
+
+        pair_key = tuple(sorted((left_cluster, right_cluster)))
+        if pair_key in seen_pairs:
+            continue
+        seen_pairs.add(pair_key)
+
+        parent_name = str(parent.name) if parent.name else ""
+        parent_signature = _leaf_signature(parent)
+        source_parent_name = asr_sig_to_name.get(parent_signature, parent_name)
+        event_type = _normalize_event_type(reconciliation_events.get(source_parent_name, reconciliation_events.get(parent_name)))
+
+        asr_parent = asr_node_lookup.get(source_parent_name)
+        asr_left = asr_node_lookup.get(cluster_asr_lca_name[left_cluster])
+        asr_right = asr_node_lookup.get(cluster_asr_lca_name[right_cluster])
+        
+        if asr_parent and asr_left and asr_right:
+            left_distance = float(asr_depths.get(asr_left, 0.0) - asr_depths.get(asr_parent, 0.0))
+            right_distance = float(asr_depths.get(asr_right, 0.0) - asr_depths.get(asr_parent, 0.0))
+        else:
+            left_distance = float(topology_depths.get(cluster_topology_lca[left_cluster], 0.0) - topology_depths.get(parent, 0.0))
+            right_distance = float(topology_depths.get(cluster_topology_lca[right_cluster], 0.0) - topology_depths.get(parent, 0.0))
+
+        if left_distance <= right_distance:
+            ldo_cluster, mdo_cluster = left_cluster, right_cluster
+        else:
+            ldo_cluster, mdo_cluster = right_cluster, left_cluster
+
+        sister_rows.append(
+            {
+                "parent_node": parent_name,
+                "source_parent_node": source_parent_name,
+                "event_type": event_type,
+                "left_cluster": int(left_cluster),
+                "right_cluster": int(right_cluster),
+                "left_lca": cluster_asr_lca_name[left_cluster],
+                "right_lca": cluster_asr_lca_name[right_cluster],
+                "left_branch_length": float(left_distance),
+                "right_branch_length": float(right_distance),
+                "ldo_cluster": int(ldo_cluster),
+                "mdo_cluster": int(mdo_cluster),
+                "ldo_lca": cluster_asr_lca_name[ldo_cluster],
+                "mdo_lca": cluster_asr_lca_name[mdo_cluster],
+                "left_members": members_by_cluster[left_cluster],
+                "right_members": members_by_cluster[right_cluster],
+            }
+        )
+
+    return sister_rows
 
 
 def compute_multilevel_badasp_scores(
@@ -501,12 +676,14 @@ def compute_multilevel_badasp_scores(
     ancestral_seqs = {rec.id: str(rec.seq) for rec in SeqIO.parse(ancestral_path, "fasta")}
     state_data = load_state_file(state_path)
     topology_tree = Phylo.read(str(tree_path), "newick")
+    _ensure_node_names(topology_tree)
     reconciliation_events = load_reconciliation_events(reconciliation_csv)
 
     asr_tree = topology_tree
     asr_tree_path = Path(state_path).with_suffix(".treefile")
     if asr_tree_path.exists():
         asr_tree = Phylo.read(str(asr_tree_path), "newick")
+    _ensure_node_names(asr_tree, prefix="ASRNode")
 
     if reconciliation_events:
         asr_node_names = {node.name for node in asr_tree.get_nonterminals() if node.name}
@@ -518,26 +695,16 @@ def compute_multilevel_badasp_scores(
             )
             reconciliation_events = {**reconciliation_events, **remapped_reconciliation_events}
 
-    duplication_pairs = build_duplication_sister_pairs(asr_tree, reconciliation_events, min_clade_size=min_clade_size)
-    node_lookup = {node.name: node for node in asr_tree.get_nonterminals() if node.name}
+    layer_files = _discover_layer_assignment_files(assignments_path)
     seq_dict = {record.id: str(record.seq) for record in alignment}
     aln_length = alignment.get_alignment_length()
 
-    pairwise_columns = ["duplication_node", "left_child", "right_child", "pair", "position", "rc", "ac", "p_ac", "score"]
-    pair_col: List[str] = []
-    dup_node_col: List[str] = []
-    left_col: List[str] = []
-    right_col: List[str] = []
-    pos_col: List[int] = []
-    rc_col: List[float] = []
-    ac_col: List[float] = []
-    p_ac_col: List[float] = []
-    score_col: List[float] = []
-    position_max_scores = np.full(aln_length, -np.inf, dtype=float)
+    pairwise_rows: List[Dict[str, object]] = []
     rc_cache: Dict[Tuple[str, int], float] = {}
     posterior_cache: Dict[Tuple[str, int, str], float] = {}
-    skipped_missing_nodes = 0
     reconstructed_sequences: Dict[str, str] = {}
+    skipped_missing_nodes = 0
+    layer_summaries: List[Dict[str, object]] = []
 
     def _ancestral_sequence(node_name: str) -> Optional[str]:
         if node_name in ancestral_seqs:
@@ -558,93 +725,204 @@ def compute_multilevel_badasp_scores(
             posterior_cache[key] = extract_posterior_probability(state_data, node, site, aa)
         return posterior_cache[key]
 
-    for duplication_node, left_name, right_name in tqdm(duplication_pairs, desc="Scoring duplication pairs", unit="pair"):
-        left_node = node_lookup.get(left_name)
-        right_node = node_lookup.get(right_name)
-        if left_node is None or right_node is None:
-            skipped_missing_nodes += 1
+    fallback_done = False
+    for layer_file in layer_files:
+        try:
+            layer_df, layer_index, layer_threshold = _load_layer_assignments(layer_file)
+            sister_pairs = _build_layer_sister_pairs(
+                layer_assignments=layer_df,
+                topology_tree=topology_tree,
+                asr_tree=asr_tree,
+                reconciliation_events=reconciliation_events,
+                min_clade_size=min_clade_size,
+            )
+        except ValueError as err:
+            if "No usable cluster_id columns" not in str(err) or fallback_done:
+                raise
+
+            node_lookup = {node.name: node for node in asr_tree.get_nonterminals() if node.name}
+            sister_pairs = []
+            asr_depths_fallback = asr_tree.depths()
+            for duplication_node, left_name, right_name in build_fallback_sister_pairs(
+                asr_tree,
+                reconciliation_events,
+                min_clade_size=min_clade_size,
+            ):
+                parent = node_lookup.get(duplication_node)
+                left_node = node_lookup.get(left_name)
+                right_node = node_lookup.get(right_name)
+                if parent is None or left_node is None or right_node is None:
+                    continue
+                left_members = [leaf.name for leaf in left_node.get_terminals() if leaf.name]
+                right_members = [leaf.name for leaf in right_node.get_terminals() if leaf.name]
+                left_distance = float(asr_depths_fallback.get(left_node, 0.0) - asr_depths_fallback.get(parent, 0.0))
+                right_distance = float(asr_depths_fallback.get(right_node, 0.0) - asr_depths_fallback.get(parent, 0.0))
+                if left_distance <= right_distance:
+                    ldo_cluster, mdo_cluster = 1, 2
+                    ldo_lca, mdo_lca = left_name, right_name
+                else:
+                    ldo_cluster, mdo_cluster = 2, 1
+                    ldo_lca, mdo_lca = right_name, left_name
+
+                sister_pairs.append(
+                    {
+                        "parent_node": str(duplication_node),
+                        "source_parent_node": str(duplication_node),
+                        "event_type": _normalize_event_type(reconciliation_events.get(duplication_node)),
+                        "left_cluster": 1,
+                        "right_cluster": 2,
+                        "left_lca": str(left_name),
+                        "right_lca": str(right_name),
+                        "left_branch_length": left_distance,
+                        "right_branch_length": right_distance,
+                        "ldo_cluster": int(ldo_cluster),
+                        "mdo_cluster": int(mdo_cluster),
+                        "ldo_lca": str(ldo_lca),
+                        "mdo_lca": str(mdo_lca),
+                        "left_members": left_members,
+                        "right_members": right_members,
+                    }
+                )
+
+            layer_index = 1
+            layer_threshold = float("nan")
+            fallback_done = True
+
+        if not sister_pairs:
             continue
 
-        left_sequence = _ancestral_sequence(left_name)
-        right_sequence = _ancestral_sequence(right_name)
-        missing_nodes = [node for node, sequence in ((left_name, left_sequence), (right_name, right_sequence)) if not sequence]
-        if missing_nodes:
-            skipped_missing_nodes += 1
-            continue
+        scored_pairs = 0
+        for pair_meta in tqdm(sister_pairs, desc=f"Scoring layer {layer_index}", unit="pair"):
+            left_name = str(pair_meta["left_lca"])
+            right_name = str(pair_meta["right_lca"])
 
-        left_sequences = [seq_dict[leaf.name] for leaf in left_node.get_terminals() if leaf.name in seq_dict]
-        right_sequences = [seq_dict[leaf.name] for leaf in right_node.get_terminals() if leaf.name in seq_dict]
-        if not left_sequences or not right_sequences:
-            skipped_missing_nodes += 1
-            continue
-
-        for pos in range(aln_length):
-            if pos >= len(left_sequence) or pos >= len(right_sequence):
+            left_sequence = _ancestral_sequence(left_name)
+            right_sequence = _ancestral_sequence(right_name)
+            if not left_sequence or not right_sequence:
+                skipped_missing_nodes += 1
                 continue
 
-            aa_left = left_sequence[pos]
-            aa_right = right_sequence[pos]
-            if aa_left in {"-", "."} or aa_right in {"-", "."}:
+            left_sequences = [seq_dict[sid] for sid in pair_meta["left_members"] if sid in seq_dict]
+            right_sequences = [seq_dict[sid] for sid in pair_meta["right_members"] if sid in seq_dict]
+            if not left_sequences or not right_sequences:
+                skipped_missing_nodes += 1
                 continue
 
-            rc_left = _rc(left_name, pos, left_sequences)
-            rc_right = _rc(right_name, pos, right_sequences)
-            rc = (rc_left + rc_right) / 2.0
-            ac = calculate_ancestral_conservation(aa_left, aa_right)
-            p_left = _posterior(left_name, pos + 1, aa_left)
-            p_right = _posterior(right_name, pos + 1, aa_right)
-            p_ac = (p_left + p_right) / 2.0
-            score = rc - (ac * p_ac)
+            scored_pairs += 1
+            for pos in range(aln_length):
+                if pos >= len(left_sequence) or pos >= len(right_sequence):
+                    continue
 
-            site = pos + 1
-            dup_node_col.append(duplication_node)
-            left_col.append(left_name)
-            right_col.append(right_name)
-            pair_col.append(f"{left_name}-{right_name}")
-            pos_col.append(site)
-            rc_col.append(rc)
-            ac_col.append(ac)
-            p_ac_col.append(p_ac)
-            score_col.append(score)
-            if score > position_max_scores[pos]:
-                position_max_scores[pos] = score
+                aa_left = left_sequence[pos]
+                aa_right = right_sequence[pos]
+                if aa_left in {"-", "."} or aa_right in {"-", "."}:
+                    continue
 
-    pairwise_df = pd.DataFrame(
-        {
-            "duplication_node": dup_node_col,
-            "left_child": left_col,
-            "right_child": right_col,
-            "pair": pair_col,
-            "position": pos_col,
-            "rc": rc_col,
-            "ac": ac_col,
-            "p_ac": p_ac_col,
-            "score": score_col,
-        },
-        columns=pairwise_columns,
-    )
+                rc_left = _rc(left_name, pos, left_sequences)
+                rc_right = _rc(right_name, pos, right_sequences)
+                rc = (rc_left + rc_right) / 2.0
+                ac = calculate_ancestral_conservation(aa_left, aa_right)
+                p_left = _posterior(left_name, pos + 1, aa_left)
+                p_right = _posterior(right_name, pos + 1, aa_right)
+                p_ac = (p_left + p_right) / 2.0
+                score = rc - (ac * p_ac)
+
+                pairwise_rows.append(
+                    {
+                        "layer_index": int(layer_index),
+                        "layer_threshold": float(layer_threshold),
+                        "duplication_node": str(pair_meta["source_parent_node"]),
+                        "lca_node_name": str(pair_meta["parent_node"]),
+                        "left_child": left_name,
+                        "right_child": right_name,
+                        "pair": f"{left_name}-{right_name}",
+                        "position": int(pos + 1),
+                        "rc": float(rc),
+                        "ac": float(ac),
+                        "p_ac": float(p_ac),
+                        "score": float(score),
+                        "Event_Type": str(pair_meta["event_type"]),
+                        "branch_len_left": float(pair_meta["left_branch_length"]),
+                        "branch_len_right": float(pair_meta["right_branch_length"]),
+                        "LDO_Cluster_ID": int(pair_meta["ldo_cluster"]),
+                        "MDO_Cluster_ID": int(pair_meta["mdo_cluster"]),
+                        "LDO_Node": str(pair_meta["ldo_lca"]),
+                        "MDO_Node": str(pair_meta["mdo_lca"]),
+                        "LDO_Label": str(pair_meta["ldo_lca"]),
+                        "MDO_Label": str(pair_meta["mdo_lca"]),
+                    }
+                )
+
+        layer_summaries.append(
+            {
+                "layer_index": int(layer_index),
+                "layer_threshold": float(layer_threshold),
+                "candidate_pairs": int(len(sister_pairs)),
+                "scored_pairs": int(scored_pairs),
+            }
+        )
+
+    pairwise_df = pd.DataFrame(pairwise_rows)
+    if pairwise_df.empty:
+        pairwise_df = pd.DataFrame(
+            columns=[
+                "layer_index",
+                "layer_threshold",
+                "duplication_node",
+                "lca_node_name",
+                "left_child",
+                "right_child",
+                "pair",
+                "position",
+                "rc",
+                "ac",
+                "p_ac",
+                "score",
+                "Event_Type",
+                "branch_len_left",
+                "branch_len_right",
+                "LDO_Cluster_ID",
+                "MDO_Cluster_ID",
+                "LDO_Node",
+                "MDO_Node",
+                "LDO_Label",
+                "MDO_Label",
+            ]
+        )
 
     score_df, sdp_df, threshold = summarize_duplication_outputs(pairwise_df=pairwise_df, aln_length=aln_length)
 
-    if score_col:
-        max_idx = int(np.argmax(score_col))
-        print(
-            f"[DUPLICATIONS] Max Pos: Pos={pos_col[max_idx]}, RC={rc_col[max_idx]:.6f}, AC={ac_col[max_idx]:.6f}, p={p_ac_col[max_idx]:.6f}, Score={score_col[max_idx]:.6f}"
-        )
-        print(f"[DUPLICATIONS] Global pooled threshold (95th percentile over all valid scores): {threshold:.6f}")
-    if skipped_missing_nodes:
-        print(f"[DUPLICATIONS] Skipped {skipped_missing_nodes} duplication pairs due to missing child nodes or ancestral sequences.")
+    per_layer_scores: Dict[int, Dict[str, Dict[str, object]]] = {}
+    for layer_index, layer_group in pairwise_df.groupby("layer_index"):
+        layer_dict = {}
+        # Combined
+        c_score, c_sdp, c_thresh = summarize_duplication_outputs(layer_group, aln_length)
+        layer_dict["combined"] = {"scores": c_score, "sdps": c_sdp, "threshold": c_thresh, "pairwise": layer_group.copy()}
+        
+        # Duplications
+        dup_group = layer_group[layer_group["Event_Type"].str.lower() == "duplication"]
+        d_score, d_sdp, d_thresh = summarize_duplication_outputs(dup_group, aln_length)
+        layer_dict["duplications"] = {"scores": d_score, "sdps": d_sdp, "threshold": d_thresh, "pairwise": dup_group.copy()}
+
+        # Speciations
+        spec_group = layer_group[layer_group["Event_Type"].str.lower() == "speciation"]
+        s_score, s_sdp, s_thresh = summarize_duplication_outputs(spec_group, aln_length)
+        layer_dict["speciations"] = {"scores": s_score, "sdps": s_sdp, "threshold": s_thresh, "pairwise": spec_group.copy()}
+
+        per_layer_scores[int(layer_index)] = layer_dict
 
     return {
-        "duplications": {
+        "combined": {
             "pairwise": pairwise_df,
             "scores": score_df,
             "sdps": sdp_df,
             "threshold": threshold,
-            "pairs": duplication_pairs,
+            "pairs": [(row["left_child"], row["right_child"]) for _, row in pairwise_df[["left_child", "right_child"]].drop_duplicates().iterrows()],
             "filtered_pairs": skipped_missing_nodes,
             "filtered_speciation_pairs": 0,
-            "candidate_pairs": len(duplication_pairs),
+            "candidate_pairs": int(sum(item["candidate_pairs"] for item in layer_summaries)),
+            "layer_scores": per_layer_scores,
+            "layer_summary": pd.DataFrame(layer_summaries),
         }
     }
 
@@ -768,14 +1046,30 @@ class BADASPCore:
         output_dir.mkdir(parents=True, exist_ok=True)
         if self.results is None:
             raise ValueError("Run compute_scores() first")
-        payload = self.results.get("duplications")
+        payload = self.results.get("combined")
         if payload is None:
-            raise KeyError("Missing duplications payload in BADASP results")
+            raise KeyError("Missing combined payload in BADASP results")
 
-        payload["scores"].to_csv(output_dir / "badasp_scores_duplications.csv", index=False)
+        payload["scores"].to_csv(output_dir / "badasp_scores.csv", index=False)
         if payload["sdps"] is not None:
-            payload["sdps"].to_csv(output_dir / "badasp_sdps_duplications.csv", index=False)
-        payload["pairwise"].to_csv(output_dir / "raw_pairwise_duplications.csv", index=False)
+            payload["sdps"].to_csv(output_dir / "badasp_sdps.csv", index=False)
+        payload["pairwise"].to_csv(output_dir / "raw_pairwise.csv", index=False)
+
+        layer_scores = payload.get("layer_scores", {})
+        for layer_index, layer_payloads in sorted(layer_scores.items(), key=lambda item: int(item[0])):
+            layer_tag = f"layer{int(layer_index):02d}"
+            
+            for track_name, track_payload in layer_payloads.items():
+                track_suffix = f"_{layer_tag}_{track_name}" if track_name != "combined" else f"_{layer_tag}"
+                
+                track_payload["pairwise"].to_csv(output_dir / f"raw_pairwise{track_suffix}.csv", index=False)
+                track_payload["scores"].to_csv(output_dir / f"badasp_scores{track_suffix}.csv", index=False)
+                if track_payload["sdps"] is not None:
+                    track_payload["sdps"].to_csv(output_dir / f"badasp_sdps{track_suffix}.csv", index=False)
+
+        layer_summary = payload.get("layer_summary")
+        if isinstance(layer_summary, pd.DataFrame) and not layer_summary.empty:
+            layer_summary.to_csv(output_dir / "badasp_layer_summary.csv", index=False)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -807,11 +1101,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     core.save_results(Path(args.output_dir))
 
     if core.results is not None:
-        payload = core.results.get("duplications", {})
+        payload = core.results.get("combined", {})
         kept_pairs = len(payload.get("pairs", []))
         filtered_pairs = int(payload.get("filtered_pairs", 0))
         threshold = float(payload.get("threshold", 0.0))
-        print(f"Scored {kept_pairs} duplication pairs and filtered {filtered_pairs} candidates.")
+        print(f"Scored {kept_pairs} dual-track pairs and filtered {filtered_pairs} candidates.")
         print(f"Global SDP threshold: {threshold:.6f}")
 
 

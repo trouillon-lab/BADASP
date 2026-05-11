@@ -6,6 +6,14 @@
 - Current date: 2026-04-27
 - Status: Duplication-directed Phase 5 scoring is synced to the corrected pooled-threshold math; downstream architecture now uses left-vs-right clade pairs instead of Group/Family/Subfamily hierarchy
 
+## Multi-Threshold Dual-Track Architecture Checkpoint (Current)
+- Replaced the O(N^2) SciPy linkage clustering approach with an O(N) fast tree traversal slicing method in Phase 3 (`tree_cluster.py`) to resolve memory bottleneck hangs.
+- Implemented the `--multi-layer <int>` CLI parameter for fast traversal (currently using 10 layers spaced evenly across tree depth).
+- Upgraded Phase 5 (`badasp_core.py`) to aggregate a Dual-Track scoring system encompassing both "Duplication" and "Speciation" events (`combined`, `duplications`, and `speciations` tracks).
+- Added LDO (Least Diverged Ortholog) and MDO (Most Diverged Ortholog) asymmetric branch tagging to Phase 5 outputs, computing distances utilizing ASR-resolved LCA node logic.
+- Configured the downstream script `pdb_mapper.py` to seamlessly parse all `badasp_sdps_layer*.csv` outputs into discrete ChimeraX coloring scripts, maintaining functional track distinctions.
+- Transitioned `evolutionary_analysis.py` to ingest dynamic multi-layer artifacts and merged `raw_pairwise.csv` + `badasp_scores.csv` instead of legacy 3-tier hierarchy outputs.
+
 ## Latest Run Status (2026-04-22)
 - Phase 5 regeneration completed with the corrected raw-pairwise pooled threshold and refreshed duplication outputs.
 - Phase 6 ChimeraX export regenerated with valid standalone provenance comments above each `color` command.

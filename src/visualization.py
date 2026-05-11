@@ -352,12 +352,51 @@ def plot_hierarchical_switch_counts(
 
 
 def plot_duplication_badasp_distribution(raw_pairwise_path: Path, output_svg: Path) -> None:
-    plot_badasp_score_distribution(
-        raw_pairwise_path=raw_pairwise_path,
-        output_svg=output_svg,
-        title="Duplication-Directed BADASP Score Distribution",
-        color="#B24A2A",
-    )
+    df = _load_pairwise_table(raw_pairwise_path)
+    output_svg.parent.mkdir(parents=True, exist_ok=True)
+
+    if "Event_Type" not in df.columns or df["Event_Type"].dropna().nunique() <= 1:
+        plot_badasp_score_distribution(
+            raw_pairwise_path=raw_pairwise_path,
+            output_svg=output_svg,
+            title="Dual-Track BADASP Score Distribution",
+            color="#B24A2A",
+        )
+        return
+
+    event_palette = {
+        "Duplication": "#B24A2A",
+        "Speciation": "#2A6FB2",
+        "Unknown": "#7A7A7A",
+    }
+    scores = pd.to_numeric(df["score"], errors="coerce")
+    threshold = _compute_95th_threshold(scores.to_numpy(dtype=float))
+
+    plt.figure(figsize=(10, 6))
+    for event_type, group in df.groupby("Event_Type"):
+        event_scores = pd.to_numeric(group["score"], errors="coerce")
+        event_scores = event_scores[np.isfinite(event_scores)]
+        if event_scores.empty:
+            continue
+        sns.histplot(
+            event_scores,
+            bins=40,
+            stat="count",
+            element="step",
+            fill=False,
+            color=event_palette.get(str(event_type), "#7A7A7A"),
+            linewidth=1.8,
+            label=str(event_type),
+        )
+
+    plt.axvline(threshold, color="#333333", linestyle="--", linewidth=1.6, label=f"95th percentile = {threshold:.6f}")
+    plt.title("Dual-Track BADASP Score Distribution")
+    plt.xlabel("Raw BADASP Score")
+    plt.ylabel("Count")
+    plt.legend(frameon=False)
+    plt.tight_layout()
+    plt.savefig(output_svg, format="svg")
+    plt.close()
 
 
 def plot_duplication_switch_counts(raw_pairwise_path: Path, output_svg: Path, percentile: float = 95.0) -> None:
@@ -371,6 +410,7 @@ def plot_duplication_switch_counts(raw_pairwise_path: Path, output_svg: Path, pe
         switch_counts = np.array([], dtype=int)
         top_col = 0
         top_count = 0
+        grouped = pd.DataFrame(columns=["position", "Event_Type", "switch_count"])
     else:
         switch_df = switched.groupby("position", as_index=False).size().rename(columns={"size": "switch_count"})
         switch_df = switch_df.sort_values(["position"]).copy()
@@ -379,14 +419,40 @@ def plot_duplication_switch_counts(raw_pairwise_path: Path, output_svg: Path, pe
         top_row = switch_df.sort_values(["switch_count", "position"], ascending=[False, True]).head(1)
         top_col = int(top_row.iloc[0]["position"]) if not top_row.empty else 0
         top_count = int(top_row.iloc[0]["switch_count"]) if not top_row.empty else 0
+        if "Event_Type" in switched.columns:
+            grouped = (
+                switched.groupby(["position", "Event_Type"], as_index=False)
+                .size()
+                .rename(columns={"size": "switch_count"})
+            )
+        else:
+            grouped = pd.DataFrame(columns=["position", "Event_Type", "switch_count"])
 
     output_svg.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(14, 4))
     if len(positions):
-        ax.bar(positions, switch_counts, color="#B24A2A", width=1.0, alpha=0.9)
+        if not grouped.empty and grouped["Event_Type"].nunique() > 1:
+            palette = {"Duplication": "#B24A2A", "Speciation": "#2A6FB2", "Unknown": "#7A7A7A"}
+            pivoted = grouped.pivot(index="position", columns="Event_Type", values="switch_count").fillna(0.0)
+            bottom = np.zeros(len(pivoted.index), dtype=float)
+            for event_type in sorted(pivoted.columns):
+                values = pivoted[event_type].to_numpy(dtype=float)
+                ax.bar(
+                    pivoted.index.to_numpy(dtype=int),
+                    values,
+                    bottom=bottom,
+                    width=1.0,
+                    alpha=0.9,
+                    color=palette.get(str(event_type), "#7A7A7A"),
+                    label=str(event_type),
+                )
+                bottom += values
+            ax.legend(frameon=False)
+        else:
+            ax.bar(positions, switch_counts, color="#B24A2A", width=1.0, alpha=0.9)
     ax.set_xlabel("Alignment Column Index")
     ax.set_ylabel("Switches")
-    ax.set_title("Duplication-Directed BADASP Switch Counts")
+    ax.set_title("Dual-Track BADASP Switch Counts")
     if len(positions):
         ax.set_xlim(1, int(positions.max()))
         ax.set_ylim(0, max(1, int(switch_counts.max())) + 1)
@@ -945,7 +1011,7 @@ def main() -> None:
     parser.add_argument("--length-output", default=str(default_length_out))
     parser.add_argument("--msa", default=None, help="Input MSA FASTA for gap-per-column plot.")
     parser.add_argument("--gap-output", default=str(default_gap_out))
-    parser.add_argument("--duplication-pairwise", default="results/badasp_scoring/raw_pairwise_duplications.csv")
+    parser.add_argument("--duplication-pairwise", default="results/badasp_scoring/raw_pairwise.csv")
     parser.add_argument("--rooted-tree", default="results/topological_clustering/mad_rooted.tree")
     parser.add_argument("--duplication-distribution-output", default=str(default_dup_dist_out))
     parser.add_argument("--duplication-switch-output", default=str(default_dup_switch_out))

@@ -8,7 +8,7 @@ This repository implements a reproducible BADASP-inspired computational pipeline
 - **Phase 2 (Alignment & Phylogeny)**: ✓ Complete — CD-HIT (default 0.80), FAMSA/MAFFT, trimAl, native OpenMP FastTreeMP
 - **Phase 3 (Topological Subfamily Clustering)**: ✓ Complete — archival support only; downstream scoring now uses duplication-directed clade pairs
 - **Phase 4 (Ancestral Sequence Reconstruction)**: ✓ Complete — single-pass global IQ-TREE2 ASR with hierarchical LCA extraction
-- **Phase 5 (Restricted BADASP Scoring)**: ✓ Complete — Duplication-directed left-vs-right clade scoring, pooled SDP thresholding
+- **Phase 5 (Restricted BADASP Scoring)**: ✓ Complete — Dual-Track (Duplications & Speciations) scoring, LDO/MDO asymmetric branch tagging, multi-layer evaluation
 - **Phase 6 (Structural Mapping)**: ✓ Complete — PyMOL/ChimeraX script generation, sequence-to-structure alignment mapping
 - **Phase 7 (Evolutionary & Physicochemical Analysis)**: ✓ Complete — Evolutionary timeline, structural clustering, co-evolution networks, multi-level synthesis
 - **Phase 7b (Advanced Synthesis)**: ✓ Complete — Architectural domain mapping, community extraction, taxonomic distribution
@@ -27,19 +27,18 @@ This repository implements a reproducible BADASP-inspired computational pipeline
 
 ### Phase 3: Topological Subfamily Clustering
 6. Root tree with the canonical MAD Python implementation (`venv/bin/mad.py`); if unavailable, fall back to midpoint rooting.
-7. Cut hierarchy into monophyletic clades by cophenetic-distance threshold (adaptive search).
-8. Retain clades ≥5 sequences (3-level hierarchy: Groups, Families, Subfamilies).
-  - Filtering is applied independently per hierarchy level (group/family/subfamily), not as a cross-level intersection.
-9. Identify and extract clade Last Common Ancestors (LCAs).
+7. Perform high-efficiency O(N) tree slicing via `--multi-layer <int>` (bypassing legacy memory-intensive SciPy linkage).
+8. Cut the tree evenly into N discrete topological layers.
+9. Retain clades ≥5 sequences per layer.
+10. Identify and extract clade Last Common Ancestors (LCAs).
 
-### Phase 4-5: Ancestral Reconstruction & Scoring
-10. Run IQ-TREE2 ASR once on the full alignment/tree (`-asr -T AUTO`) to infer ancestral amino acid sequences, then wait for the single global `.state` file and parse it into per-node sequences.
-11. Map hierarchical LCA nodes from the clustering assignments onto the ASR tree and extract the corresponding ancestral sequences from the master reconstruction.
-12. Compute restricted BADASP scores for left-vs-right clades of high-confidence duplication nodes.
-13. Score formula: `RC - (AC * p(AC))` where RC=conservation, AC=ancestral call, p(AC)=posterior probability.
-14. Calculate 95th percentile threshold on raw pairwise scores; identify Specificity Determining Positions (SDPs).
-15. Generate dendrogram switch-event overlays and hierarchical score distributions.
-  - Dendrogram circle sizes reflect aggregated threshold-exceeding pairwise switch events at each LCA node; the per-position `switch_count` tables remain the source for summary statistics.
+### Phase 4-5: Ancestral Reconstruction & Dual-Track Scoring
+11. Run IQ-TREE2 ASR once on the full alignment/tree (`-asr -T AUTO`) to infer ancestral amino acid sequences.
+12. Map dynamic layer LCA nodes onto the ASR tree to extract the corresponding ancestral sequences from the global reconstruction.
+13. Compute Dual-Track BADASP scores across both "Duplication" and "Speciation" events, analyzing left-vs-right clades at each threshold layer.
+14. Assign LDO (Least Diverged Ortholog) and MDO (Most Diverged Ortholog) asymmetric branches utilizing direct ASR-resolved node distances.
+15. Score formula: `RC - (AC * p(AC))` where RC=conservation, AC=ancestral call, p(AC)=posterior probability.
+16. Calculate 95th percentile threshold on raw pairwise scores across tracks; identify Specificity Determining Positions (SDPs).
 
 ### Reconciliation Refinement: Cluster-Expanded Fuzzy Logic
 The reconciliation stage expands each tree leaf (CD-HIT representative at 80% identity) to the full species set in its `.clstr` cluster before classifying events.
@@ -55,19 +54,15 @@ Current reconciliation policy:
 
 This preserves biological signal while preventing false duplication inflation from metadata artifacts.
 
-### Architecture Evolution: Duplication-Directed Scoring
-Phase 5 no longer uses the 3-level hierarchy as the scoring substrate. The prior Group/Family/Subfamily walk produced a 61:1 speciation starvation pattern and left too few valid pairwise comparisons to carry a meaningful BADASP signal. The scoring layer now operates directly on the 346 high-confidence duplication nodes, comparing each duplication node's immediate left and right clades and pooling all qualifying pairs into a single duplication-directed score distribution.
-
-Why this shift happened:
-1. The hierarchy-based walk starved Phase 5 of comparable paralog pairs.
-2. Duplication nodes are the biologically correct unit for detecting neo/subfunctionalization.
-3. A pooled duplication distribution restores a clean, continuous 95th-percentile SDP threshold.
+### Architecture Evolution: Multi-Threshold Dual-Track Scoring
+Phase 5 utilizes a Multi-Threshold Dual-Track system. Rather than restricting analysis to static Group/Family/Subfamily tiers, the pipeline generates evenly distributed threshold layers across the dendrogram depth using an optimized O(N) fast-traversal slicing method (`tree_cluster.py --multi-layer 10`).
 
 How scoring now works:
-1. Use the curated duplication catalog from `results/reconciliation/duplication_nodes.csv`.
-2. Keep only duplication nodes whose left and right clades both contain at least 5 sequences.
-3. Score the immediate left-vs-right clade comparison for each retained duplication node.
-4. Pool all scores into `results/badasp_scoring/raw_pairwise_duplications.csv` and derive a single global SDP threshold.
+1. Ingest reconciliation logic to identify Duplication and Speciation internal nodes.
+2. For each defined layer (`layer01` to `layer10`), assess clade pairs. Keep nodes whose left and right descendant clades each contain at least 5 sequences.
+3. Compute distances from the immediate parent node to the ASR-resolved LCA node for both branches to establish the Least Diverged Ortholog (LDO) and Most Diverged Ortholog (MDO) tags.
+4. Separate the raw pairwise metrics and threshold-passing scores into three tracks per layer: `Combined`, `Duplications_Only`, and `Speciations_Only`.
+5. Downstream processing (Phase 6 mapping, Phase 7 timelines) ingests these discrete tracks dynamically to decouple event types without muddying the phylogenetic signals.
 
 ### Phase 6-7: Structural & Evolutionary Analysis (Complete)
 16. Map trimmed alignment columns to PDB residue numbers; generate PyMOL/ChimeraX scripts for SDP visualization.

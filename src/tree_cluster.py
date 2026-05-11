@@ -1,6 +1,7 @@
 import argparse
 import csv
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -126,6 +127,262 @@ def _surviving_clade_count_at_threshold(
     for cid in cluster_ids:
         sizes[cid] = sizes.get(cid, 0) + 1
     return sum(1 for size in sizes.values() if size >= min_clade_size)
+
+
+def _pick_even_threshold_layers(
+    linkage_rows: Sequence[Sequence[float]],
+    layer_count: int,
+) -> List[float]:
+    z = np.asarray(linkage_rows, dtype=float)
+    if z.size == 0:
+        return []
+
+    unique_distances = sorted(set(float(x) for x in z[:, 2]), reverse=True)
+    if not unique_distances:
+        return []
+
+    if layer_count <= 1:
+        return [unique_distances[0]]
+
+    if len(unique_distances) <= layer_count:
+        return unique_distances
+
+    raw_indices = np.linspace(0, len(unique_distances) - 1, num=layer_count)
+    selected_indices = sorted(set(int(round(i)) for i in raw_indices))
+    return [unique_distances[i] for i in selected_indices]
+
+
+def _materialize_multithreshold_layer(
+    tree: Tree,
+    labels: Sequence[str],
+    linkage_rows: Sequence[Sequence[float]],
+    threshold: float,
+    layer_index: int,
+    min_clade_size: int,
+    output_dir: Path,
+) -> Optional[Dict[str, float]]:
+    assignments = _build_level_assignments(labels, linkage_rows, threshold, min_clade_size)
+    if len(assignments) < 2:
+        return None
+
+    membership = _level_membership_map(assignments)
+    lca_map = {cluster_id: _resolve_lca_label(tree, members) for cluster_id, members in assignments.items()}
+    assignment_path = output_dir / f"tree_cluster_assignments_layer{layer_index:02d}.csv"
+    cluster_path = output_dir / f"tree_clusters_layer{layer_index:02d}.csv"
+
+    assignment_rows = []
+    for sequence_id in sorted(labels):
+        cluster_id = membership.get(sequence_id)
+        if cluster_id is None:
+            continue
+        assignment_rows.append(
+            {
+                "sequence_id": sequence_id,
+                "cluster_id": int(cluster_id),
+                "lca_node": lca_map[int(cluster_id)],
+                "layer_index": int(layer_index),
+                "threshold": float(threshold),
+            }
+        )
+    pd.DataFrame(assignment_rows).to_csv(assignment_path, index=False)
+
+    cluster_rows = [
+        {
+            "layer_index": int(layer_index),
+            "threshold": float(threshold),
+            "cluster_id": int(cluster_id),
+            "member_count": int(len(members)),
+            "lca_node": lca_map[int(cluster_id)],
+        }
+        for cluster_id, members in sorted(assignments.items(), key=lambda item: int(item[0]))
+    ]
+    pd.DataFrame(cluster_rows).to_csv(cluster_path, index=False)
+
+    return {
+        "layer_index": int(layer_index),
+        "threshold": float(threshold),
+        "cluster_count": int(len(assignments)),
+        "assignments_csv": str(assignment_path),
+        "clusters_csv": str(cluster_path),
+    }
+
+
+def write_multithreshold_cluster_artifacts(
+    rooted_tree_path: Path,
+    output_dir: Path,
+    layer_count: int = 8,
+    min_clade_size: int = 5,
+    max_layer_cluster_count: int = 400,
+    workers: int = 1,
+) -> List[Dict[str, float]]:
+    tree = Phylo.read(str(rooted_tree_path), "newick")
+    labels, linkage_rows = tree_to_linkage(tree)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    thresholds = _pick_even_threshold_layers(linkage_rows, max(2, int(layer_count)))
+
+    candidate_layers: List[Tuple[int, float]] = []
+    previous_membership: Optional[Dict[str, int]] = None
+    layer_index = 0
+    for threshold in thresholds:
+        assignments = _build_level_assignments(labels, linkage_rows, threshold, min_clade_size)
+        if len(assignments) < 2:
+            continue
+        if len(assignments) > int(max_layer_cluster_count):
+            continue
+
+        membership = _level_membership_map(assignments)
+        if previous_membership is not None and membership == previous_membership:
+            continue
+
+        layer_index += 1
+        previous_membership = membership
+        candidate_layers.append((layer_index, float(threshold)))
+
+    if not candidate_layers:
+        pd.DataFrame([]).to_csv(output_dir / "tree_cluster_layers.csv", index=False)
+        return []
+
+    layer_records: List[Dict[str, float]] = []
+    if int(workers) > 1 and len(candidate_layers) > 1:
+        with ThreadPoolExecutor(max_workers=int(workers)) as executor:
+            futures = [
+                executor.submit(
+                    _materialize_multithreshold_layer,
+                    tree,
+                    labels,
+                    linkage_rows,
+                    threshold,
+                    layer_idx,
+                    min_clade_size,
+                    output_dir,
+                )
+                for layer_idx, threshold in candidate_layers
+            ]
+            for future in futures:
+                record = future.result()
+                if record is not None:
+                    layer_records.append(record)
+    else:
+        for layer_idx, threshold in candidate_layers:
+            record = _materialize_multithreshold_layer(
+                tree,
+                labels,
+                linkage_rows,
+                threshold,
+                layer_idx,
+                min_clade_size,
+                output_dir,
+            )
+            if record is not None:
+                layer_records.append(record)
+
+    layer_records = sorted(layer_records, key=lambda item: int(item["layer_index"]))
+    pd.DataFrame(layer_records).to_csv(output_dir / "tree_cluster_layers.csv", index=False)
+    return layer_records
+
+
+def fast_multi_layer_clustering(
+    tree_path: Path,
+    layer_count: int,
+    min_clade_size: int,
+    output_dir: Path,
+) -> List[Dict[str, float]]:
+    tree = Phylo.read(str(tree_path), "newick")
+    
+    # Ensure all internal nodes have names
+    for idx, node in enumerate(tree.get_nonterminals(order="preorder"), start=1):
+        if not node.name:
+            node.name = f"InternalNode_{idx}"
+
+    depths = tree.depths()
+    if not max(depths.values()):
+        depths = tree.depths(unit_branch_lengths=True)
+
+    max_depth = max(depths.values())
+    thresholds = np.linspace(0, max_depth, num=int(layer_count) + 2)[1:-1]
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    layer_records = []
+    layer_index = 0
+    previous_assignments = None
+
+    for threshold in thresholds:
+        clades_at_threshold = []
+
+        def traverse(node: Clade, parent_depth: float):
+            d = depths[node]
+            if parent_depth <= threshold < d:
+                clades_at_threshold.append(node)
+                return
+            if node.is_terminal() and d <= threshold:
+                clades_at_threshold.append(node)
+                return
+            for child in node.clades:
+                traverse(child, d)
+
+        traverse(tree.root, -1.0)
+
+        assignments = {}
+        for clade in clades_at_threshold:
+            members = [leaf.name for leaf in clade.get_terminals() if leaf.name]
+            if len(members) >= min_clade_size:
+                assignments[id(clade)] = (clade, members)
+
+        if len(assignments) < 2:
+            continue
+
+        sorted_clades = sorted(assignments.values(), key=lambda x: (-len(x[1]), x[0].name or ""))
+        
+        cluster_rows = []
+        assignment_rows = []
+        
+        current_cluster_id = 1
+        for clade, members in sorted_clades:
+            lca_name = str(clade.name)
+            cluster_rows.append({
+                "layer_index": layer_index + 1,
+                "threshold": float(threshold),
+                "cluster_id": current_cluster_id,
+                "member_count": len(members),
+                "lca_node": lca_name,
+            })
+            for member in members:
+                assignment_rows.append({
+                    "sequence_id": member,
+                    "cluster_id": current_cluster_id,
+                    "lca_node": lca_name,
+                    "layer_index": layer_index + 1,
+                    "threshold": float(threshold),
+                })
+            current_cluster_id += 1
+
+        if not cluster_rows:
+            continue
+
+        member_map = {row["sequence_id"]: row["cluster_id"] for row in assignment_rows}
+        if previous_assignments is not None and member_map == previous_assignments:
+            continue
+
+        layer_index += 1
+        previous_assignments = member_map
+
+        assignment_path = output_dir / f"tree_cluster_assignments_layer{layer_index:02d}.csv"
+        cluster_path = output_dir / f"tree_clusters_layer{layer_index:02d}.csv"
+
+        pd.DataFrame(assignment_rows).to_csv(assignment_path, index=False)
+        pd.DataFrame(cluster_rows).to_csv(cluster_path, index=False)
+
+        layer_records.append({
+            "layer_index": layer_index,
+            "threshold": float(threshold),
+            "cluster_count": len(cluster_rows),
+            "assignments_csv": str(assignment_path),
+            "clusters_csv": str(cluster_path),
+        })
+
+    pd.DataFrame(layer_records).to_csv(output_dir / "tree_cluster_layers.csv", index=False)
+    return layer_records
 
 
 def choose_distance_threshold(
@@ -334,6 +591,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--subfamily-target-max-clades", type=int, default=150)
     parser.add_argument("--min-clade-size", type=int, default=5)
     parser.add_argument("--dendrogram-output", default="results/topological_clustering/tree_dendrogram.svg")
+    parser.add_argument("--multi-layer", type=int, default=0, help="If >0, bypass SciPy and run fast O(N) multi-layer clustering with this many layers.")
+    parser.add_argument("--max-layer-cluster-count", type=int, default=400)
+    parser.add_argument("--workers", type=int, default=1)
     return parser
 
 
@@ -387,6 +647,23 @@ def write_hierarchical_dendrograms(
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.multi_layer > 0:
+        rooted_tree_path = Path(args.rooted_tree_output)
+        if not rooted_tree_path.exists():
+            rooted_tree_path = root_tree(
+                input_tree=Path(args.tree),
+                output_tree=rooted_tree_path,
+                method=args.rooting_method,
+            )
+        layer_records = fast_multi_layer_clustering(
+            tree_path=rooted_tree_path,
+            layer_count=args.multi_layer,
+            min_clade_size=args.min_clade_size,
+            output_dir=Path(args.assignments_output).parent,
+        )
+        print(f"Saved fast O(N) multi-threshold layers: {len(layer_records)} (tree_cluster_assignments_layerXX.csv / tree_clusters_layerXX.csv)")
+        return
 
     level_counts, level_thresholds = cluster_tree_topologically(
         tree_path=Path(args.tree),

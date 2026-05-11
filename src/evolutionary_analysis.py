@@ -333,7 +333,19 @@ def _plot_switch_timeline(events_df: pd.DataFrame, output_svg: Path) -> None:
     }
 
     plt.figure(figsize=(11, 6))
-    if "level" in events_df.columns and events_df["level"].nunique() > 1:
+    if "Event_Type" in events_df.columns and events_df["Event_Type"].dropna().nunique() > 1:
+        sns.histplot(
+            data=events_df,
+            x="root_distance",
+            hue="Event_Type",
+            bins=40,
+            stat="count",
+            element="step",
+            fill=False,
+            common_bins=True,
+            palette={"Duplication": "#B24A2A", "Speciation": "#2A6FB2", "Unknown": "#7A7A7A"},
+        )
+    elif "level" in events_df.columns and events_df["level"].nunique() > 1:
         sns.histplot(
             data=events_df,
             x="root_distance",
@@ -744,6 +756,8 @@ def _load_switch_events_from_duplications(
             root_distance = float(depths.get(clade, np.nan))
         else:
             root_distance = float(named_depths.get(source_branch_id, np.nan))
+        event_value = row["Event_Type"] if "Event_Type" in row else row.get("event_type", "Unknown")
+        layer_index = int(row["layer_index"]) if "layer_index" in row and pd.notna(row["layer_index"]) else 1
         rows.append(
             {
                 "level": DUPLICATION_LEVEL,
@@ -753,6 +767,8 @@ def _load_switch_events_from_duplications(
                 "source_branch_id": source_branch_id,
                 "branch_id": branch_id,
                 "root_distance": root_distance,
+                "Event_Type": str(event_value),
+                "layer_index": int(layer_index),
             }
         )
 
@@ -1065,19 +1081,42 @@ def run_phase7_analyses(
     tu_find = _run_tu_json(["tu", "find", "amino acid properties hydrophobicity charge", "--json"])
     tu_tools = [tool.get("name") for tool in tu_find.get("tools", [])[:5]]
 
-    events_by_level: Dict[str, pd.DataFrame] = {
-        DUPLICATION_LEVEL: _load_switch_events_from_duplications(
-            tree_path=tree_path,
-            raw_pairwise_path=raw_pairwise_duplications,
-            named_tree_path=reference_asr_tree_path,
-        )
-    }
-    score_by_level: Dict[str, pd.DataFrame] = {
-        DUPLICATION_LEVEL: pd.read_csv(duplication_scores_path),
-    }
+    events_by_level: Dict[str, pd.DataFrame] = {}
+    score_by_level: Dict[str, pd.DataFrame] = {}
+
+    scores_dir = duplication_scores_path.parent
+    layer_scores_files = sorted(scores_dir.glob("badasp_scores_layer*.csv"))
+
+    if layer_scores_files:
+        analysis_levels = []
+        for score_file in layer_scores_files:
+            layer_name = score_file.stem.replace("badasp_scores_", "")
+            # Only process the combined layers, or specific layers if we want. For now, all layer CSVs.
+            pairwise_file = scores_dir / f"raw_pairwise_{layer_name}.csv"
+            if not pairwise_file.exists():
+                continue
+            events_by_level[layer_name] = _load_switch_events_from_duplications(
+                tree_path=tree_path,
+                raw_pairwise_path=pairwise_file,
+                named_tree_path=reference_asr_tree_path,
+            )
+            score_by_level[layer_name] = pd.read_csv(score_file)
+            analysis_levels.append(layer_name)
+    else:
+        events_by_level = {
+            DUPLICATION_LEVEL: _load_switch_events_from_duplications(
+                tree_path=tree_path,
+                raw_pairwise_path=raw_pairwise_duplications,
+                named_tree_path=reference_asr_tree_path,
+            )
+        }
+        score_by_level = {
+            DUPLICATION_LEVEL: pd.read_csv(duplication_scores_path),
+        }
 
     timeline_svg = output_dir / "switch_timeline.svg"
-    all_events = pd.concat([events_by_level[level] for level in analysis_levels], ignore_index=True)
+    valid_events = [events_by_level[level] for level in analysis_levels if not events_by_level[level].empty]
+    all_events = pd.concat(valid_events, ignore_index=True) if valid_events else pd.DataFrame()
     _plot_switch_timeline(all_events, timeline_svg)
     master_dendrogram_svg = output_dir / "master_dendrogram_switches.svg"
     _plot_master_dendrogram(tree_path=tree_path, events_by_level=events_by_level, output_svg=master_dendrogram_svg)
@@ -1104,7 +1143,15 @@ def run_phase7_analyses(
         )
         top_positions_for_lit[level] = top_positions
 
-        residue_numbers = [mapping[pos] for pos in top_positions if pos in mapping]
+        residue_numbers = []
+        for pos in top_positions:
+            if pos in mapping:
+                entries = mapping[pos]
+                if isinstance(entries, int):
+                    residue_numbers.append(int(entries))
+                elif isinstance(entries, list):
+                    for entry in entries:
+                        residue_numbers.append(int(entry[1]))
         distance_matrix = calculate_ca_distance_matrix(pdb_path, residue_numbers)
         distance_csv = output_dir / f"distance_matrix_{level}.csv"
         distance_matrix.to_csv(distance_csv, index=True)
@@ -1270,8 +1317,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Phase 7 evolutionary and physicochemical analysis")
     parser.add_argument("--tree", default="results/topological_clustering/mad_rooted.tree")
     parser.add_argument("--assignments", default="results/topological_clustering/tree_cluster_assignments.csv")
-    parser.add_argument("--raw-pairwise-duplications", default="results/badasp_scoring/raw_pairwise_duplications.csv")
-    parser.add_argument("--duplication-scores", default="results/badasp_scoring/badasp_scores_duplications.csv")
+    parser.add_argument("--raw-pairwise-duplications", default="results/badasp_scoring/raw_pairwise.csv")
+    parser.add_argument("--duplication-scores", default="results/badasp_scoring/badasp_scores.csv")
     parser.add_argument("--msa", default="data/interim/IPR019888_trimmed.aln")
     parser.add_argument("--ancestral", default="data/interim/ancestral_sequences.fasta")
     parser.add_argument("--asr-map", default="results/topological_clustering/tree_clusters_asr_mapped.csv")

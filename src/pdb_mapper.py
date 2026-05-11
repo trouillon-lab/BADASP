@@ -64,14 +64,14 @@ class PDBMapper:
         representative = min(records, key=lambda r: str(r.seq).count("-"))
         return str(representative.seq)
 
-    def _extract_pdb_sequence_and_residue_numbers(self, pdb_path: Path) -> Tuple[str, List[int], Optional[str]]:
+    def _extract_pdb_sequence_and_residue_numbers(self, pdb_path: Path) -> List[Tuple[str, str, List[int]]]:
+        """Return list of (chain_id, sequence, residue_numbers) for protein chains in structure."""
         if pdb_path.suffix.lower() == ".cif":
             structure = MMCIFParser(QUIET=True).get_structure(self.pdb_id, str(pdb_path))
         else:
             structure = PDBParser(QUIET=True).get_structure(self.pdb_id, str(pdb_path))
 
-        residues: List[Tuple[str, int]] = []
-        selected_chain_id: Optional[str] = None
+        chains_info: List[Tuple[str, str, List[int]]] = []
         for model in structure:
             for chain in model:
                 chain_residues: List[Tuple[str, int]] = []
@@ -84,25 +84,24 @@ class PDBMapper:
                         continue
                     chain_residues.append((aa, resseq))
                 if chain_residues:
-                    residues = chain_residues
-                    selected_chain_id = str(chain.id).strip() or None
-                    break
-            if residues:
+                    seq = "".join(aa for aa, _ in chain_residues)
+                    numbers = [n for _, n in chain_residues]
+                    chains_info.append((str(chain.id).strip() or "A", seq, numbers))
+            if chains_info:
                 break
 
-        if not residues:
+        if not chains_info:
             raise ValueError(f"No protein residues found in structure: {pdb_path}")
 
-        sequence = "".join(aa for aa, _ in residues)
-        numbers = [n for _, n in residues]
-        return sequence, numbers, selected_chain_id
+        return chains_info
 
     def map_alignment_to_structure(self, alignment_path: Path) -> Dict[int, int]:
         """Map alignment column index (1-based) to PDB residue number."""
         pdb_path = Path(self.download_pdb())
         msa_seq_gapped = self._extract_representative_msa_sequence(alignment_path)
-        pdb_seq, pdb_residue_numbers, protein_chain_id = self._extract_pdb_sequence_and_residue_numbers(pdb_path)
-        self._last_protein_chain_id = protein_chain_id
+        chains_info = self._extract_pdb_sequence_and_residue_numbers(pdb_path)
+        # store last seen protein chains
+        self._last_protein_chain_id = chains_info[0][0] if chains_info else None
 
         ungapped_to_msa_col: List[int] = []
         msa_ungapped_chars: List[str] = []
@@ -112,7 +111,7 @@ class PDBMapper:
                 ungapped_to_msa_col.append(idx)
         msa_seq_ungapped = "".join(msa_ungapped_chars)
 
-        if not msa_seq_ungapped or not pdb_seq:
+        if not msa_seq_ungapped or not chains_info:
             return {}
 
         aligner = PairwiseAligner()
@@ -122,21 +121,24 @@ class PDBMapper:
         aligner.open_gap_score = -5.0
         aligner.extend_gap_score = -0.5
 
-        alignment = aligner.align(msa_seq_ungapped, pdb_seq)[0]
-        mapping: Dict[int, int] = {}
+        mapping: Dict[int, List[Tuple[str, int]]] = {}
 
-        msa_blocks, pdb_blocks = alignment.aligned
-        for (msa_start, msa_end), (pdb_start, pdb_end) in zip(msa_blocks, pdb_blocks):
-            block_len = min(msa_end - msa_start, pdb_end - pdb_start)
-            for offset in range(block_len):
-                msa_ungapped_index = msa_start + offset
-                pdb_index = pdb_start + offset
-                if msa_ungapped_index >= len(ungapped_to_msa_col):
-                    continue
-                if pdb_index >= len(pdb_residue_numbers):
-                    continue
-                msa_col = ungapped_to_msa_col[msa_ungapped_index]
-                mapping[msa_col] = int(pdb_residue_numbers[pdb_index])
+        # Align to each protein chain and record chain-specific residue mappings
+        for chain_id, chain_seq, chain_numbers in chains_info:
+            alignment = aligner.align(msa_seq_ungapped, chain_seq)[0]
+            msa_blocks, pdb_blocks = alignment.aligned
+            for (msa_start, msa_end), (pdb_start, pdb_end) in zip(msa_blocks, pdb_blocks):
+                block_len = min(msa_end - msa_start, pdb_end - pdb_start)
+                for offset in range(block_len):
+                    msa_ungapped_index = msa_start + offset
+                    pdb_index = pdb_start + offset
+                    if msa_ungapped_index >= len(ungapped_to_msa_col):
+                        continue
+                    if pdb_index >= len(chain_numbers):
+                        continue
+                    msa_col = ungapped_to_msa_col[msa_ungapped_index]
+                    resnum = int(chain_numbers[pdb_index])
+                    mapping.setdefault(msa_col, []).append((chain_id, resnum))
 
         return mapping
 
@@ -161,7 +163,12 @@ class PDBMapper:
         top_df = df[["position", value_col]].head(top_n)
         return [(int(pos), float(val)) for pos, val in top_df.itertuples(index=False, name=None)]
 
-    def _all_switch_rows_from_csv(self, csv_path: Path) -> Tuple[List[Tuple[int, float]], str]:
+    def _all_switch_rows_from_csv(
+        self,
+        csv_path: Path,
+        event_type_filter: Optional[str] = None,
+        mdo_only: bool = False,
+    ) -> Tuple[List[Tuple[int, float]], str]:
         """Return every mapped switch position with switch_count > 0 for a level."""
         if not csv_path.exists():
             return [], f"missing csv: {csv_path}"
@@ -172,6 +179,15 @@ class PDBMapper:
             return [], f"empty csv: {csv_path}"
         if "position" not in df.columns:
             return [], f"missing position column: {csv_path}"
+
+        if event_type_filter:
+            event_col = "Event_Type" if "Event_Type" in df.columns else "event_type" if "event_type" in df.columns else None
+            if event_col is None:
+                return [], f"event filter requested but no Event_Type column: {csv_path}"
+            df = df[df[event_col].astype(str).str.lower() == str(event_type_filter).strip().lower()].copy()
+
+        if mdo_only and "MDO_Node" not in df.columns and "MDO_Label" not in df.columns:
+            return [], f"mdo-only filter requested but no MDO_Node/MDO_Label column: {csv_path}"
 
         if "switch_count" in df.columns:
             switch_series = pd.to_numeric(df["switch_count"], errors="coerce").fillna(0.0)
@@ -190,6 +206,17 @@ class PDBMapper:
             if df.empty:
                 return [], f"no finite max_score rows in {csv_path}"
             return [(int(pos), float(val)) for pos, val in df[["position", "max_score"]].itertuples(index=False, name=None)], ""
+
+        if "score" in df.columns:
+            numeric_scores = pd.to_numeric(df["score"], errors="coerce")
+            numeric_scores = numeric_scores[np.isfinite(numeric_scores)]
+            threshold = float(np.percentile(numeric_scores.to_numpy(dtype=float), 95)) if not numeric_scores.empty else 0.0
+            switched = df[pd.to_numeric(df["score"], errors="coerce") >= threshold].copy()
+            if switched.empty:
+                return [], f"no switched rows above threshold in {csv_path}"
+            switch_df = switched.groupby("position", as_index=False).size().rename(columns={"size": "switch_count"})
+            switch_df = switch_df.sort_values(["switch_count", "position"], ascending=[False, True])
+            return [(int(pos), float(val)) for pos, val in switch_df[["position", "switch_count"]].itertuples(index=False, name=None)], ""
 
         return [], f"no switch_count/max_score column: {csv_path}"
 
@@ -223,20 +250,26 @@ class PDBMapper:
     def _residue_color_pairs(
         self,
         top_rows: Sequence[Tuple[int, float]],
-        mapping: Dict[int, int],
+        mapping: Dict[int, List[Tuple[str, int]]],
         low_hex: str,
         high_hex: str,
         min_value: Optional[float] = None,
         max_value: Optional[float] = None,
-    ) -> List[Tuple[int, str, int, float]]:
-        scored_residues: Dict[int, Tuple[int, float]] = {}
+    ) -> List[Tuple[str, int, str, int, float]]:
+        """Return list of (chain_id, residue_num, color_hex, msa_col, value)."""
+        scored_residues: Dict[Tuple[str, int], Tuple[int, float]] = {}
         for msa_pos, value in top_rows:
             if msa_pos not in mapping:
                 continue
-            residue = mapping[msa_pos]
-            existing = scored_residues.get(residue)
-            if existing is None or float(value) > float(existing[1]):
-                scored_residues[residue] = (int(msa_pos), float(value))
+            entries = mapping[msa_pos]
+            # support legacy single-int mapping
+            if isinstance(entries, int):
+                entries = [(None, int(entries))]
+            for chain_id, residue in entries:
+                key = (chain_id, residue)
+                existing = scored_residues.get(key)
+                if existing is None or float(value) > float(existing[1]):
+                    scored_residues[key] = (int(msa_pos), float(value))
 
         if not scored_residues:
             return []
@@ -246,10 +279,11 @@ class PDBMapper:
         max_val = float(max_value) if max_value is not None else max(values)
         scale = max(max_val - min_val, 1e-9)
 
-        residue_colors: List[Tuple[int, str, int, float]] = []
-        for residue, (msa_col, value) in sorted(scored_residues.items()):
+        residue_colors: List[Tuple[str, int, str, int, float]] = []
+        for (chain_id, residue), (msa_col, value) in sorted(scored_residues.items()):
             fraction = (value - min_val) / scale
-            residue_colors.append((residue, self._interpolate_hex(low_hex, high_hex, fraction), msa_col, value))
+            color_hex = self._interpolate_hex(low_hex, high_hex, fraction)
+            residue_colors.append((chain_id, int(residue), color_hex, int(msa_col), float(value)))
         return residue_colors
 
     @staticmethod
@@ -274,9 +308,18 @@ class PDBMapper:
         family_msa = [pos for pos, _ in self._top_switch_rows_from_csv(sdp_csv_families, top_n=top_n)]
         subfamily_msa = [pos for pos, _ in self._top_switch_rows_from_csv(sdp_csv_subfamilies, top_n=top_n)]
 
-        group_res = [mapping[p] for p in group_msa if p in mapping]
-        family_res = [mapping[p] for p in family_msa if p in mapping]
-        subfamily_res = [mapping[p] for p in subfamily_msa if p in mapping]
+        # Flatten mapping to residue numbers across chains, restrict to protein polymer in PyMOL selection
+        def _flatten_resnums(msa_positions: List[int]) -> List[int]:
+            resnums: List[int] = []
+            for p in msa_positions:
+                if p in mapping:
+                    for chain_id, res in mapping[p]:
+                        resnums.append(int(res))
+            return resnums
+
+        group_res = _flatten_resnums(group_msa)
+        family_res = _flatten_resnums(family_msa)
+        subfamily_res = _flatten_resnums(subfamily_msa)
 
         lines: List[str] = [
             "# BADASP hierarchical SDP highlighting",
@@ -290,21 +333,21 @@ class PDBMapper:
 
         if group_res:
             selector = self._format_residue_selector(group_res)
-            lines.append(f"select group_sdps, resi {selector}")
+            lines.append(f"select group_sdps, polymer.protein and resi {selector}")
             lines.append("color red, group_sdps")
         else:
             lines.append("# group_sdps: no mapped residues")
 
         if family_res:
             selector = self._format_residue_selector(family_res)
-            lines.append(f"select family_sdps, resi {selector}")
+            lines.append(f"select family_sdps, polymer.protein and resi {selector}")
             lines.append("color blue, family_sdps")
         else:
             lines.append("# family_sdps: no mapped residues")
 
         if subfamily_res:
             selector = self._format_residue_selector(subfamily_res)
-            lines.append(f"select subfamily_sdps, resi {selector}")
+            lines.append(f"select subfamily_sdps, polymer.protein and resi {selector}")
             lines.append("color green, subfamily_sdps")
         else:
             lines.append("# subfamily_sdps: no mapped residues")
@@ -315,7 +358,7 @@ class PDBMapper:
     def _build_chimerax_script(
         self,
         pdb_path: Path,
-        residue_pairs: Sequence[Tuple[int, str, int, float]],
+        residue_pairs: Sequence[Tuple[str, int, str, int, float]],
         output_path: Path,
         level_label: str,
         min_switch_count: int,
@@ -323,11 +366,10 @@ class PDBMapper:
         low_hex: str,
         high_hex: str,
         no_switch_reason: str = "",
-        chain_id: Optional[str] = None,
     ) -> Path:
         """Write a publication-quality ChimeraX script for one hierarchy level."""
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        residues = [residue for residue, _, _, _ in residue_pairs]
+        residues = [f"{residue}" if chain is None else f"{chain}:{residue}" for chain, residue, _, _, _ in residue_pairs]
 
         lines = [
             f"# BADASP Phase 6 structural mapping: {level_label}",
@@ -344,15 +386,16 @@ class PDBMapper:
         ]
 
         if residues:
-            selector = ",".join(str(residue) for residue in residues)
-            for residue, color_hex, alignment_col, switch_value in residue_pairs:
+            selector = ",".join(str(r) for r in residues)
+            for chain_id, residue, color_hex, alignment_col, switch_value in residue_pairs:
                 lines.append(f"# Mapped from alignment col {alignment_col} (switch_count={int(round(switch_value))})")
-                residue_selector = f"/{chain_id}:{residue}" if chain_id else f":{residue}"
+                if chain_id is None:
+                    residue_selector = f":{residue}"
+                else:
+                    residue_selector = f"/{chain_id}:{residue}"
                 lines.append(f"color {residue_selector} {color_hex}")
 
             lines.append(f"# {level_label.lower()}_residues: {selector}")
-            if chain_id:
-                lines.append(f"# target_chain: {chain_id}")
         else:
             lines.append(f"# {level_label.lower()}_residues: none")
             if no_switch_reason:
@@ -405,6 +448,7 @@ class PDBMapper:
         sdp_csv_families: Optional[Path] = None,
         sdp_csv_subfamilies: Optional[Path] = None,
         output_dir: Optional[Path] = None,
+        scores_dir: Optional[Path] = None,
     ) -> Dict[str, Path]:
         """Generate ChimeraX scripts for any available BADASP hierarchy outputs."""
         if output_dir is None:
@@ -413,12 +457,23 @@ class PDBMapper:
         pdb_path = Path(self.download_pdb())
         mapping = self.map_alignment_to_structure(alignment_path)
 
-        level_specs = {
-            "duplications": (sdp_csv_duplications, "highlight_sdps_duplications.cxc"),
-            "groups": (sdp_csv_groups, "highlight_sdps_groups.cxc"),
-            "families": (sdp_csv_families, "highlight_sdps_families.cxc"),
-            "subfamilies": (sdp_csv_subfamilies, "highlight_sdps_subfamilies.cxc"),
-        }
+        level_specs = {}
+        if sdp_csv_duplications:
+            level_specs["duplications"] = (sdp_csv_duplications, "highlight_sdps_duplications.cxc")
+        if sdp_csv_groups:
+            level_specs["groups"] = (sdp_csv_groups, "highlight_sdps_groups.cxc")
+        if sdp_csv_families:
+            level_specs["families"] = (sdp_csv_families, "highlight_sdps_families.cxc")
+        if sdp_csv_subfamilies:
+            level_specs["subfamilies"] = (sdp_csv_subfamilies, "highlight_sdps_subfamilies.cxc")
+
+        if scores_dir and scores_dir.exists():
+            for layer_csv in scores_dir.glob("badasp_sdps_layer*.csv"):
+                # layer_csv.stem could be 'badasp_sdps_layer01_duplications'
+                # Extract everything after 'badasp_sdps_'
+                layer_name = layer_csv.stem.replace("badasp_sdps_", "")
+                level_specs[layer_name] = (layer_csv, f"highlight_sdps_{layer_name}.cxc")
+
         level_outputs: Dict[str, Path] = {}
         for level, (csv_path, filename) in level_specs.items():
             if csv_path is None:
@@ -454,8 +509,7 @@ class PDBMapper:
                 max_switch_count,
                 low_hex,
                 high_hex,
-                no_switch_reason=no_switch_reason,
-                chain_id=self._last_protein_chain_id,
+                    no_switch_reason=no_switch_reason,
             )
             self._write_switch_legend_png(
                 output_path=output_dir / f"legend_{level}.png",
@@ -496,11 +550,17 @@ class PDBMapper:
         sdp_csv: Path,
         output_cxc: Path,
         level_label: str = "Duplications",
+        event_type_filter: Optional[str] = None,
+        mdo_only: bool = False,
     ) -> Path:
         """Generate one ChimeraX script from an explicit SDP CSV file."""
         pdb_path = Path(self.download_pdb())
         mapping = self.map_alignment_to_structure(alignment_path)
-        rows, no_switch_reason = self._all_switch_rows_from_csv(sdp_csv)
+        rows, no_switch_reason = self._all_switch_rows_from_csv(
+            sdp_csv,
+            event_type_filter=event_type_filter,
+            mdo_only=mdo_only,
+        )
         _, max_switch_count = self._switch_count_bounds(rows)
         min_switch_count = 0
         low_hex = "#FBE6E6"
@@ -530,7 +590,6 @@ class PDBMapper:
             low_hex,
             high_hex,
             no_switch_reason=no_switch_reason,
-            chain_id=self._last_protein_chain_id,
         )
         return output_cxc
 
@@ -579,12 +638,11 @@ class PDBMapper:
             "multiple_complex": "#9467BD",
         }
 
-        residue_color: Dict[int, str] = {}
+        residue_color: Dict[Tuple[str, int], str] = {}
         for _, row in df.iterrows():
             pos = int(row.get("position", -1))
             if pos not in mapping:
                 continue
-            residue = int(mapping[pos])
             charge_shift = _is_shift(str(row.get("charge_change", "")))
             hydro_shift = _is_shift(str(row.get("hydrophobicity_change", "")))
             volume_delta = float(row.get("volume_change", 0.0)) if pd.notna(row.get("volume_change", np.nan)) else 0.0
@@ -601,7 +659,12 @@ class PDBMapper:
                 category = "size_shift"
             else:
                 continue
-            residue_color[residue] = color_map[category]
+            # assign color to each chain/residue mapping for this alignment position
+            entries = mapping[pos]
+            if isinstance(entries, int):
+                entries = [(None, int(entries))]
+            for chain_id, residue in entries:
+                residue_color[(chain_id, int(residue))] = color_map[category]
 
         lines = [
             "# BADASP Phase 7 physicochemical structural mapping",
@@ -618,13 +681,22 @@ class PDBMapper:
         ]
 
         if residue_color:
-            for residue, color in sorted(residue_color.items()):
-                lines.append(f"color :{residue} {color}")
-            selector = ",".join(str(residue) for residue in sorted(residue_color))
+            for (chain_id, residue), color in sorted(residue_color.items()):
+                if chain_id is None:
+                    lines.append(f"color :{residue} {color}")
+                else:
+                    lines.append(f"color /{chain_id}:{residue} {color}")
+            selector_items = []
+            for (chain, res) in sorted(residue_color):
+                if chain is None:
+                    selector_items.append(f":{res}")
+                else:
+                    selector_items.append(f"/{chain}:{res}")
+            selector = ",".join(selector_items)
             lines.extend(
                 [
-                    f"show :{selector} atoms",
-                    f"style :{selector} stick",
+                    f"show {selector} atoms",
+                    f"style {selector} stick",
                     "size stickRadius 0.28",
                     "size atomRadius 1.05",
                 ]
@@ -677,6 +749,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional explicit SDP CSV to map into a single output CXC script",
     )
+    parser.add_argument(
+        "--event-type-filter",
+        default=None,
+        choices=["Duplication", "Speciation", "Unknown"],
+        help="Optional Event_Type filter for --sdp-csv mode",
+    )
+    parser.add_argument(
+        "--mdo-only",
+        action="store_true",
+        help="When set in --sdp-csv mode, require MDO-tagged rows",
+    )
     parser.add_argument("--top-n", type=int, default=10, help="Top N SDPs per level")
     return parser
 
@@ -696,6 +779,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             sdp_csv=sdp_csv,
             output_cxc=output_cxc,
             level_label="Duplications",
+            event_type_filter=args.event_type_filter,
+            mdo_only=bool(args.mdo_only),
         )
         print(f"Generated ChimeraX script: {output_cxc}")
         return
@@ -707,11 +792,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     outputs = mapper.generate_chimerax_scripts(
         alignment_path=alignment,
-        sdp_csv_duplications=duplications_csv,
-        sdp_csv_groups=groups_csv,
-        sdp_csv_families=families_csv,
-        sdp_csv_subfamilies=subfamilies_csv,
+        sdp_csv_duplications=duplications_csv if duplications_csv.exists() else None,
+        sdp_csv_groups=groups_csv if groups_csv.exists() else None,
+        sdp_csv_families=families_csv if families_csv.exists() else None,
+        sdp_csv_subfamilies=subfamilies_csv if subfamilies_csv.exists() else None,
         output_dir=output_cxc.parent,
+        scores_dir=scores_dir,
     )
     combined = output_cxc
     if combined.exists() and combined not in set(outputs.values()):
