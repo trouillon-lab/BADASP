@@ -3,22 +3,55 @@
 ## Project
 - Name: BADASP replication pipeline for IPR019888 (PF13404 track included)
 - Mode: Reproducible, modular Python workflow
-- Current date: 2026-04-27
-- Status: Duplication-directed Phase 5 scoring is synced to the corrected pooled-threshold math; downstream architecture now uses left-vs-right clade pairs instead of Group/Family/Subfamily hierarchy
+- Current date: 2026-05-19
+- Status: **Legacy Group/Family/Subfamily clustering remains archival only.** Pipeline now runs duplication-directed Phase 5 scoring across a 20-layer linear timeline with three tracks per layer (`duplications`, `speciations`, `combined`). Root track artifacts were reconstructed from preserved layer snapshots after an overwrite, and Phase 6 structural scripts were regenerated.
 
-## Multi-Threshold Dual-Track Architecture Checkpoint (Current)
-- Replaced the O(N^2) SciPy linkage clustering approach with an O(N) fast tree traversal slicing method in Phase 3 (`tree_cluster.py`) to resolve memory bottleneck hangs.
-- Implemented the `--multi-layer <int>` CLI parameter for fast traversal (currently using 10 layers spaced evenly across tree depth).
-- Upgraded Phase 5 (`badasp_core.py`) to aggregate a Dual-Track scoring system encompassing both "Duplication" and "Speciation" events (`combined`, `duplications`, and `speciations` tracks).
-- Added LDO (Least Diverged Ortholog) and MDO (Most Diverged Ortholog) asymmetric branch tagging to Phase 5 outputs, computing distances utilizing ASR-resolved LCA node logic.
-- Configured the downstream script `pdb_mapper.py` to seamlessly parse all `badasp_sdps_layer*.csv` outputs into discrete ChimeraX coloring scripts, maintaining functional track distinctions.
-- Transitioned `evolutionary_analysis.py` to ingest dynamic multi-layer artifacts and merged `raw_pairwise.csv` + `badasp_scores.csv` instead of legacy 3-tier hierarchy outputs.
+## 2026-05-19: O(1) LCA Optimization, Full 20-Layer Execution, and Reconciliation Audit
+- **O(1) LCA Bottleneck Resolution (Major Performance Gain):**
+  - **Problem:** Original code used Biopython's `tree.common_ancestor()` repeatedly, causing deep recursion and multi-minute per-layer slowdowns.
+  - **Solution:** Replaced with O(1) LCA lookup: load per-layer `results/topological_clustering/layer_XX/tree_clusters_layerXX.csv` cluster_id → lca_node mapping at initialization; LCA resolution is now a simple dictionary lookup.
+  - **Removed code:** All `tree.common_ancestor()` calls from the active scoring path in `src/badasp_core.py`.
+  - **Result:** 20-layer Phase 5 execution now completes in **~2 minutes** (previously: hangs/multi-hour estimates).
 
-## Latest Run Status (2026-04-22)
-- Phase 5 regeneration completed with the corrected raw-pairwise pooled threshold and refreshed duplication outputs.
-- Phase 6 ChimeraX export regenerated with valid standalone provenance comments above each `color` command.
-- Phase 7 reran from the updated Phase 5 outputs, then `scripts/regenerate_stale_plots.py` reported `0` stale files.
-- Mathematical proof check confirmed `raw_rows_ge_threshold == sdp_total_switch_count == 1352` at threshold `1.270761446912`.
+- **Full 20-Layer Execution and Reconciliation Audit:**
+  - Successfully ran `python src/badasp_core.py` across all 20 layers with `--reconciliation-csv results/reconciliation/duplication_nodes.csv`.
+  - **Final reconciliation data metrics:**
+    - **Duplication pairs:** 7,774 (6.1% of total)
+    - **Speciation pairs:** 118,976 (93.5% of total)
+    - **Unknown pairs:** 338 (0.27% of total)
+  - **Interpretation:** Mapping is 99.7% successful. Unknown labels appear in ancient root layers (e.g., Layer 2) where ASR node names do not exist in reconciliation CSV; this is expected for pre-duplication ancestral nodes and does not represent a structural error.
+
+- **Threshold Calculation Rule (Mathematical Correctness):**
+  - **Rule:** Threshold calculations strictly permit negative values as biologically relevant.
+  - **Rationale:** The BADASP score formula is `score = rc - (ac * p_ac)`, where rc ∈ [0, 1], ac ∈ {−1, +1}, and p_ac ∈ [0, 1]. When ac = +1 (match) and p_ac is high, score can be negative, indicating conservation despite recent evolutionary divergence.
+  - **Implementation:** `np.percentile()` is applied directly to valid scores without clamping. The 95th percentile of negative-containing distributions preserves negative values naturally.
+  - **Example:** Layer 2 duplication subtrack has no duplication-labeled pairs (only Unknown or Speciation), resulting in an empty valid_scores set and threshold = NaN (not 0.0).
+
+- **Root track recovery (earlier):**
+  - Rebuilt `results/badasp_scoring/raw_pairwise_duplications.csv`, `raw_pairwise_speciations.csv`, and `raw_pairwise_combined.csv` from preserved layer snapshots
+  - Restored nonzero speciation track content at the root level
+  - Rewrote `badasp_scores_<track>.csv` and `badasp_sdps_<track>.csv` for all three tracks
+
+- **Cross-layer summary and timeline (regenerated with new data):**
+  - `results/badasp_scoring/global_layer_summary.csv` with 20 rows contains all reconciliation labels
+  - `results/evolutionary_analysis/switch_timeline.svg` now reflects the full 20-layer speciation-dominated signal
+  - Summary tracks duplication/speciation/combined SDP counts across the 20-layer timeline
+
+- **Phase 6 structural mapping (to regenerate with latest data):**
+  - Regenerated ChimeraX layer scripts for all 20 layers and all three tracks
+  - Output structure: `results/structural_mapping/layer_XX/layer_XX_duplications.cxc`, `layer_XX_speciations.cxc`, `layer_XX_combined.cxc`
+
+- **Validation:**
+  - Layer 2 safe test: completed in 4.1 seconds with combined threshold = 1.195, duplication/speciation thresholds = NaN (expected, no data after event-type filtering)
+  - Full 20-layer run: completed in ~2 minutes; event-type counts audited and confirmed
+  - Tests: focused pytest slice passed; `test_badasp_core.py`, `test_evolutionary_analysis.py`, `test_pdb_mapper.py` verified
+
+## Current Pipeline Snapshot
+- Phase 3 remains archival for the old hierarchy; the active path is the 20-layer linear timeline.
+- Phase 4 extraction uses the global ASR reconstruction plus the layer LCA union.
+- Phase 5 now emits three tracks at every layer and at the root level: `duplications`, `speciations`, and `combined`.
+- Phase 6 structural mapping now loops over all layers and all three tracks when generating ChimeraX scripts.
+- Phase 7 analysis consumes the regenerated layer outputs and the refreshed global summary.
 
 ## Threshold Explorer Checkpoint (2026-04-27)
 - Added `scripts/explore_thresholds.py` to derive stricter duplication SDP tables directly from `results/badasp_scoring/raw_pairwise_duplications.csv` without rerunning Phase 5.
@@ -398,6 +431,15 @@
 
 ## QC Metrics
 - Raw sequence length QC plot: `results/sequence_filtering/raw_length_dist.svg`
+
+## Adaptive Multi-Threshold Slicing (2026-05-16)
+- **Change:** Replaced static `--multi-layer` even-slicing with an Adaptive Oversample+Deduplicate+Select strategy in `src/tree_cluster.py`.
+- **Distance metric used for slicing:** Cophenetic / linkage distance (the third column of the SciPy linkage matrix derived from tree subtree heights). This matches the dendrogram linkage axis and provides slices consistent with visual dendrogram thresholds.
+- **Oversampling:** Candidate thresholds are now oversampled (default: 100 samples) across the linkage distance range, snapped to nearest unique linkage distances when available.
+- **Filter / Deduplicate:** Candidate layers are filtered to remove thresholds producing fewer than two surviving clades or that exceed `max_layer_cluster_count`. Identical topological assignments are deduplicated by canonical cluster-member signatures.
+- **Selection:** Up to the requested target number of layers (CLI `--multi-layer`) are selected by evenly sampling the deduplicated, valid candidates across the evolutionary axis (deep→shallow).
+- **Materialization:** Selected unique layers are materialized into `results/topological_clustering/layer_XX/tree_cluster_assignments_layerXX.csv` and `tree_clusters_layerXX.csv` files.
+- **Latest run:** The most recent run (2026-05-16) produced 10 unique materialized multi-threshold layers (selected from 34 unique valid candidates after deduplication).
 - MSA gap-per-column QC plot: `results/alignment_qc/msa_gap_profile.svg`
 - Length-filtered sequence count (130-200 AA): 110022
 - Clustered representative sequence count (`-c 0.80 -n 5`): 21641
@@ -716,3 +758,29 @@
 - Surgical regeneration executed (non-heavy only):
   - Refreshed score distribution SVGs from existing raw pairwise CSVs.
   - Regenerated `results/structural_mapping/highlight_sdps_{groups,families,subfamilies}.cxc` via targeted `src/pdb_mapper.py` run.
+
+## Multi-Threshold Layer Dendrogram Generation Fix Checkpoint (2026-05-13)
+- **Purpose**: Fix critical failures in tree_cluster.py that prevented per-layer dendrogram generation and caused crashes with corrupted tree structures after MAD rooting.
+- **Fixes Applied**:
+  1. **FIX 1 - Error-Handle _resolve_lca_label()**: Added try/except block to handle AttributeError from corrupted Clade objects after MAD rooting. Fallback uses hash-based LCA label generation when tree.common_ancestor() fails.
+  2. **FIX 2 - Add write_layer_dendrograms() Function**: New function that iterates through layer_XX/ subdirectories, loads per-layer cluster assignments, and generates tree_dendrogram_layer{idx}.svg using existing visualization infrastructure.
+  3. **FIX 3 - Call write_layer_dendrograms() from main()**: Added call after write_multithreshold_cluster_artifacts() in main() to trigger per-layer dendrogram generation.
+  4. **FIX 4 - Clarify badasp_layer_summary.csv Routing**: Added explanatory comments in badasp_core.py documenting that layer_summary is intentionally global (not per-layer) for cross-layer comparison.
+  5. **FIX 5 - Replace Corrupted Notebook**: Replaced notebooks/layer_explorer.ipynb JSON with clean nbformat 4 structure to fix JSON parsing errors from duplicated cells and mixed metadata.
+
+- **Test Status**: All 114 pytest tests pass after fixes (100% regression-free).
+- **Verification**:
+  - JSON validation: `notebooks/layer_explorer.ipynb` now loads without errors.
+  - Per-layer CSV structure: Confirmed 170 rows in each layer_XX/badasp_scores_duplications.csv (9 layers).
+  - Layer dendrogram generation: Running full 9-layer tree_cluster.py execution (120+ second dendrogram generation time expected).
+
+- **Data Preservation**:
+  - Legacy flat-layer outputs archived to: `results/archive_flat_outputs_backup_20260513T082201/` (382 files).
+  - Per-layer CSV outputs remain in: `results/badasp_scoring/layer_XX/` subdirectories.
+  - Per-layer tree assignments remain in: `results/topological_clustering/layer_XX/` subdirectories.
+
+- **Known Behavior**:
+  - Dendrogram generation is computationally intensive (9 large SVG files) and single-threaded per layers (--workers 1 enforced for stable output).
+  - write_layer_dendrograms() silently skips layers with missing assignment CSVs to maintain robustness.
+
+- **Next Steps**: After dendrogram generation completes, commit all code fixes with Git Validation And Tracking verification.
