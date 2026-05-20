@@ -936,56 +936,20 @@ def _safe_window(sequence: str, center_1based: int, width: int = 15) -> str:
     return window
 
 
-def _run_tu_json(args: Sequence[str]) -> dict:
-    proc = subprocess.run(list(args), check=False, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(f"ToolUniverse command failed: {' '.join(args)}\\n{proc.stderr.strip()}")
-    return json.loads(proc.stdout)
 
-
-def _tu_literature_hits(query: str, max_hits: int = 5) -> List[dict]:
-    tools = _run_tu_json(["tu", "find", "pubmed pmc europe pmc literature search", "--json"]).get("tools", [])
-    literature_tools = [tool.get("name") for tool in tools if tool.get("name")]
-
-    payload_templates = [
-        {"query": query, "max_results": max_hits},
-        {"term": query, "max_results": max_hits},
-        {"search_query": query, "max_results": max_hits},
-    ]
-    for tool_name in literature_tools:
-        for payload in payload_templates:
-            try:
-                result = _run_tu_json(["tu", "run", tool_name, json.dumps(payload), "--json"])
-            except RuntimeError:
-                continue
-            data = result.get("data", result)
-            if isinstance(data, list) and data:
-                return data[:max_hits]
-            if isinstance(data, dict):
-                for key in ("results", "articles", "items"):
-                    value = data.get(key)
-                    if isinstance(value, list) and value:
-                        return value[:max_hits]
-    return []
 
 
 @lru_cache(maxsize=2048)
 def _protparam(sequence: str) -> dict:
-    if os.getenv("BADASP_LOCAL_PROTPARAM", "0") == "1":
-        cleaned = "".join([aa for aa in sequence.upper() if aa.isalpha()])
-        if not cleaned:
-            return {}
-        analysis = ProteinAnalysis(cleaned)
-        return {
-            "gravy": float(analysis.gravy()),
-            "isoelectric_point": float(analysis.isoelectric_point()),
-        }
-
-    payload = json.dumps({"sequence": sequence})
-    result = _run_tu_json(["tu", "run", "ProtParam_calculate", payload, "--json"])
-    if result.get("status") == "success":
-        return result.get("data", {})
-    return result
+    """Compute GRAVY and isoelectric point using local ProteinAnalysis."""
+    cleaned = "".join([aa for aa in sequence.upper() if aa.isalpha()])
+    if not cleaned:
+        return {}
+    analysis = ProteinAnalysis(cleaned)
+    return {
+        "gravy": float(analysis.gravy()),
+        "isoelectric_point": float(analysis.isoelectric_point()),
+    }
 
 
 def _charge_class(residue: str) -> str:
@@ -1210,9 +1174,6 @@ def run_phase7_analyses(
     mapper = PDBMapper(pdb_id=pdb_id, pdb_file=str(pdb_path))
     mapping = mapper.map_alignment_to_structure(msa_path)
 
-    tu_find = _run_tu_json(["tu", "find", "amino acid properties hydrophobicity charge", "--json"])
-    tu_tools = [tool.get("name") for tool in tu_find.get("tools", [])[:5]]
-
     events_by_level: Dict[str, pd.DataFrame] = {
         DUPLICATION_LEVEL: _load_switch_events_from_duplications(
             tree_path=tree_path,
@@ -1233,7 +1194,6 @@ def run_phase7_analyses(
     community_rows: List[pd.DataFrame] = []
     tax_rows: List[pd.DataFrame] = []
     all_shifts: List[pd.DataFrame] = []
-    top_positions_for_lit: Dict[str, List[int]] = {}
     outputs: Dict[str, Path] = {
         "switch_timeline_svg": timeline_svg,
         "master_dendrogram_switches_svg": master_dendrogram_svg,
@@ -1250,7 +1210,6 @@ def run_phase7_analyses(
             .head(15)
             .tolist()
         )
-        top_positions_for_lit[level] = top_positions
 
         residue_numbers = [
             resnum
@@ -1310,7 +1269,7 @@ def run_phase7_analyses(
             ancestral_records=ancestral_records,
             alignment_records=alignment_records,
             consensus=consensus,
-            tu_tools=tu_tools,
+            tu_tools=[],
         )
         shifts_csv = output_dir / f"physicochemical_shifts_{level}.csv"
         shifts_df.to_csv(shifts_csv, index=False)
@@ -1386,36 +1345,6 @@ def run_phase7_analyses(
             output_cxc=physio_cxc,
         )
         outputs["physicochemical_mapping_cxc"] = physio_cxc
-
-    if os.getenv("BADASP_SKIP_LITERATURE", "0") != "1":
-        lit_queries = [
-            "IPR019888 active site",
-            "IPR019888 specificity residues",
-            "AraC family DNA-binding specificity residues",
-        ]
-        print("ToolUniverse literature cross-reference")
-        print(f"- Queries executed: {', '.join(lit_queries)}")
-        all_hits: List[dict] = []
-        for query in lit_queries:
-            all_hits.extend(_tu_literature_hits(query, max_hits=3))
-        print(f"- Candidate literature hits retrieved: {len(all_hits)}")
-
-        top_predicted = set()
-        for level in analysis_levels:
-            top_predicted.update(top_positions_for_lit.get(level, [])[:10])
-        matched_mentions: List[Tuple[str, int]] = []
-        for hit in all_hits:
-            blob = " ".join(str(hit.get(key, "")) for key in ["title", "abstract", "snippet", "summary"]).lower()
-            for residue in sorted(top_predicted):
-                if str(residue) in blob:
-                    matched_mentions.append((str(hit.get("title", "untitled")), residue))
-
-        if matched_mentions:
-            print("- Overlap between literature residue mentions and top predicted SDPs:")
-            for title, residue in matched_mentions[:10]:
-                print(f"  residue {residue}: {title}")
-        else:
-            print("- No direct residue-number overlap found in retrieved snippets (manual curation recommended).")
 
     return outputs
 
