@@ -1071,7 +1071,8 @@ def summarize_duplication_outputs(
     percentile: Optional[float] = 95.0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
     if pairwise_df.empty:
-        threshold = float("nan") if percentile is None else 0.0
+        # No valid scores: keep threshold undefined instead of forcing a 0.0 floor.
+        threshold = float("nan")
         score_df = pd.DataFrame(
             {
                 "position": np.arange(1, aln_length + 1, dtype=int),
