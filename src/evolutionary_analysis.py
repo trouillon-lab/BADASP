@@ -1,4 +1,6 @@
 from __future__ import annotations
+import matplotlib
+matplotlib.use('Agg')
 
 import argparse
 import json
@@ -111,6 +113,30 @@ def calculate_ca_distance_matrix(pdb_path: Path, residue_numbers: Sequence[int])
         for right in ordered:
             matrix.loc[left, right] = float(np.linalg.norm(ca_coords[left] - ca_coords[right]))
     return matrix
+
+
+def _normalize_residue_number(value: object) -> Optional[int]:
+    """Normalize mapper outputs to a single integer residue number.
+
+    Mapper values may be ints, strings, tuples like (chain, resnum), or lists
+    of such tuples when multiple chains align to one MSA column.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, np.integer, float, np.floating, str)):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(value, tuple) and len(value) >= 2:
+        return _normalize_residue_number(value[1])
+    if isinstance(value, list):
+        for candidate in value:
+            normalized = _normalize_residue_number(candidate)
+            if normalized is not None:
+                return normalized
+        return None
+    return None
 
 
 def compute_coevolution_matrix(events_df: pd.DataFrame) -> pd.DataFrame:
@@ -371,6 +397,112 @@ def _plot_switch_timeline(events_df: pd.DataFrame, output_svg: Path) -> None:
     plt.tight_layout()
     plt.savefig(output_svg, format="svg")
     plt.close()
+
+
+def _layer_sort_key(path: Path) -> Tuple[int, str]:
+    match = re.search(r"layer_(\d+)", path.name)
+    layer_index = int(match.group(1)) if match else 10**9
+    return layer_index, path.name
+
+
+def _read_csv_if_exists(path: Path) -> pd.DataFrame:
+    if path.exists() and path.stat().st_size > 0:
+        return pd.read_csv(path)
+    return pd.DataFrame()
+
+
+def build_global_layer_summary(scores_root: Path, output_csv: Optional[Path] = None) -> pd.DataFrame:
+    scores_root = Path(scores_root)
+    output_csv = Path(output_csv) if output_csv is not None else scores_root / "global_layer_summary.csv"
+    summary_path = scores_root / "global_layer_summary.csv"
+    legacy_summary_path = scores_root / "badasp_layer_summary.csv"
+
+    if summary_path.exists() and summary_path.stat().st_size > 0:
+        summary_df = pd.read_csv(summary_path)
+    elif legacy_summary_path.exists() and legacy_summary_path.stat().st_size > 0:
+        summary_df = pd.read_csv(legacy_summary_path)
+    else:
+        rows: List[dict] = []
+        layer_dirs = sorted(scores_root.glob("layer_*"), key=_layer_sort_key)
+        for layer_dir in layer_dirs:
+            combined_scores = _read_csv_if_exists(layer_dir / "badasp_scores_combined.csv")
+            combined_pairwise = _read_csv_if_exists(layer_dir / "raw_pairwise_combined.csv")
+            duplication_sdps = _read_csv_if_exists(layer_dir / "badasp_sdps_duplications.csv")
+            speciation_sdps = _read_csv_if_exists(layer_dir / "badasp_sdps_speciations.csv")
+            combined_sdps = _read_csv_if_exists(layer_dir / "badasp_sdps_combined.csv")
+
+            layer_index = int(re.search(r"layer_(\d+)", layer_dir.name).group(1)) if re.search(r"layer_(\d+)", layer_dir.name) else 0
+            linkage_threshold = float("nan")
+            if not combined_pairwise.empty and "layer_threshold" in combined_pairwise.columns:
+                thresholds = pd.to_numeric(combined_pairwise["layer_threshold"], errors="coerce").dropna()
+                if not thresholds.empty:
+                    linkage_threshold = float(thresholds.iloc[0])
+
+            valid_pairs = 0
+            if not combined_pairwise.empty:
+                pair_cols = [col for col in ["duplication_node", "left_child", "right_child"] if col in combined_pairwise.columns]
+                if len(pair_cols) == 3:
+                    valid_pairs = int(combined_pairwise[pair_cols].drop_duplicates().shape[0])
+                elif "pair" in combined_pairwise.columns:
+                    valid_pairs = int(combined_pairwise[["pair"]].drop_duplicates().shape[0])
+
+            percentile_threshold = float("nan")
+            if not combined_scores.empty and "global_threshold" in combined_scores.columns:
+                threshold_values = pd.to_numeric(combined_scores["global_threshold"], errors="coerce").dropna()
+                if not threshold_values.empty:
+                    percentile_threshold = float(threshold_values.iloc[0])
+
+            rows.append(
+                {
+                    "layer_index": layer_index,
+                    "linkage_threshold": linkage_threshold,
+                    "number_valid_pairs": valid_pairs,
+                    "95th_percentile_threshold": percentile_threshold,
+                    "total_duplication_sdps": int(len(duplication_sdps)),
+                    "total_speciation_sdps": int(len(speciation_sdps)),
+                    "total_combined_sdps": int(len(combined_sdps)),
+                }
+            )
+
+        summary_df = pd.DataFrame(rows)
+        if not summary_df.empty:
+            summary_df = summary_df.sort_values("layer_index").reset_index(drop=True)
+
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    summary_df.to_csv(output_csv, index=False)
+    return summary_df
+
+
+def plot_layerwise_switch_timeline(summary_df: pd.DataFrame, output_svg: Path) -> None:
+    output_svg.parent.mkdir(parents=True, exist_ok=True)
+    if summary_df.empty:
+        return
+
+    timeline = summary_df.sort_values("layer_index").copy()
+    fig, ax = plt.subplots(figsize=(11, 6))
+    x = timeline["layer_index"].astype(int)
+
+    ax.plot(x, timeline["total_duplication_sdps"].astype(float), marker="o", linewidth=2.0, color="#B24A2A", label="Duplications")
+    ax.plot(x, timeline["total_speciation_sdps"].astype(float), marker="o", linewidth=2.0, color="#2A6FB2", label="Speciations")
+
+    ax.set_xlabel("Layer (ancient -> recent)")
+    ax.set_ylabel("Total SDP count")
+    ax.set_xticks(x.tolist())
+    ax.set_title("BADASP Dual-Track SDP Timeline")
+
+    if "linkage_threshold" in timeline.columns and timeline["linkage_threshold"].notna().any():
+        threshold_labels = [f"{float(val):.2f}" if pd.notna(val) else "" for val in timeline["linkage_threshold"]]
+        top_axis = ax.twiny()
+        top_axis.set_xlim(ax.get_xlim())
+        top_axis.set_xticks(x.tolist())
+        top_axis.set_xticklabels(threshold_labels, rotation=45, ha="left")
+        top_axis.set_xlabel("Linkage Threshold")
+
+    ax.legend(loc="best")
+    ax.grid(axis="y", color="#E6E6E6", linewidth=0.6)
+    fig.tight_layout()
+    fig.savefig(output_svg, format="svg")
+    plt.close(fig)
 
 
 def _plot_master_dendrogram(
@@ -1081,42 +1213,19 @@ def run_phase7_analyses(
     tu_find = _run_tu_json(["tu", "find", "amino acid properties hydrophobicity charge", "--json"])
     tu_tools = [tool.get("name") for tool in tu_find.get("tools", [])[:5]]
 
-    events_by_level: Dict[str, pd.DataFrame] = {}
-    score_by_level: Dict[str, pd.DataFrame] = {}
-
-    scores_dir = duplication_scores_path.parent
-    layer_scores_files = sorted(scores_dir.glob("badasp_scores_layer*.csv"))
-
-    if layer_scores_files:
-        analysis_levels = []
-        for score_file in layer_scores_files:
-            layer_name = score_file.stem.replace("badasp_scores_", "")
-            # Only process the combined layers, or specific layers if we want. For now, all layer CSVs.
-            pairwise_file = scores_dir / f"raw_pairwise_{layer_name}.csv"
-            if not pairwise_file.exists():
-                continue
-            events_by_level[layer_name] = _load_switch_events_from_duplications(
-                tree_path=tree_path,
-                raw_pairwise_path=pairwise_file,
-                named_tree_path=reference_asr_tree_path,
-            )
-            score_by_level[layer_name] = pd.read_csv(score_file)
-            analysis_levels.append(layer_name)
-    else:
-        events_by_level = {
-            DUPLICATION_LEVEL: _load_switch_events_from_duplications(
-                tree_path=tree_path,
-                raw_pairwise_path=raw_pairwise_duplications,
-                named_tree_path=reference_asr_tree_path,
-            )
-        }
-        score_by_level = {
-            DUPLICATION_LEVEL: pd.read_csv(duplication_scores_path),
-        }
+    events_by_level: Dict[str, pd.DataFrame] = {
+        DUPLICATION_LEVEL: _load_switch_events_from_duplications(
+            tree_path=tree_path,
+            raw_pairwise_path=raw_pairwise_duplications,
+            named_tree_path=reference_asr_tree_path,
+        )
+    }
+    score_by_level: Dict[str, pd.DataFrame] = {
+        DUPLICATION_LEVEL: pd.read_csv(duplication_scores_path),
+    }
 
     timeline_svg = output_dir / "switch_timeline.svg"
-    valid_events = [events_by_level[level] for level in analysis_levels if not events_by_level[level].empty]
-    all_events = pd.concat(valid_events, ignore_index=True) if valid_events else pd.DataFrame()
+    all_events = pd.concat([events_by_level[level] for level in analysis_levels], ignore_index=True)
     _plot_switch_timeline(all_events, timeline_svg)
     master_dendrogram_svg = output_dir / "master_dendrogram_switches.svg"
     _plot_master_dendrogram(tree_path=tree_path, events_by_level=events_by_level, output_svg=master_dendrogram_svg)
@@ -1143,15 +1252,13 @@ def run_phase7_analyses(
         )
         top_positions_for_lit[level] = top_positions
 
-        residue_numbers = []
-        for pos in top_positions:
-            if pos in mapping:
-                entries = mapping[pos]
-                if isinstance(entries, int):
-                    residue_numbers.append(int(entries))
-                elif isinstance(entries, list):
-                    for entry in entries:
-                        residue_numbers.append(int(entry[1]))
+        residue_numbers = [
+            resnum
+            for pos in top_positions
+            if pos in mapping
+            for resnum in [_normalize_residue_number(mapping[pos])]
+            if resnum is not None
+        ]
         distance_matrix = calculate_ca_distance_matrix(pdb_path, residue_numbers)
         distance_csv = output_dir / f"distance_matrix_{level}.csv"
         distance_matrix.to_csv(distance_csv, index=True)
@@ -1317,8 +1424,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Phase 7 evolutionary and physicochemical analysis")
     parser.add_argument("--tree", default="results/topological_clustering/mad_rooted.tree")
     parser.add_argument("--assignments", default="results/topological_clustering/tree_cluster_assignments.csv")
-    parser.add_argument("--raw-pairwise-duplications", default="results/badasp_scoring/raw_pairwise.csv")
-    parser.add_argument("--duplication-scores", default="results/badasp_scoring/badasp_scores.csv")
+    parser.add_argument("--raw-pairwise-duplications", default="results/badasp_scoring/raw_pairwise_duplications.csv")
+    parser.add_argument("--duplication-scores", default="results/badasp_scoring/badasp_scores_duplications.csv")
     parser.add_argument("--msa", default="data/interim/IPR019888_trimmed.aln")
     parser.add_argument("--ancestral", default="data/interim/ancestral_sequences.fasta")
     parser.add_argument("--asr-map", default="results/topological_clustering/tree_clusters_asr_mapped.csv")
@@ -1332,6 +1439,40 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = build_parser().parse_args(argv)
+
+    scores_root = Path(args.duplication_scores).parent
+    layer_score_files = sorted(scores_root.glob("layer_*/badasp_scores_duplications.csv"), key=_layer_sort_key)
+    if layer_score_files:
+        summary_csv = Path(args.output_dir) / "global_layer_summary.csv"
+        summary_df = build_global_layer_summary(scores_root=scores_root, output_csv=summary_csv)
+        timeline_svg = Path(args.output_dir) / "switch_timeline.svg"
+        plot_layerwise_switch_timeline(summary_df=summary_df, output_svg=timeline_svg)
+        print(f"Saved global layer summary: {summary_csv}")
+        print(f"Saved layer timeline plot: {timeline_svg}")
+        for score_file in layer_score_files:
+            layer_dir = score_file.parent
+            pairwise_file = layer_dir / "raw_pairwise_duplications.csv"
+            if not pairwise_file.exists():
+                continue
+            layer_out = Path(args.output_dir) / layer_dir.name
+            outputs = run_phase7_analyses(
+                tree_path=Path(args.tree),
+                raw_pairwise_duplications=pairwise_file,
+                duplication_scores_path=score_file,
+                msa_path=Path(args.msa),
+                ancestral_fasta_path=Path(args.ancestral),
+                asr_mapping_path=Path(args.asr_map),
+                domain_architecture_path=Path(args.domain_architecture),
+                pdb_path=Path(args.pdb),
+                output_dir=layer_out,
+                assignments_path=Path(args.assignments) if args.assignments else None,
+                reference_asr_tree_path=Path(args.reference_asr_tree) if args.reference_asr_tree else None,
+                pdb_id=str(args.pdb_id),
+            )
+            for label, path in outputs.items():
+                print(f"Saved {label}: {path}")
+        return
+
     outputs = run_phase7_analyses(
         tree_path=Path(args.tree),
         raw_pairwise_duplications=Path(args.raw_pairwise_duplications),
