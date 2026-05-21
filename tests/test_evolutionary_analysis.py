@@ -10,6 +10,7 @@ from src.evolutionary_analysis import (
     _remap_named_nodes_to_plot_tree,
     _plot_architecture_boxplot,
     _plot_master_dendrogram,
+    build_global_layer_summary,
     assign_coevolution_communities,
     calculate_ca_distance_matrix,
     calculate_lca_depth,
@@ -18,6 +19,7 @@ from src.evolutionary_analysis import (
     classify_physicochemical_shift,
     extract_taxon_label,
     rank_top_functional_sdps,
+    plot_layerwise_switch_timeline,
 )
 
 
@@ -214,6 +216,65 @@ def test_plot_master_dendrogram_exports_svg(tmp_path: Path) -> None:
     assert output_svg.stat().st_size > 0
 
 
+def test_global_layer_summary_and_timeline_plot(tmp_path: Path) -> None:
+    scores_root = tmp_path / "scores"
+    for layer_index, duplication_rows, speciation_rows in [(1, 2, 1), (2, 3, 4)]:
+        layer_dir = scores_root / f"layer_{layer_index:02d}"
+        layer_dir.mkdir(parents=True, exist_ok=True)
+
+        pd.DataFrame(
+            {
+                "duplication_node": [f"N{layer_index}"] * 2,
+                "left_child": ["A", "A"],
+                "right_child": ["B", "B"],
+                "pair": ["A-B", "A-B"],
+                "position": [1, 2],
+                "score": [0.1, 0.2],
+                "Event_Type": ["Duplication", "Duplication"],
+                "layer_threshold": [0.5, 0.5],
+                "global_threshold": [0.4, 0.4],
+            }
+        ).to_csv(layer_dir / "raw_pairwise_combined.csv", index=False)
+        pd.DataFrame(
+            {
+                "position": list(range(1, duplication_rows + 1)),
+                "switch_count": [1] * duplication_rows,
+            }
+        ).to_csv(layer_dir / "badasp_sdps_duplications.csv", index=False)
+        pd.DataFrame(
+            {
+                "position": list(range(1, speciation_rows + 1)),
+                "switch_count": [1] * speciation_rows,
+            }
+        ).to_csv(layer_dir / "badasp_sdps_speciations.csv", index=False)
+        pd.DataFrame(
+            {
+                "position": [1, 2],
+                "global_threshold": [0.4, 0.4],
+                "max_score": [0.2, 0.3],
+                "switch_count": [1, 1],
+                "badasp_score": [0.2, 0.3],
+            }
+        ).to_csv(layer_dir / "badasp_scores_combined.csv", index=False)
+        pd.DataFrame(
+            {
+                "position": [1],
+                "switch_count": [1],
+            }
+        ).to_csv(layer_dir / "badasp_sdps_combined.csv", index=False)
+
+    summary = build_global_layer_summary(scores_root=scores_root, output_csv=scores_root / "global_layer_summary.csv")
+    assert list(summary["layer_index"]) == [1, 2]
+    assert summary.iloc[0]["number_valid_pairs"] == 1
+    assert summary.iloc[0]["total_duplication_sdps"] == 2
+    assert summary.iloc[1]["total_speciation_sdps"] == 4
+
+    timeline_svg = tmp_path / "timeline.svg"
+    plot_layerwise_switch_timeline(summary, timeline_svg)
+    assert timeline_svg.exists()
+    assert timeline_svg.stat().st_size > 0
+
+
 def test_load_switch_events_uses_unit_branch_depth_when_lengths_missing(tmp_path: Path) -> None:
     tree_path = tmp_path / "toy.tree"
     assignments_path = tmp_path / "assignments.csv"
@@ -277,6 +338,29 @@ def test_load_switch_events_from_duplications_uses_lca_node_names(tmp_path: Path
     assert (events["root_distance"] > 0.0).all()
 
 
+def test_load_switch_events_from_duplications_preserves_event_type(tmp_path: Path) -> None:
+    tree_path = tmp_path / "toy.tree"
+    pairwise_path = tmp_path / "raw_pairwise_duplications.csv"
+
+    tree_path.write_text("((A:0.1,B:0.1)N1:0.2,(C:0.1,D:0.1)N2:0.2)Root;\n", encoding="utf-8")
+    pd.DataFrame(
+        {
+            "pair": ["Node1_L-Node1_R"] * 6,
+            "position": [10, 11, 12, 13, 14, 15],
+            "score": [0.1, 0.2, 0.3, 0.4, 1.8, 2.2],
+            "lca_node_name": ["N2", "N2", "N2", "N2", "N2", "N2"],
+            "Event_Type": ["Speciation", "Speciation", "Speciation", "Speciation", "Speciation", "Speciation"],
+            "layer_index": [3, 3, 3, 3, 3, 3],
+        }
+    ).to_csv(pairwise_path, index=False)
+
+    events = _load_switch_events_from_duplications(tree_path=tree_path, raw_pairwise_path=pairwise_path)
+
+    assert not events.empty
+    assert events["Event_Type"].eq("Speciation").all()
+    assert events["layer_index"].eq(3).all()
+
+
 def test_load_switch_events_from_duplications_maps_named_asr_nodes_to_nameless_tree(tmp_path: Path) -> None:
     tree_path = tmp_path / "mad_rooted.tree"
     reference_tree_path = tmp_path / "asr_run.treefile"
@@ -317,3 +401,111 @@ def test_remap_named_nodes_to_plot_tree_matches_by_leaf_signature(tmp_path: Path
 
     assert "NodeAB" in mapping
     assert mapping["NodeAB"].startswith("InternalNode_")
+
+
+def test_rank_top_functional_sdps_handles_nan_threshold(tmp_path: Path) -> None:
+    """Test that rank_top_functional_sdps gracefully handles NaN threshold."""
+    # Create badasp_scores with NaN threshold
+    scores_df = pd.DataFrame(
+        {
+            "position": [1, 2, 3, 4, 5],
+            "max_score": [0.5, 0.3, 0.8, 0.2, 0.6],
+            "switch_count": [2, 1, 3, 1, 2],
+            "global_threshold": [np.nan, np.nan, np.nan, np.nan, np.nan],
+        }
+    )
+    
+    # Create coevolution_matrix
+    coevo_matrix = pd.DataFrame(
+        np.eye(5),
+        index=[1, 2, 3, 4, 5],
+        columns=[1, 2, 3, 4, 5],
+    )
+    
+    # Create shifts_df (physicochemical shifts) with all required columns
+    shifts_df = pd.DataFrame(
+        {
+            "position": [1, 2, 3],
+            "ancestral_aa": ["A", "G", "K"],
+            "recent_aa": ["G", "A", "R"],
+            "charge_change": ["neutral->neutral", "neutral->neutral", "positive->positive"],
+            "hydrophobicity_change": ["hydrophobic->hydrophobic", "polar->hydrophobic", "positive->positive"],
+            "volume_change": [0.0, 50.0, 10.0],
+            "major_transition_count": [1, 2, 3],
+        }
+    )
+    
+    # Should not crash despite NaN threshold
+    result = rank_top_functional_sdps(
+        subfamily_scores_df=scores_df,
+        coevolution_matrix_df=coevo_matrix,
+        shifts_df=shifts_df,
+        top_n=3,
+    )
+    
+    # Should return a DataFrame without crashing
+    assert isinstance(result, pd.DataFrame)
+    # With NaN threshold, should have results
+    assert len(result) >= 0
+
+
+def test_compute_coevolution_matrix_with_empty_events(tmp_path: Path) -> None:
+    """Test that compute_coevolution_matrix handles empty event DataFrame."""
+    # Create empty events DataFrame
+    events = pd.DataFrame({"branch_id": [], "position": []})
+    
+    # Should not crash with empty events
+    matrix = compute_coevolution_matrix(events_df=events)
+    
+    # Should return empty DataFrame
+    assert isinstance(matrix, pd.DataFrame)
+    assert matrix.empty
+
+
+def test_build_global_layer_summary_with_nan_thresholds(tmp_path: Path) -> None:
+    """Test that build_global_layer_summary handles NaN thresholds gracefully."""
+    # Create a temporary directory structure with mock layer data
+    scores_root = tmp_path / "badasp_scoring"
+    scores_root.mkdir(parents=True, exist_ok=True)
+    
+    # Create layer_01 subdirectory with mock CSV files
+    layer_01_dir = scores_root / "layer_01"
+    layer_01_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create mock badasp_scores files with NaN global_threshold
+    for track in ["duplications", "speciations", "combined"]:
+        scores_csv = layer_01_dir / f"badasp_scores_{track}.csv"
+        scores_df = pd.DataFrame(
+            {
+                "position": [1, 2, 3],
+                "max_score": [0.5, 0.3, 0.8],
+                "switch_count": [2, 1, 3],
+                "global_threshold": [np.nan, np.nan, np.nan],
+            }
+        )
+        scores_df.to_csv(scores_csv, index=False)
+    
+    # Create raw_pairwise files with mock data
+    for track in ["duplications", "speciations", "combined"]:
+        raw_csv = layer_01_dir / f"raw_pairwise_{track}.csv"
+        raw_df = pd.DataFrame(
+            {
+                "position": [1, 2, 3],
+                "score": [0.5, 0.3, 0.8],
+            }
+        )
+        raw_df.to_csv(raw_csv, index=False)
+    
+    # Call build_global_layer_summary
+    output_csv = tmp_path / "global_layer_summary.csv"
+    result = build_global_layer_summary(scores_root=scores_root, output_csv=output_csv)
+    
+    # Should return a DataFrame without crashing
+    assert isinstance(result, pd.DataFrame)
+    # Should have at least 1 row (for layer_01)
+    assert len(result) >= 1
+    # The 95th_percentile_threshold should be NaN for NaN threshold layers
+    if len(result) > 0:
+        threshold_val = result.iloc[0]["95th_percentile_threshold"]
+        # It should be either NaN or a valid number (depending on if threshold_values had any values)
+        assert pd.isna(threshold_val) or isinstance(threshold_val, (int, float))

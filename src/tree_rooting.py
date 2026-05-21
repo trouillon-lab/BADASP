@@ -16,6 +16,10 @@ def root_tree(
 ) -> Path:
     output_tree.parent.mkdir(parents=True, exist_ok=True)
 
+    # RESUME LOGIC: Skip if output already exists and is non-empty
+    if output_tree.exists() and output_tree.stat().st_size > 0:
+        return output_tree
+
     if method == "midpoint":
         tree = Phylo.read(str(input_tree), "newick")
         tree.root_at_midpoint()

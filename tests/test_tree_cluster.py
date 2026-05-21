@@ -237,3 +237,39 @@ def test_cluster_tree_topologically_uses_mad_rooting_when_requested(monkeypatch,
     assert calls[0][2] == "mad"
     assert rooted_tree_out.exists()
     assert level_counts["group"] > 0
+
+
+def test_write_multithreshold_cluster_artifacts_writes_layered_outputs(tmp_path: Path) -> None:
+    from src.tree_cluster import write_multithreshold_cluster_artifacts
+
+    rooted_tree = tmp_path / "rooted.tree"
+    rooted_tree.write_text(
+        "(((A:0.05,B:0.05):0.2,(C:0.05,D:0.05):0.2):0.4,((E:0.05,F:0.05):0.2,(G:0.05,H:0.05):0.2):0.4);\n",
+        encoding="utf-8",
+    )
+
+    output_dir = tmp_path / "layers"
+    layer_records = write_multithreshold_cluster_artifacts(
+        rooted_tree_path=rooted_tree,
+        output_dir=output_dir,
+        layer_count=5,
+        min_clade_size=1,
+    )
+
+    assert layer_records
+    assert len(layer_records) >= 2
+    assert (output_dir / "tree_cluster_layers.csv").exists()
+
+    assignments_files = sorted(output_dir.glob("tree_cluster_assignments_layer*.csv"))
+    clusters_files = sorted(output_dir.glob("tree_clusters_layer*.csv"))
+    assert len(assignments_files) == len(clusters_files) == len(layer_records)
+
+    sample_assignments = pd.read_csv(assignments_files[0])
+    assert set(sample_assignments.columns) == {"sequence_id", "cluster_id", "lca_node", "layer_index", "threshold"}
+    assert sample_assignments["cluster_id"].nunique() >= 2
+
+
+def test_build_parser_exposes_multi_threshold_layer_count() -> None:
+    parser = build_parser()
+    args = parser.parse_args([])
+    assert args.multi_threshold_layers == 8

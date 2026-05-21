@@ -44,6 +44,13 @@ fix_lca_mapping.py
 generate_badasp_viz.py
 phase5_badasp_scoring.py
 scripts/explore_badasp_math.py
+scripts/explore_thresholds.py
+scripts/regenerate_stale_plots.py
+scripts/audit_*.py
+scripts/debug_*.py
+REPAIR_GUIDE.md
+patch_call.py
+test_layer_dendrograms.py
 
 # Phylogeny/ASR intermediate files
 *.state
@@ -58,3 +65,4 @@ PIPELINE_STATE.md
 
 # Archived snapshot artifacts
 _archive_v1/
+_archive_v2*/

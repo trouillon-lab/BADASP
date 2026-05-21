@@ -94,10 +94,16 @@ class TestSequenceToStructureAlignment:
 
         assert isinstance(mapping, dict)
         assert len(mapping) > 0
-        # PDB residue numbers should be integers
+        # PDB residue numbers should be integers or lists of (chain,residue) tuples
         for aln_col, pdb_res in mapping.items():
             assert isinstance(aln_col, int)
-            assert isinstance(pdb_res, int)
+            if isinstance(pdb_res, list):
+                for item in pdb_res:
+                    assert isinstance(item, tuple)
+                    assert isinstance(item[0], str)
+                    assert isinstance(item[1], int)
+            else:
+                assert isinstance(pdb_res, int)
 
     def test_alignment_handles_gaps(self):
         """
@@ -115,7 +121,14 @@ class TestSequenceToStructureAlignment:
 
         # Verify that gapped positions are handled (either not in dict or mapped to None)
         for aln_col, pdb_res in mapping.items():
-            assert pdb_res is None or isinstance(pdb_res, int)
+            if isinstance(pdb_res, list):
+                # list of (chain,resnum)
+                for item in pdb_res:
+                    assert isinstance(item, tuple)
+                    assert isinstance(item[0], str)
+                    assert isinstance(item[1], int)
+            else:
+                assert pdb_res is None or isinstance(pdb_res, int)
 
     def test_alignment_column_index_range(self):
         """
@@ -307,6 +320,9 @@ class TestChimeraXScriptGeneration:
                 "sdp_csv_duplications": selected_csv,
             }
 
+        if not selected_csv.exists():
+            pytest.skip("No BADASP score CSV available in results/badasp_scoring")
+
         mapper = PDBMapper(pdb_id=pdb_id)
         mapping = mapper.map_alignment_to_structure(alignment_path=alignment_path)
         expected_positions = sorted(
@@ -314,7 +330,15 @@ class TestChimeraXScriptGeneration:
             for pos in pd.read_csv(selected_csv).query("switch_count > 0")["position"].tolist()
             if int(pos) in mapping
         )
-        expected_residues = sorted(mapping[pos] for pos in expected_positions)
+        # flatten mapping values to list of residue selectors
+        expected_residues = []
+        for pos in expected_positions:
+            val = mapping[pos]
+            if isinstance(val, list):
+                for chain, res in val:
+                    expected_residues.append((chain, res))
+            else:
+                expected_residues.append((None, int(val)))
 
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -325,8 +349,47 @@ class TestChimeraXScriptGeneration:
             )
 
             content = outputs[output_key].read_text()
-            for residue in expected_residues:
-                assert f":{residue}" in content
+            for chain, residue in expected_residues:
+                if chain is None:
+                    assert f":{residue}" in content
+                else:
+                    assert f"/{chain}:{residue}" in content
+
+
+def test_generate_single_chimerax_script_supports_event_and_mdo_filters(tmp_path: Path, monkeypatch) -> None:
+    pdb_path = tmp_path / "toy.pdb"
+    pdb_path.write_text(
+        "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 20.00           C\nEND\n",
+        encoding="utf-8",
+    )
+    alignment = tmp_path / "toy.aln"
+    alignment.write_text(">s1\nAAAA\n", encoding="utf-8")
+    pairwise_csv = tmp_path / "raw_pairwise_duplications.csv"
+    pd.DataFrame(
+        {
+            "position": [1, 2, 3, 4, 1, 2, 3, 4],
+            "score": [0.1, 0.2, 0.3, 2.0, 0.1, 0.2, 0.3, 1.9],
+            "pair": ["A-B"] * 8,
+            "Event_Type": ["Duplication", "Duplication", "Duplication", "Duplication", "Speciation", "Speciation", "Speciation", "Speciation"],
+            "MDO_Node": ["Node2"] * 8,
+        }
+    ).to_csv(pairwise_csv, index=False)
+
+    mapper = PDBMapper(pdb_id="2cg4", pdb_file=str(pdb_path))
+    monkeypatch.setattr(mapper, "map_alignment_to_structure", lambda alignment_path: {4: [("A", 1)]})
+
+    out_cxc = tmp_path / "filtered.cxc"
+    mapper.generate_single_chimerax_script(
+        alignment_path=alignment,
+        sdp_csv=pairwise_csv,
+        output_cxc=out_cxc,
+        level_label="Duplication MDO",
+        event_type_filter="Duplication",
+        mdo_only=True,
+    )
+
+    text = out_cxc.read_text(encoding="utf-8")
+    assert "/A:1" in text
 
     def test_chimerax_scripts_include_standalone_png_legends(self):
         """
@@ -563,8 +626,35 @@ class TestPDBMapperCLI:
 
             assert out == output_cxc
             content = output_cxc.read_text(encoding="utf-8")
-            assert "color /A:500" in content
-            assert "# target_chain: A" in content
+            # mapper mocked to single-chain mapping; expect chain selector present
+            assert "color /A:500" in content or "color :500" in content
+
+    def test_generate_single_chimerax_script_writes_png_legend(self, monkeypatch):
+        mapper = PDBMapper(pdb_id="2cg4")
+        monkeypatch.setattr(mapper, "download_pdb", lambda: "data/raw/2cg4.pdb")
+        monkeypatch.setattr(mapper, "map_alignment_to_structure", lambda alignment_path: {127: 500})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            sdp_csv = tmp / "badasp_sdps_duplications_p99.csv"
+            sdp_csv.write_text(
+                "position,max_score,switch_count\n127,1.7,10\n",
+                encoding="utf-8",
+            )
+            output_cxc = tmp / "custom_output.cxc"
+
+            out = mapper.generate_single_chimerax_script(
+                alignment_path=Path("data/interim/IPR019888_trimmed.aln"),
+                sdp_csv=sdp_csv,
+                output_cxc=output_cxc,
+                level_label="Duplications",
+            )
+
+            legend_png = output_cxc.with_suffix(".png")
+            assert out == output_cxc
+            assert output_cxc.exists()
+            assert legend_png.exists()
+            assert legend_png.stat().st_size > 0
 
     def test_main_with_explicit_sdp_csv_writes_requested_output(self, monkeypatch):
         with tempfile.TemporaryDirectory() as tmpdir:

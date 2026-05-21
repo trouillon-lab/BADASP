@@ -288,6 +288,98 @@ def extract_lca_ancestral_sequences(
     return len(records)
 
 
+def _discover_layer_assignment_files(assignments_path: Path) -> List[Path]:
+    p = Path(assignments_path)
+    if p.is_dir():
+        layer_files = sorted(p.glob("layer_*/tree_cluster_assignments_layer*.csv"))
+        if not layer_files:
+            layer_files = sorted(p.glob("tree_cluster_assignments_layer*.csv"))
+        return layer_files
+
+    parent = p.parent
+    layer_files = sorted(parent.glob("layer_*/tree_cluster_assignments_layer*.csv"))
+    if layer_files:
+        return layer_files
+    # fallback to the single file
+    return [p]
+
+
+def extract_lca_ancestral_sequences_from_layers(
+    tree_path: Path,
+    assignments_dir: Path,
+    node_sequences: Dict[str, str],
+    output_fasta: Path,
+    asr_mapping_csv: Optional[Path] = None,
+    cluster_mapping_csv: Optional[Path] = None,
+    min_clade_size: int = 5,
+) -> int:
+    """Scan all layer assignment files and extract unique LCA ancestral sequences.
+
+    assignments_dir: directory containing `layer_XX/tree_cluster_assignments_layerXX.csv` files
+    """
+    asr_node_map = _load_asr_node_mapping(asr_mapping_csv) if asr_mapping_csv is not None else {}
+    clustered_fasta = cluster_mapping_csv.with_suffix("") if cluster_mapping_csv is not None else None
+    representative_map = (
+        _load_cdhit_representative_mapping(cluster_mapping_csv, clustered_fasta=clustered_fasta)
+        if cluster_mapping_csv is not None
+        else {}
+    )
+
+    tree = Phylo.read(str(tree_path), "newick")
+    tree_tip_names = {terminal.name for terminal in tree.get_terminals() if terminal.name}
+
+    # collect members per reported LCA label across all layer files
+    members_by_node: Dict[str, List[str]] = defaultdict(list)
+    layer_files = _discover_layer_assignment_files(assignments_dir)
+    for f in layer_files:
+        try:
+            with f.open("r", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                for row in reader:
+                    seq = (row.get("sequence_id") or row.get("terminal_name") or "").strip()
+                    lca = (row.get("lca_node") or row.get("lca") or "").strip()
+                    if seq and lca and seq not in members_by_node[lca]:
+                        members_by_node[lca].append(seq)
+        except Exception:
+            continue
+
+    records: List[SeqRecord] = []
+    seen = set()
+    for node_id in tqdm(sorted(members_by_node), desc="Extracting LCAs from layers", unit="node"):
+        members = members_by_node[node_id]
+        resolved_node_id = asr_node_map.get(node_id, node_id)
+        if resolved_node_id == node_id:
+            tree_members = sorted(
+                {
+                    resolved_member
+                    for resolved_member in (
+                        _resolve_representative_tip(member, representative_map) for member in members
+                    )
+                    if resolved_member in tree_tip_names
+                }
+            )
+            if not tree_members:
+                # skip nodes without representatives in tree
+                continue
+            try:
+                lca_node = tree.common_ancestor(tree_members)
+            except Exception:
+                continue
+            resolved_node_id = lca_node.name or resolved_node_id
+
+        if resolved_node_id in seen:
+            continue
+        if resolved_node_id not in node_sequences:
+            # skip missing ASR nodes
+            continue
+        seen.add(resolved_node_id)
+        records.append(SeqRecord(Seq(node_sequences[resolved_node_id]), id=resolved_node_id, description="source=layer_mapping"))
+
+    output_fasta.parent.mkdir(parents=True, exist_ok=True)
+    SeqIO.write(records, str(output_fasta), "fasta")
+    return len(records)
+
+
 def run_asr_pipeline(
     alignment_path: Path,
     tree_path: Path,
@@ -315,9 +407,21 @@ def run_asr_pipeline(
 
     node_sequences = parse_iqtree_state_sequences(state_file)
 
+    assignments_path = Path(assignments_csv)
+    if assignments_path.is_dir():
+        return extract_lca_ancestral_sequences_from_layers(
+            tree_path=asr_tree,
+            assignments_dir=assignments_path,
+            node_sequences=node_sequences,
+            output_fasta=output_fasta,
+            asr_mapping_csv=asr_mapping_csv,
+            cluster_mapping_csv=cluster_mapping_csv,
+            min_clade_size=min_clade_size,
+        )
+
     return extract_lca_ancestral_sequences(
         tree_path=asr_tree,
-        assignments_csv=assignments_csv,
+        assignments_csv=Path(assignments_csv),
         node_sequences=node_sequences,
         output_fasta=output_fasta,
         asr_mapping_csv=asr_mapping_csv,

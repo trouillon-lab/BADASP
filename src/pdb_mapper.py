@@ -440,6 +440,25 @@ class PDBMapper:
         plt.close(fig)
         return output_path
 
+    def write_switch_legend_png(
+        self,
+        output_path: Path,
+        low_hex: str,
+        high_hex: str,
+        min_switch_count: int,
+        max_switch_count: int,
+        level_label: str,
+    ) -> Path:
+        """Write a standalone switch-count legend PNG for a ChimeraX script."""
+        return self._write_switch_legend_png(
+            output_path=output_path,
+            low_hex=low_hex,
+            high_hex=high_hex,
+            min_switch_count=min_switch_count,
+            max_switch_count=max_switch_count,
+            level_label=level_label,
+        )
+
     def generate_chimerax_scripts(
         self,
         alignment_path: Path,
@@ -448,7 +467,6 @@ class PDBMapper:
         sdp_csv_families: Optional[Path] = None,
         sdp_csv_subfamilies: Optional[Path] = None,
         output_dir: Optional[Path] = None,
-        scores_dir: Optional[Path] = None,
     ) -> Dict[str, Path]:
         """Generate ChimeraX scripts for any available BADASP hierarchy outputs."""
         if output_dir is None:
@@ -457,23 +475,12 @@ class PDBMapper:
         pdb_path = Path(self.download_pdb())
         mapping = self.map_alignment_to_structure(alignment_path)
 
-        level_specs = {}
-        if sdp_csv_duplications:
-            level_specs["duplications"] = (sdp_csv_duplications, "highlight_sdps_duplications.cxc")
-        if sdp_csv_groups:
-            level_specs["groups"] = (sdp_csv_groups, "highlight_sdps_groups.cxc")
-        if sdp_csv_families:
-            level_specs["families"] = (sdp_csv_families, "highlight_sdps_families.cxc")
-        if sdp_csv_subfamilies:
-            level_specs["subfamilies"] = (sdp_csv_subfamilies, "highlight_sdps_subfamilies.cxc")
-
-        if scores_dir and scores_dir.exists():
-            for layer_csv in scores_dir.glob("badasp_sdps_layer*.csv"):
-                # layer_csv.stem could be 'badasp_sdps_layer01_duplications'
-                # Extract everything after 'badasp_sdps_'
-                layer_name = layer_csv.stem.replace("badasp_sdps_", "")
-                level_specs[layer_name] = (layer_csv, f"highlight_sdps_{layer_name}.cxc")
-
+        level_specs = {
+            "duplications": (sdp_csv_duplications, "highlight_sdps_duplications.cxc"),
+            "groups": (sdp_csv_groups, "highlight_sdps_groups.cxc"),
+            "families": (sdp_csv_families, "highlight_sdps_families.cxc"),
+            "subfamilies": (sdp_csv_subfamilies, "highlight_sdps_subfamilies.cxc"),
+        }
         level_outputs: Dict[str, Path] = {}
         for level, (csv_path, filename) in level_specs.items():
             if csv_path is None:
@@ -590,6 +597,14 @@ class PDBMapper:
             low_hex,
             high_hex,
             no_switch_reason=no_switch_reason,
+        )
+        self.write_switch_legend_png(
+            output_path=output_cxc.with_suffix(".png"),
+            low_hex=low_hex,
+            high_hex=high_hex,
+            min_switch_count=min_switch_count,
+            max_switch_count=max_switch_count,
+            level_label=level_label,
         )
         return output_cxc
 
@@ -785,6 +800,32 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         print(f"Generated ChimeraX script: {output_cxc}")
         return
 
+    layer_score_dirs = sorted(scores_dir.glob("layer_*"))
+    if layer_score_dirs:
+        all_outputs: List[str] = []
+        track_specs = [
+            ("duplications", "Duplications"),
+            ("speciations", "Speciations"),
+            ("combined", "Combined"),
+        ]
+        for layer_dir in layer_score_dirs:
+            layer_output_dir = output_cxc.parent / layer_dir.name
+            layer_output_dir.mkdir(parents=True, exist_ok=True)
+            for track_name, label in track_specs:
+                sdp_csv = _resolve_sdp_csv(layer_dir, track_name)
+                if not sdp_csv.exists():
+                    continue
+                output_path = layer_output_dir / f"{layer_dir.name}_{track_name}.cxc"
+                mapper.generate_single_chimerax_script(
+                    alignment_path=alignment,
+                    sdp_csv=sdp_csv,
+                    output_cxc=output_path,
+                    level_label=label,
+                )
+                all_outputs.append(str(output_path))
+        print("Generated ChimeraX scripts: " + ", ".join(all_outputs))
+        return
+
     duplications_csv = _resolve_sdp_csv(scores_dir, "duplications")
     groups_csv = _resolve_sdp_csv(scores_dir, "groups")
     families_csv = _resolve_sdp_csv(scores_dir, "families")
@@ -792,12 +833,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     outputs = mapper.generate_chimerax_scripts(
         alignment_path=alignment,
-        sdp_csv_duplications=duplications_csv if duplications_csv.exists() else None,
-        sdp_csv_groups=groups_csv if groups_csv.exists() else None,
-        sdp_csv_families=families_csv if families_csv.exists() else None,
-        sdp_csv_subfamilies=subfamilies_csv if subfamilies_csv.exists() else None,
+        sdp_csv_duplications=duplications_csv,
+        sdp_csv_groups=groups_csv,
+        sdp_csv_families=families_csv,
+        sdp_csv_subfamilies=subfamilies_csv,
         output_dir=output_cxc.parent,
-        scores_dir=scores_dir,
     )
     combined = output_cxc
     if combined.exists() and combined not in set(outputs.values()):

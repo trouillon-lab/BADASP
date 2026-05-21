@@ -1,16 +1,16 @@
 # BADASP Pipeline (IPR019888)
 
 ## Purpose
-This repository implements a reproducible BADASP-inspired computational pipeline focused on the IPR019888 transcription factor family. The workflow performs sequence ingestion, quality-controlled alignment/phylogeny generation, and duplication-directed BADASP scoring to support downstream specificity-determining position analysis.
+This repository implements a reproducible BADASP-inspired computational pipeline focused on the IPR019888 transcription factor family. The workflow performs sequence ingestion, quality-controlled alignment/phylogeny generation, and dual-track BADASP scoring across a 20-layer linear evolutionary timeline to support downstream specificity-determining position analysis.
 
 ## Current Status
 - **Phase 1 (Architecture & Data Ingestion)**: ✓ Complete
 - **Phase 2 (Alignment & Phylogeny)**: ✓ Complete — CD-HIT (default 0.80), FAMSA/MAFFT, trimAl, native OpenMP FastTreeMP
 - **Phase 3 (Topological Subfamily Clustering)**: ✓ Complete — archival support only; downstream scoring now uses duplication-directed clade pairs
 - **Phase 4 (Ancestral Sequence Reconstruction)**: ✓ Complete — single-pass global IQ-TREE2 ASR with hierarchical LCA extraction
-- **Phase 5 (Restricted BADASP Scoring)**: ✓ Complete — Dual-Track (Duplications & Speciations) scoring, LDO/MDO asymmetric branch tagging, multi-layer evaluation
-- **Phase 6 (Structural Mapping)**: ✓ Complete — PyMOL/ChimeraX script generation, sequence-to-structure alignment mapping
-- **Phase 7 (Evolutionary & Physicochemical Analysis)**: ✓ Complete — Evolutionary timeline, structural clustering, co-evolution networks, multi-level synthesis
+- **Phase 5 (Restricted BADASP Scoring)**: ✓ Complete — Dual-Track (Duplications, Speciations, Combined) scoring, LDO/MDO asymmetric branch tagging, 20-layer evaluation
+- **Phase 6 (Structural Mapping)**: ✓ Complete — PyMOL/ChimeraX script generation, sequence-to-structure alignment mapping, per-layer track scripts
+- **Phase 7 (Evolutionary & Physicochemical Analysis)**: ✓ Complete — Linear layer timeline, structural clustering, co-evolution networks, multi-level synthesis
 - **Phase 7b (Advanced Synthesis)**: ✓ Complete — Architectural domain mapping, community extraction, taxonomic distribution
 - **Dendrogram Visualizations**: ✓ Complete & Refined — Orientation standardization, style cleanup (endpoint removal), architecture normalization
 - All development uses TDD and the root virtual environment (`venv/`). Full test suite: **89/89 passing**.
@@ -28,14 +28,14 @@ This repository implements a reproducible BADASP-inspired computational pipeline
 ### Phase 3: Topological Subfamily Clustering
 6. Root tree with the canonical MAD Python implementation (`venv/bin/mad.py`); if unavailable, fall back to midpoint rooting.
 7. Perform high-efficiency O(N) tree slicing via `--multi-layer <int>` (bypassing legacy memory-intensive SciPy linkage).
-8. Cut the tree evenly into N discrete topological layers.
+8. Cut the tree evenly into N discrete topological layers. The pipeline now defaults to a 20-layer linear evolutionary timeline (`--multi-layer 20`), which slices the tree linkage distance into 20 evenly spaced thresholds to improve temporal resolution of divergence events.
 9. Retain clades ≥5 sequences per layer.
 10. Identify and extract clade Last Common Ancestors (LCAs).
 
 ### Phase 4-5: Ancestral Reconstruction & Dual-Track Scoring
 11. Run IQ-TREE2 ASR once on the full alignment/tree (`-asr -T AUTO`) to infer ancestral amino acid sequences.
 12. Map dynamic layer LCA nodes onto the ASR tree to extract the corresponding ancestral sequences from the global reconstruction.
-13. Compute Dual-Track BADASP scores across both "Duplication" and "Speciation" events, analyzing left-vs-right clades at each threshold layer.
+13. Compute Dual-Track BADASP scores across "Duplication", "Speciation", and combined event tracks, analyzing left-vs-right clades at each threshold layer.
 14. Assign LDO (Least Diverged Ortholog) and MDO (Most Diverged Ortholog) asymmetric branches utilizing direct ASR-resolved node distances.
 15. Score formula: `RC - (AC * p(AC))` where RC=conservation, AC=ancestral call, p(AC)=posterior probability.
 16. Calculate 95th percentile threshold on raw pairwise scores across tracks; identify Specificity Determining Positions (SDPs).
@@ -55,13 +55,15 @@ Current reconciliation policy:
 This preserves biological signal while preventing false duplication inflation from metadata artifacts.
 
 ### Architecture Evolution: Multi-Threshold Dual-Track Scoring
-Phase 5 utilizes a Multi-Threshold Dual-Track system. Rather than restricting analysis to static Group/Family/Subfamily tiers, the pipeline generates evenly distributed threshold layers across the dendrogram depth using an optimized O(N) fast-traversal slicing method (`tree_cluster.py --multi-layer 10`).
+Phase 5 uses a 20-layer linear evolutionary timeline rather than static Group/Family/Subfamily tiers. The dendrogram is sliced into evenly spaced linkage thresholds (`tree_cluster.py --multi-layer 20`), ordered from ancient to recent, and the downstream outputs are emitted for three tracks at every layer: `duplications`, `speciations`, and `combined`.
+
+The pipeline uses a "Roll-Down Inheritance" model: assignments propagate from deep to shallow layers so slowly evolving lineages remain coherently assigned rather than being fragmented at shallow cuts. That keeps the timeline comparable across all 20 layers.
 
 How scoring now works:
 1. Ingest reconciliation logic to identify Duplication and Speciation internal nodes.
-2. For each defined layer (`layer01` to `layer10`), assess clade pairs. Keep nodes whose left and right descendant clades each contain at least 5 sequences.
+2. For each defined layer (`layer_01` to `layer_20`), assess clade pairs. Keep nodes whose left and right descendant clades each contain at least 5 sequences.
 3. Compute distances from the immediate parent node to the ASR-resolved LCA node for both branches to establish the Least Diverged Ortholog (LDO) and Most Diverged Ortholog (MDO) tags.
-4. Separate the raw pairwise metrics and threshold-passing scores into three tracks per layer: `Combined`, `Duplications_Only`, and `Speciations_Only`.
+4. Separate the raw pairwise metrics and threshold-passing scores into three tracks per layer: `combined`, `duplications`, and `speciations`.
 5. Downstream processing (Phase 6 mapping, Phase 7 timelines) ingests these discrete tracks dynamically to decouple event types without muddying the phylogenetic signals.
 
 ### Phase 6-7: Structural & Evolutionary Analysis (Complete)
@@ -100,9 +102,10 @@ Results are grouped by analysis purpose and never by phase number:
 - `results/alignment_qc/`: MSA quality outputs
 - `results/topological_clustering/`: tree-clade assignments, LCA summaries, and dendrograms (rotated, color-refined, architecture-normalized)
 - `results/badasp_scoring/`: duplication-directed BADASP scores, switch distributions, and SDP tables
-  - `raw_pairwise_duplications.csv`: pooled left-vs-right clade pair scores for high-confidence duplication nodes
-  - `badasp_scores_duplications.csv`: position-level pooled score table
-  - `badasp_sdps_duplications.csv`: final SDP calls after pooled 95th-percentile thresholding
+  - `raw_pairwise_<track>.csv`: pooled left-vs-right clade pair scores for `duplications`, `speciations`, or `combined`
+  - `badasp_scores_<track>.csv`: position-level pooled score table for each track
+  - `badasp_sdps_<track>.csv`: final SDP calls after track-specific 95th-percentile thresholding
+  - `global_layer_summary.csv`: 20-row cross-layer summary with linkage threshold, valid pair counts, and duplication/speciation SDP totals
 - `results/structural_mapping/`: ChimeraX/PyMOL visualization scripts, PDB mappings, and legends
 - `results/evolutionary_analysis/`: phylogenetic timelines, structural clustering heatmaps, coevolution matrices, physicochemical shifts, architectural domain distributions, compact count-based boxplots, taxonomic SDP mapping, and multilevel synthesized outputs
 

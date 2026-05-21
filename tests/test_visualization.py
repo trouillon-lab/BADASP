@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from scipy.cluster.hierarchy import linkage
 
@@ -74,6 +75,27 @@ def test_plot_topological_dendrogram_writes_svg(tmp_path: Path) -> None:
 
     assert out_svg.exists()
     assert out_svg.stat().st_size > 0
+
+
+def test_plot_duplication_distribution_handles_event_type_groups(tmp_path: Path) -> None:
+    from src.visualization import plot_duplication_badasp_distribution
+
+    raw_pairwise_csv = tmp_path / "raw_pairwise_duplications.csv"
+    output_svg = tmp_path / "badasp_score_distribution_duplications.svg"
+
+    pd.DataFrame(
+        {
+            "pair": ["1-2", "1-2", "3-4", "3-4"],
+            "position": [1, 2, 1, 2],
+            "score": [0.4, 1.8, 0.3, 1.1],
+            "Event_Type": ["Duplication", "Duplication", "Speciation", "Speciation"],
+        }
+    ).to_csv(raw_pairwise_csv, index=False)
+
+    plot_duplication_badasp_distribution(raw_pairwise_csv, output_svg)
+
+    assert output_svg.exists()
+    assert output_svg.stat().st_size > 0
 
 
 def test_plot_hierarchical_badasp_distributions_writes_svg(tmp_path: Path) -> None:
@@ -316,9 +338,9 @@ def test_plot_topological_tree_dendrogram_keeps_level_color(tmp_path: Path) -> N
 
 
 def test_compute_95th_threshold_isolated_per_level() -> None:
-    groups = _compute_95th_threshold([0.01, 0.02, 0.03, 0.04])
-    families = _compute_95th_threshold([0.1, 0.2, 0.3, 0.4])
-    subfamilies = _compute_95th_threshold([1.0, 2.0, 3.0, 4.0])
+    groups = _compute_95th_threshold(np.array([0.01, 0.02, 0.03, 0.04]))
+    families = _compute_95th_threshold(np.array([0.1, 0.2, 0.3, 0.4]))
+    subfamilies = _compute_95th_threshold(np.array([1.0, 2.0, 3.0, 4.0]))
 
     assert groups != families
     assert families != subfamilies
@@ -424,3 +446,96 @@ def test_generate_duplication_tree_switch_plot_remaps_asr_nodes_on_nameless_tree
     svg_text = out_svg.read_text(encoding="utf-8")
     assert out_svg.exists()
     assert "Switch count" in svg_text
+
+
+def test_plot_global_architectural_enrichment_writes_svg_and_csv(tmp_path: Path) -> None:
+    from src.visualization import plot_global_architectural_enrichment
+
+    scores_root = tmp_path / "results" / "badasp_scoring"
+    layer_01 = scores_root / "layer_01"
+    layer_02 = scores_root / "layer_02"
+    layer_01.mkdir(parents=True, exist_ok=True)
+    layer_02.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        {
+            "position": [1, 2, 3],
+            "switch_count": [1, 3, 2],
+            "max_score": [0.2, 0.4, 0.6],
+            "global_threshold": [1.0, 1.0, 1.0],
+        }
+    ).to_csv(layer_01 / "badasp_scores_duplications.csv", index=False)
+    pd.DataFrame(
+        {
+            "position": [2, 3, 4],
+            "switch_count": [2, 1, 4],
+            "max_score": [0.3, 0.7, 0.9],
+            "global_threshold": [1.0, 1.0, 1.0],
+        }
+    ).to_csv(layer_02 / "badasp_scores_duplications.csv", index=False)
+
+    domain_arch_path = tmp_path / "domain_architecture.json"
+    domain_arch_path.write_text(
+        '{"DomainA": [1, 2], "DomainB": [3, 4]}',
+        encoding="utf-8",
+    )
+    out_svg = tmp_path / "global_architectural_enrichment.svg"
+    out_csv = tmp_path / "global_architectural_enrichment.csv"
+
+    result = plot_global_architectural_enrichment(
+        scores_root=scores_root,
+        output_svg=out_svg,
+        domain_arch_path=domain_arch_path,
+        output_csv=out_csv,
+    )
+
+    assert out_svg.exists()
+    assert out_svg.stat().st_size > 0
+    assert out_csv.exists()
+    assert out_csv.stat().st_size > 0
+    assert list(result["position"]) == [1, 2, 3, 4]
+
+
+def test_plot_chronological_switch_timeline_writes_svg(tmp_path: Path) -> None:
+    from src.visualization import plot_chronological_switch_timeline
+
+    tree_path = tmp_path / "mad_rooted.tree"
+    reference_tree_path = tmp_path / "asr_run.treefile"
+    scores_root = tmp_path / "results" / "badasp_scoring"
+    layer_01 = scores_root / "layer_01"
+    layer_02 = scores_root / "layer_02"
+    layer_01.mkdir(parents=True, exist_ok=True)
+    layer_02.mkdir(parents=True, exist_ok=True)
+
+    tree_text = "((A:0.1,B:0.1)N1:0.2,(C:0.1,D:0.1)N2:0.2)Root;\n"
+    tree_path.write_text(tree_text, encoding="utf-8")
+    reference_tree_path.write_text(tree_text, encoding="utf-8")
+
+    pd.DataFrame(
+        {
+            "pair": ["1-2", "1-2", "1-2", "1-2"],
+            "position": [1, 2, 3, 4],
+            "score": [0.1, 0.2, 0.3, 10.0],
+            "duplication_node": ["N1"] * 4,
+        }
+    ).to_csv(layer_01 / "raw_pairwise_duplications.csv", index=False)
+    pd.DataFrame(
+        {
+            "pair": ["3-4", "3-4", "3-4", "3-4"],
+            "position": [1, 2, 3, 4],
+            "score": [0.2, 0.3, 0.4, 9.5],
+            "duplication_node": ["N2"] * 4,
+        }
+    ).to_csv(layer_02 / "raw_pairwise_duplications.csv", index=False)
+
+    out_svg = tmp_path / "chronological_switch_timeline.svg"
+    timeline = plot_chronological_switch_timeline(
+        tree_path=tree_path,
+        scores_root=scores_root,
+        output_svg=out_svg,
+        reference_asr_tree_path=reference_tree_path,
+    )
+
+    assert out_svg.exists()
+    assert out_svg.stat().st_size > 0
+    assert not timeline.empty
+    assert set(timeline["layer_name"]) == {"layer_01", "layer_02"}

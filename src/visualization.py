@@ -1,4 +1,8 @@
 import argparse
+import json
+import re
+import matplotlib
+matplotlib.use('Agg')
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -39,10 +43,24 @@ def build_terminal_color_map(assignments_path: Path, cluster_column: str) -> Dic
     return color_map
 
 
+def build_terminal_cluster_map(assignments_path: Path, cluster_column: str) -> Dict[str, str]:
+    assignments = pd.read_csv(assignments_path)
+    if cluster_column not in assignments.columns:
+        raise ValueError(f"Missing required column in {assignments_path}: {cluster_column}")
+
+    cluster_map: Dict[str, str] = {}
+    members = assignments[["sequence_id", cluster_column]].dropna(subset=[cluster_column])
+    for row in members.itertuples(index=False):
+        cluster_map[str(row.sequence_id)] = str(getattr(row, cluster_column))
+    return cluster_map
+
+
 def _subtree_terminal_color(
     clade: Clade,
     terminal_colors: Optional[Dict[str, str]],
     cache: Dict[int, Optional[str]],
+    terminal_clusters: Optional[Dict[str, str]] = None,
+    cluster_cache: Optional[Dict[int, Optional[str]]] = None,
 ) -> Optional[str]:
     if terminal_colors is None:
         return None
@@ -51,14 +69,45 @@ def _subtree_terminal_color(
         return cache[key]
 
     if clade.is_terminal():
-        color = terminal_colors.get(str(clade.name))
+        leaf_name = str(clade.name)
+        color = terminal_colors.get(leaf_name)
         cache[key] = color
+        if cluster_cache is not None:
+            if terminal_clusters is not None:
+                cluster_cache[key] = terminal_clusters.get(leaf_name)
+            else:
+                cluster_cache[key] = color
         return color
 
-    child_colors = [_subtree_terminal_color(child, terminal_colors, cache) for child in clade.clades]
-    non_null_colors = [color for color in child_colors if color is not None]
-    # Keep a subtree colored when all mapped descendants agree; unmapped leaves do not force gray.
-    color = non_null_colors[0] if non_null_colors and len(set(non_null_colors)) == 1 else None
+    child_colors = [
+        _subtree_terminal_color(
+            child,
+            terminal_colors,
+            cache,
+            terminal_clusters=terminal_clusters,
+            cluster_cache=cluster_cache,
+        )
+        for child in clade.clades
+    ]
+
+    if terminal_clusters is not None and cluster_cache is not None:
+        child_cluster_ids = [cluster_cache.get(id(child)) for child in clade.clades]
+        non_null_cluster_ids = [cluster_id for cluster_id in child_cluster_ids if cluster_id is not None]
+        if non_null_cluster_ids and len(set(non_null_cluster_ids)) == 1:
+            selected_cluster = non_null_cluster_ids[0]
+            color = None
+            for child, child_color in zip(clade.clades, child_colors):
+                if cluster_cache.get(id(child)) == selected_cluster and child_color is not None:
+                    color = child_color
+                    break
+            cluster_cache[key] = selected_cluster
+        else:
+            color = None
+            cluster_cache[key] = None
+    else:
+        non_null_colors = [color for color in child_colors if color is not None]
+        # Legacy behavior: subtree is colored when all mapped descendants agree by color.
+        color = non_null_colors[0] if non_null_colors and len(set(non_null_colors)) == 1 else None
     cache[key] = color
     return color
 
@@ -563,12 +612,14 @@ def _draw_rotated_tree_axes(
     line_color: str = "#666666",
     line_width: float = 0.7,
     terminal_colors: Optional[Dict[str, str]] = None,
+    terminal_clusters: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[Clade, float], Dict[Clade, float]]:
     depths = tree.depths()
     if not max(depths.values()):
         depths = tree.depths(unit_branch_lengths=True)
     x_positions = _build_y_positions(tree)
     subtree_colors: Dict[int, Optional[str]] = {}
+    subtree_clusters: Dict[int, Optional[str]] = {}
 
     def _draw(node: Clade) -> None:
         x = x_positions[node]
@@ -576,7 +627,13 @@ def _draw_rotated_tree_axes(
         for child in node.clades:
             child_x = x_positions[child]
             child_y = depths[child]
-            child_color = _subtree_terminal_color(child, terminal_colors, subtree_colors)
+            child_color = _subtree_terminal_color(
+                child,
+                terminal_colors,
+                subtree_colors,
+                terminal_clusters=terminal_clusters,
+                cluster_cache=subtree_clusters,
+            )
             branch_color = child_color or line_color
             ax.plot([x, child_x], [y, y], color=branch_color, linewidth=line_width)
             ax.plot([child_x, child_x], [y, child_y], color=branch_color, linewidth=line_width)
@@ -593,13 +650,21 @@ def plot_topological_tree_dendrogram(
     title: str = "Topological Clustering Dendrogram",
     line_color: str = "#B0B0B0",
     terminal_colors: Optional[Dict[str, str]] = None,
+    terminal_clusters: Optional[Dict[str, str]] = None,
 ) -> None:
     tree = Phylo.read(str(tree_path), "newick")
     _ensure_tree_node_names(tree)
 
     output_svg.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(12, 8))
-    _draw_rotated_tree_axes(ax, tree, line_color=line_color, line_width=0.8, terminal_colors=terminal_colors)
+    _draw_rotated_tree_axes(
+        ax,
+        tree,
+        line_color=line_color,
+        line_width=0.8,
+        terminal_colors=terminal_colors,
+        terminal_clusters=terminal_clusters,
+    )
     ax.set_title(title)
     ax.set_xlabel("Taxa / internal nodes")
     ax.set_ylabel("Branch length from root")
@@ -763,6 +828,149 @@ def plot_tree_with_switches(
     fig.savefig(output_svg, format="svg")
     plt.close(fig)
 
+
+def _layer_directory_key(path: Path) -> Tuple[int, str]:
+    match = re.search(r"layer_(\d+)", path.as_posix())
+    if match:
+        return int(match.group(1)), path.as_posix()
+    return 10**9, path.as_posix()
+
+
+def _tree_relative_time_lookup(tree: Tree) -> Dict[Clade, float]:
+    depths = tree.depths()
+    if not max(depths.values()):
+        depths = tree.depths(unit_branch_lengths=True)
+
+    relative_times: Dict[Clade, float] = {}
+    for clade in tree.find_clades(order="preorder"):
+        relative_times[clade] = float(depths.get(clade, 0.0))
+    return relative_times
+
+
+def plot_global_architectural_enrichment(
+    scores_root: Path,
+    output_svg: Path,
+    domain_arch_path: Path = Path("data/domain_architecture.json"),
+    output_csv: Optional[Path] = None,
+    track: str = "duplications",
+) -> pd.DataFrame:
+    """Pool per-layer switch counts and plot a global architectural enrichment profile."""
+    scores_root = Path(scores_root)
+    output_svg = Path(output_svg)
+    output_csv = Path(output_csv) if output_csv is not None else output_svg.with_suffix(".csv")
+
+    layer_tables = sorted(scores_root.glob(f"layer_*/badasp_scores_{track}.csv"), key=_layer_directory_key)
+    if not layer_tables:
+        layer_tables = sorted(scores_root.glob("layer_*/badasp_scores_*.csv"), key=_layer_directory_key)
+
+    pooled_rows: List[dict] = []
+    for layer_table in layer_tables:
+        if not layer_table.exists() or layer_table.stat().st_size == 0:
+            continue
+        try:
+            table = pd.read_csv(layer_table)
+        except pd.errors.EmptyDataError:
+            continue
+        if "position" not in table.columns or "switch_count" not in table.columns:
+            continue
+
+        positions = pd.to_numeric(table["position"], errors="coerce")
+        switch_counts = pd.to_numeric(table["switch_count"], errors="coerce").fillna(0.0)
+        layer_name = layer_table.parent.name
+        layer_index = _layer_directory_key(layer_table.parent)[0]
+        valid_mask = positions.notna() & switch_counts.notna()
+        for position, switch_count in zip(positions[valid_mask].astype(int), switch_counts[valid_mask].astype(float)):
+            pooled_rows.append(
+                {
+                    "layer_index": layer_index,
+                    "layer_name": layer_name,
+                    "position": int(position),
+                    "switch_count": float(switch_count),
+                }
+            )
+
+    output_svg.parent.mkdir(parents=True, exist_ok=True)
+    if not pooled_rows:
+        empty_df = pd.DataFrame(columns=["position", "pooled_switch_count", "supporting_layers", "cumulative_switch_count"])
+        empty_df.to_csv(output_csv, index=False)
+        fig, ax = plt.subplots(figsize=(12, 4))
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No layer switch data available", ha="center", va="center")
+        ax.set_title("Global Architectural Enrichment")
+        fig.tight_layout()
+        fig.savefig(output_svg, format="svg")
+        plt.close(fig)
+        return empty_df
+
+    pooled_df = pd.DataFrame(pooled_rows)
+    enrichment = (
+        pooled_df.groupby("position", as_index=False)
+        .agg(
+            pooled_switch_count=("switch_count", "sum"),
+            supporting_layers=("layer_name", "nunique"),
+        )
+        .sort_values("position")
+        .reset_index(drop=True)
+    )
+    enrichment["cumulative_switch_count"] = enrichment["pooled_switch_count"].cumsum()
+    enrichment.to_csv(output_csv, index=False)
+
+    domain_arch: Dict[str, Sequence[int]] = {}
+    if domain_arch_path.exists():
+        with domain_arch_path.open("r", encoding="utf-8") as handle:
+            domain_arch = json.load(handle)
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    if domain_arch:
+        palette = sns.color_palette("Set2", n_colors=max(1, len(domain_arch))).as_hex()
+        y_max = float(enrichment["pooled_switch_count"].max()) if not enrichment.empty else 1.0
+        for idx, (domain, span) in enumerate(domain_arch.items()):
+            start, end = int(span[0]), int(span[1])
+            color = palette[idx % len(palette)]
+            ax.axvspan(start, end, color=color, alpha=0.08, zorder=0)
+            ax.text(
+                (start + end) / 2.0,
+                y_max * 1.02,
+                domain,
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color="#444444",
+            )
+
+    ax.bar(
+        enrichment["position"].astype(int),
+        enrichment["pooled_switch_count"].astype(float),
+        width=1.0,
+        color="#4C78A8",
+        alpha=0.65,
+        label="Pooled switch count",
+        zorder=2,
+    )
+    ax.set_xlabel("Alignment Position")
+    ax.set_ylabel("Pooled Switch Count")
+    ax.set_title("Global Architectural Enrichment Across 20 Layers")
+    ax.set_xlim(1, int(enrichment["position"].max()))
+
+    cumulative_axis = ax.twinx()
+    cumulative_axis.plot(
+        enrichment["position"].astype(int),
+        enrichment["cumulative_switch_count"].astype(float),
+        color="#B24A2A",
+        linewidth=2.0,
+        label="Cumulative pooled switches",
+        zorder=3,
+    )
+    cumulative_axis.set_ylabel("Cumulative Switch Count")
+
+    handles, labels = ax.get_legend_handles_labels()
+    cum_handles, cum_labels = cumulative_axis.get_legend_handles_labels()
+    ax.legend(handles + cum_handles, labels + cum_labels, frameon=False, loc="upper left")
+    ax.grid(axis="y", color="#E6E6E6", linewidth=0.6)
+    fig.tight_layout()
+    fig.savefig(output_svg, format="svg")
+    plt.close(fig)
+    return enrichment
 
 def generate_tree_switch_plots(
     rooted_tree_path: Path,
@@ -1011,7 +1219,7 @@ def main() -> None:
     parser.add_argument("--length-output", default=str(default_length_out))
     parser.add_argument("--msa", default=None, help="Input MSA FASTA for gap-per-column plot.")
     parser.add_argument("--gap-output", default=str(default_gap_out))
-    parser.add_argument("--duplication-pairwise", default="results/badasp_scoring/raw_pairwise.csv")
+    parser.add_argument("--duplication-pairwise", default="results/badasp_scoring/raw_pairwise_duplications.csv")
     parser.add_argument("--rooted-tree", default="results/topological_clustering/mad_rooted.tree")
     parser.add_argument("--duplication-distribution-output", default=str(default_dup_dist_out))
     parser.add_argument("--duplication-switch-output", default=str(default_dup_switch_out))
@@ -1031,6 +1239,31 @@ def main() -> None:
 
     pairwise_path = Path(args.duplication_pairwise)
     rooted_tree_path = Path(args.rooted_tree)
+
+    layer_pairwise_files = sorted(pairwise_path.parent.glob("layer_*/raw_pairwise_duplications.csv"))
+    if layer_pairwise_files:
+        for layer_pairwise in layer_pairwise_files:
+            layer_dir = layer_pairwise.parent
+            dist_out = layer_dir / "badasp_score_distribution_duplications.svg"
+            switch_out = layer_dir / "switch_counts_duplications.svg"
+            tree_out = layer_dir / "tree_switches_duplications.svg"
+            dendro_out = layer_dir / "dendrogram_switches_duplications.svg"
+
+            plot_duplication_badasp_distribution(raw_pairwise_path=layer_pairwise, output_svg=dist_out)
+            plot_duplication_switch_counts(raw_pairwise_path=layer_pairwise, output_svg=switch_out)
+            if rooted_tree_path.exists():
+                generate_duplication_tree_switch_plot(
+                    rooted_tree_path=rooted_tree_path,
+                    raw_pairwise_duplications=layer_pairwise,
+                    output_svg=tree_out,
+                )
+                generate_duplication_tree_switch_plot(
+                    rooted_tree_path=rooted_tree_path,
+                    raw_pairwise_duplications=layer_pairwise,
+                    output_svg=dendro_out,
+                )
+            print(f"Saved layer duplication plots: {layer_dir}")
+        return
 
     if pairwise_path.exists():
         plot_duplication_badasp_distribution(
@@ -1064,3 +1297,66 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+def plot_chronological_switch_timeline(
+    tree_path: Path,
+    aln_path: Path,
+    switch_path: Path,
+    output_svg: Path
+) -> None:
+    """Generates a relative timeline by mapping internal node IDs to evolutionary depths."""
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    import pandas as pd
+    import numpy as np
+    from Bio import Phylo
+
+    print(f"  -> Loading tree for timeline mapping: {tree_path}")
+    tree = Phylo.read(str(tree_path), "newick")
+    depths = tree.depths()
+    max_d = max(depths.values()) if depths else 1.0
+    
+    # CRITICAL FIX: Map EVERY node name (Internal or Tip) to its depth
+    node_depths = {node.name: (depths.get(node, 0.0) / max_d) for node in tree.find_clades() if node.name}
+    print(f"  -> Mapped {len(node_depths)} internal and tip nodes.")
+
+    # Helper to load events
+    def get_switch_times(event_type):
+        path = switch_path.parent / switch_path.name.replace("duplications", event_type)
+        if not path.exists(): return []
+        df = pd.read_csv(path)
+        if 'score' not in df.columns: return []
+        
+        # Filter for top 5%
+        scores = pd.to_numeric(df['score'], errors='coerce').dropna()
+        if scores.empty: return []
+        threshold = np.percentile(scores, 95)
+        switched = df[df['score'] >= threshold]['pair'].unique()
+        
+        times = []
+        for pair in switched:
+            # Check both sides of the node pair
+            nodes = str(pair).split('-')
+            for node in nodes:
+                if node in node_depths:
+                    times.append(node_depths[node])
+                    break # Found the mapping, move to next pair
+        return times
+
+    dup_times = get_switch_times("duplications")
+    spec_times = get_switch_times("speciations")
+    print(f"  -> Successfully mapped {len(dup_times)} Duplications and {len(spec_times)} Speciations.")
+
+    plt.figure(figsize=(10, 6))
+    if dup_times:
+        sns.kdeplot(dup_times, color="#B24A2A", fill=True, label="Duplications", linewidth=2, alpha=0.3)
+    if spec_times:
+        sns.kdeplot(spec_times, color="#2A6FB2", fill=True, label="Speciations", linewidth=2, alpha=0.3)
+    
+    plt.title("Evolutionary Emergence of Functional Switches")
+    plt.xlabel("Relative Time (0.0 = Root, 1.0 = Modern Day)")
+    plt.ylabel("Density of Switches")
+    plt.legend(frameon=False)
+    plt.tight_layout()
+    plt.savefig(output_svg, format="svg")
+    plt.close()
