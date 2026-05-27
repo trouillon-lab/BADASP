@@ -14,7 +14,7 @@ parameters:
   cdhit_word_size: 5
   trimal_gap_threshold: 0.2
   iqtree_model: LG+G
-  iqtree_bootstrap: 100
+  iqtree_bootstrap: 1000
 
 paths:
   raw_fasta: data/raw/IPR019888.fasta
