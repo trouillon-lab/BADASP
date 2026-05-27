@@ -115,6 +115,8 @@ Generated CSV outputs under `results/` are treated as local analysis artifacts a
 
 ## Reproducibility Notes
 - Use root virtual environment commands, for example: `./venv/bin/python -m pytest -q`.
+- Snakemake workflow entry point: `./venv/bin/python -m snakemake -n -j1 --snakefile Snakefile`.
+- The reconciliation workflow stages AleRax inputs under `data/interim/alerax/` and writes final outputs under `results/reconciliation/alerax/`.
 - Generate vector figures as SVG by default.
 - `_archive_v1/` is excluded from active development and execution.
 - The pipeline intentionally uses a single MAD execution path through `venv/bin/mad.py` (no separate binary-mode integration in pipeline code).

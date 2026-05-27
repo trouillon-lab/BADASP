@@ -1,0 +1,30 @@
+project:
+  family_name: IPR019888
+
+tools:
+  python: ./venv/bin/python
+  cd_hit: cd-hit
+  famsa: famsa
+  trimal: trimal
+  iqtree: iqtree2
+  alerax: alerax
+
+parameters:
+  cdhit_identity: 0.8
+  cdhit_word_size: 5
+  trimal_gap_threshold: 0.2
+  iqtree_model: LG+G
+  iqtree_bootstrap: 100
+
+paths:
+  raw_fasta: data/raw/IPR019888.fasta
+  clustered_fasta: data/interim/IPR019888_clustered.fasta
+  clustered_clstr: data/interim/IPR019888_clustered.fasta.clstr
+  aligned_fasta: data/interim/IPR019888_clustered.aln.fasta
+  trimmed_fasta: data/interim/IPR019888_trimmed.aln
+  iqtree_prefix: data/interim/iqtree/IPR019888
+  species_tree_source: data/interim/ncbi_species_tree.nwk
+  species_tree_normalized: data/interim/alerax/IPR019888_species_tree.nwk
+  alerax_mapping: data/interim/alerax/IPR019888.treerecs_mapping.link
+  alerax_families: data/interim/alerax/IPR019888.families.txt
+  alerax_output_dir: results/reconciliation/alerax/IPR019888

@@ -7,3 +7,4 @@ seaborn
 joblib
 tqdm
 ete3
+snakemake>=8.0
