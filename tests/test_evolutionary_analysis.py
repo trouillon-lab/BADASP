@@ -268,6 +268,12 @@ def test_global_layer_summary_and_timeline_plot(tmp_path: Path) -> None:
     assert summary.iloc[0]["number_valid_pairs"] == 1
     assert summary.iloc[0]["total_duplication_sdps"] == 2
     assert summary.iloc[1]["total_speciation_sdps"] == 4
+    assert summary.iloc[0]["valid_duplication_nodes"] == 2
+    assert summary.iloc[0]["valid_speciation_nodes"] == 1
+    assert summary.iloc[0]["total_valid_nodes"] == 3
+    assert summary.iloc[1]["valid_duplication_nodes"] == 3
+    assert summary.iloc[1]["valid_speciation_nodes"] == 4
+    assert summary.iloc[1]["total_valid_nodes"] == 7
 
     timeline_svg = tmp_path / "timeline.svg"
     plot_layerwise_switch_timeline(summary, timeline_svg)

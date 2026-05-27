@@ -476,18 +476,26 @@ def write_multithreshold_cluster_artifacts(
             pass
 
         start_write = time.time()
-        cluster_rows = [
-            {
-                "layer_index": int(layer_idx),
-                "threshold": float(threshold),
-                "cluster_id": int(cluster_id),
-                "member_count": int(len(members)),
-                "lca_node": lca_map[int(cluster_id)],
-            }
-            for cluster_id, members in sorted(cluster_members_final.items(), key=lambda item: int(item[0]))
-        ]
+        cluster_rows = []
+        if cluster_members_final:
+            cluster_rows = [
+                {
+                    "layer_index": int(layer_idx),
+                    "threshold": float(threshold),
+                    "cluster_id": int(cluster_id),
+                    "member_count": int(len(members)),
+                    "lca_node": lca_map[int(cluster_id)],
+                }
+                for cluster_id, members in sorted(cluster_members_final.items(), key=lambda item: int(item[0]))
+            ]
         pd.DataFrame(cluster_rows).to_csv(cluster_path, index=False)
         print(f"  [PROFILE] Cluster CSV write took {time.time() - start_write:.3f}s")
+
+        # Also copy clusters to output root for backward compatibility
+        try:
+            shutil.copyfile(str(cluster_path), str(output_dir / cluster_path.name))
+        except Exception:
+            pass
 
         
 
@@ -797,9 +805,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-hierarchical-plots", action="store_true", default=False, help="Skip generating hierarchical (group/family/subfamily) dendrogram SVGs")
     return parser
 
-# Legacy hierarchical (Group/Family/Subfamily) artifact writers removed.
-# The pipeline now exclusively materializes multi-threshold layer artifacts
-# via `write_multithreshold_cluster_artifacts()` and per-layer dendrograms.
+def write_hierarchical_tree_artifacts(
+    clusters_csv: Path,
+    assignments_csv: Path,
+    rooted_tree_output: Path,
+    output_dir: Path,
+) -> None:
+    """Writes level-specific hierarchical CSV and tree files for backward compatibility."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Load and split clusters
+    if clusters_csv.exists():
+        df_clusters = pd.read_csv(clusters_csv)
+        for lvl, suffix in [("group", "groups"), ("family", "families"), ("subfamily", "subfamilies")]:
+            sub = df_clusters[df_clusters["level"] == lvl]
+            sub.to_csv(output_dir / f"tree_clusters_{suffix}.csv", index=False)
+            
+    # Load and split assignments
+    if assignments_csv.exists():
+        df_assign = pd.read_csv(assignments_csv)
+        for lvl, suffix in [("group", "groups"), ("family", "families"), ("subfamily", "subfamilies")]:
+            cols = ["sequence_id", f"{lvl}_id", f"{lvl}_lca_node"]
+            # Map back to group_id/group_lca_node but rename to cluster_id/lca_node
+            sub = df_assign[cols].rename(columns={
+                f"{lvl}_id": "cluster_id",
+                f"{lvl}_lca_node": "lca_node"
+            })
+            sub.to_csv(output_dir / f"tree_cluster_assignments_{suffix}.csv", index=False)
+            
+    # Copy trees
+    if rooted_tree_output.exists():
+        for suffix in ["groups", "families", "subfamilies"]:
+            shutil.copyfile(str(rooted_tree_output), str(output_dir / f"midpoint_rooted_{suffix}.tree"))
 
 
 def _plot_layer_dendrogram_task(tree_path_str: str, layer_assignments_csv_str: str, output_svg_str: str, layer_idx: str):

@@ -55,7 +55,7 @@ def test_tiny_tree_reconciliation_counts_are_exact(tmp_path: Path) -> None:
         phylo_tree_factory=lambda path: PhyloTree(path, format=1),
     )
 
-    assert counts == {"Duplication": 0, "Speciation": 3}
+    assert counts == {"Duplication": 0, "Speciation": 3, "Unresolved": 0}
     assert output_csv.exists()
 
     with output_csv.open("r", encoding="utf-8") as handle:
@@ -98,7 +98,7 @@ def test_reconciliation_falls_back_to_clustered_fasta_when_trimmed_alignment_has
         phylo_tree_factory=lambda path: PhyloTree(path, format=1),
     )
 
-    assert counts == {"Duplication": 0, "Speciation": 3}
+    assert counts == {"Duplication": 0, "Speciation": 3, "Unresolved": 0}
     assert output_csv.exists()
 
 
@@ -137,6 +137,7 @@ def test_classify_fuzzy_event_thresholds() -> None:
     assert classify_fuzzy_event({"1", "2", "3"}, {"4", "5"}) == "Speciation"
     assert classify_fuzzy_event({"1", "2", "3"}, {"2", "3", "4"}) == "Speciation"
     assert classify_fuzzy_event({str(i) for i in range(100)}, {str(i) for i in range(50, 150)}) == "Duplication"
+    assert classify_fuzzy_event(set(), set()) == "Unresolved"
 
 
 def test_strict_garbage_taxonomy_terms_only() -> None:

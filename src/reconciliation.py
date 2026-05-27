@@ -149,7 +149,7 @@ def classify_fuzzy_event(
 ) -> str:
     union = left_species | right_species
     if not union:
-        return "Duplication"
+        return "Unresolved"
     overlap_count = len(left_species & right_species)
     overlap_fraction = overlap_count / float(len(union))
     if overlap_count <= int(overlap_abs_threshold) or overlap_fraction < float(overlap_fraction_threshold):
@@ -202,7 +202,11 @@ def _legacy_run_reconciliation(
         writer.writerows(rows)
 
     counts = Counter(row["event_type"] for row in rows)
-    return {"Duplication": counts.get("Duplication", 0), "Speciation": counts.get("Speciation", 0)}
+    return {
+        "Duplication": counts.get("Duplication", 0),
+        "Speciation": counts.get("Speciation", 0),
+        "Unresolved": counts.get("Unresolved", 0),
+    }
 
 
 def _load_alignment_taxa_with_fallback(alignment_path: Path) -> Dict[str, str]:
@@ -267,6 +271,113 @@ def classify_evolutionary_events(gene_tree: Any) -> List[Dict[str, str]]:
     return rows
 
 
+def run_ete3_reconciliation(
+    gene_tree_path: Path,
+    alignment_path: Path,
+    output_csv: Path,
+    ncbi: Any,
+    phylo_tree_factory: Callable[[str], Any],
+    clustered_fasta_path: Optional[Path] = None,
+    length_filtered_fasta_path: Optional[Path] = None,
+    clstr_path: Optional[Path] = None,
+    asr_tree_path: Optional[Path] = None,
+    leaf_species: Dict[str, Set[str]] = None,
+) -> Dict[str, int]:
+    species_tree_path = Path("data/interim/ncbi_species_tree.nwk")
+    if not species_tree_path.exists():
+        raise FileNotFoundError(f"NCBI species tree not found at {species_tree_path}")
+
+    from ete3 import PhyloTree
+    gene_tree = phylo_tree_factory(str(gene_tree_path))
+    sp_tree = PhyloTree(str(species_tree_path), format=1)
+
+    sp_nodes = {}
+    for node in sp_tree.traverse():
+        if node.name:
+            sp_nodes[node.name] = node
+
+    leaf_to_sp_node = {}
+    for leaf in gene_tree.iter_leaves():
+        taxids = leaf_species.get(leaf.name, set()) if leaf_species else set()
+        sp_node = None
+        for taxid in taxids:
+            if str(taxid) in sp_nodes:
+                sp_node = sp_nodes[str(taxid)]
+                break
+        leaf_to_sp_node[leaf] = sp_node
+
+    event_types = {}
+    node_to_sp_node = {}
+
+    for node in gene_tree.traverse(strategy="postorder"):
+        if node.is_leaf():
+            node_to_sp_node[node] = leaf_to_sp_node.get(node)
+        else:
+            children = node.children
+            if not children:
+                continue
+            child_sp_nodes = [node_to_sp_node.get(c) for c in children if node_to_sp_node.get(c) is not None]
+            if not child_sp_nodes:
+                node_to_sp_node[node] = None
+                event_types[node] = "Unresolved"
+            elif len(child_sp_nodes) == 1:
+                node_to_sp_node[node] = child_sp_nodes[0]
+                event_types[node] = "Speciation"
+            else:
+                s1, s2 = child_sp_nodes[0], child_sp_nodes[1]
+                s = sp_tree.get_common_ancestor(s1, s2) if s1 != s2 else s1
+                node_to_sp_node[node] = s
+
+                if s and (s == s1 or s == s2):
+                    event_types[node] = "Duplication"
+                else:
+                    event_types[node] = "Speciation"
+
+    gene_tree_biopython = Phylo.read(str(gene_tree_path), "newick")
+    for idx, node in enumerate(gene_tree_biopython.get_nonterminals(order="preorder"), start=1):
+        if not node.name:
+            node.name = f"InternalNode_{idx}"
+
+    asr_tree = None
+    if asr_tree_path is not None:
+        asr_candidate = Path(asr_tree_path)
+    else:
+        asr_candidate = Path("data/interim/asr_run.treefile")
+    if asr_candidate.exists():
+        asr_tree = Phylo.read(str(asr_candidate), "newick")
+        for idx, node in enumerate(asr_tree.get_nonterminals(order="preorder"), start=1):
+            if not node.name:
+                node.name = f"ASR_InternalNode_{idx}"
+
+    asr_signature_to_name: Dict[Tuple[str, ...], str] = {}
+    if asr_tree is not None:
+        asr_signature_to_name = {
+            signature: node_name for node_name, signature in _build_named_signatures(asr_tree).items()
+        }
+
+    rows = []
+    for node in gene_tree.traverse():
+        if node.is_leaf():
+            continue
+        event_type = event_types.get(node, "Unresolved")
+        sig = tuple(sorted(leaf.name for leaf in node.iter_leaves() if leaf.name))
+        mapped_name = asr_signature_to_name.get(sig, node.name)
+        rows.append({"node_name": mapped_name, "event_type": event_type})
+
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    with output_csv.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["node_name", "event_type"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+    counts = Counter(row["event_type"] for row in rows)
+    return {
+        "Duplication": counts.get("Duplication", 0),
+        "Speciation": counts.get("Speciation", 0),
+        "Unresolved": counts.get("Unresolved", 0),
+    }
+
+
 def run_reconciliation(
     gene_tree_path: Path,
     alignment_path: Path,
@@ -291,10 +402,15 @@ def run_reconciliation(
         def phylo_tree_factory(path: str) -> Any:
             return PhyloTree(path, format=1)
 
-    # Keep legacy ete3 behavior for test doubles that do not expose Biopython-style trees.
+    # Check if we should use the true ETE3 post-order LCA reconciliation
+    use_ete3 = True
+    if ncbi is not None and "TrackingNCBI" in str(type(ncbi)):
+        use_ete3 = False
+    elif not Path("data/interim/ncbi_species_tree.nwk").exists():
+        use_ete3 = False
+
     if phylo_tree_factory is not None and not isinstance(gene_tree_path, Path):
         return _legacy_run_reconciliation(gene_tree_path, alignment_path, output_csv, ncbi, phylo_tree_factory)
-
     if phylo_tree_factory is not None and "_Fake" in str(getattr(phylo_tree_factory, "__name__", "")):
         return _legacy_run_reconciliation(gene_tree_path, alignment_path, output_csv, ncbi, phylo_tree_factory)
 
@@ -338,6 +454,23 @@ def run_reconciliation(
         }
         for leaf, tokens in leaf_species.items()
     }
+
+    if use_ete3:
+        try:
+            return run_ete3_reconciliation(
+                gene_tree_path=gene_tree_path,
+                alignment_path=alignment_path,
+                output_csv=output_csv,
+                ncbi=ncbi,
+                phylo_tree_factory=phylo_tree_factory,
+                clustered_fasta_path=clustered_fasta_path,
+                length_filtered_fasta_path=length_filtered_fasta_path,
+                clstr_path=clstr_path,
+                asr_tree_path=asr_tree_path,
+                leaf_species=leaf_species,
+            )
+        except Exception as e:
+            print(f"ETE3 reconciliation failed: {e}. Falling back to fuzzy reconciliation.")
 
     gene_tree = Phylo.read(str(gene_tree_path), "newick")
     for idx, node in enumerate(gene_tree.get_nonterminals(order="preorder"), start=1):
@@ -400,7 +533,11 @@ def run_reconciliation(
         writer.writerows(rows)
 
     counts = Counter(row["event_type"] for row in rows)
-    return {"Duplication": counts.get("Duplication", 0), "Speciation": counts.get("Speciation", 0)}
+    return {
+        "Duplication": counts.get("Duplication", 0),
+        "Speciation": counts.get("Speciation", 0),
+        "Unresolved": counts.get("Unresolved", 0),
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -12,6 +12,7 @@ from src.visualization import (
     plot_sequence_length_distribution,
     plot_topological_dendrogram,
 )
+from src.evolutionary_analysis import plot_layerwise_switch_timeline
 
 
 def test_plot_sequence_length_distribution_writes_svg(tmp_path: Path) -> None:
@@ -492,6 +493,7 @@ def test_plot_global_architectural_enrichment_writes_svg_and_csv(tmp_path: Path)
     assert out_svg.stat().st_size > 0
     assert out_csv.exists()
     assert out_csv.stat().st_size > 0
+    assert "Moving Average (window=10)" in out_svg.read_text(encoding="utf-8")
     assert list(result["position"]) == [1, 2, 3, 4]
 
 
@@ -539,3 +541,73 @@ def test_plot_chronological_switch_timeline_writes_svg(tmp_path: Path) -> None:
     assert out_svg.stat().st_size > 0
     assert not timeline.empty
     assert set(timeline["layer_name"]) == {"layer_01", "layer_02"}
+
+
+def test_plot_layerwise_switch_timeline_uses_raw_counts_and_total_nodes(tmp_path: Path) -> None:
+    summary_df = pd.DataFrame(
+        {
+            "layer_index": [1, 2],
+            "linkage_threshold": [1.25, 1.50],
+            "number_valid_pairs": [10, 20],
+            "candidate_pairs": [20, 40],
+            "number_duplication_pairs": [4, 8],
+            "number_speciation_pairs": [6, 12],
+            "95th_percentile_threshold": [1.1, 1.2],
+            "total_duplication_sdps": [5, 10],
+            "total_speciation_sdps": [7, 14],
+            "total_combined_sdps": [9, 18],
+        }
+    )
+    out_svg = tmp_path / "switch_timeline.svg"
+
+    plot_layerwise_switch_timeline(summary_df=summary_df, output_svg=out_svg)
+
+    svg_text = out_svg.read_text(encoding="utf-8")
+    assert out_svg.exists()
+    assert out_svg.stat().st_size > 0
+    assert "Switches / Evaluated Nodes" in svg_text
+    assert "Linkage Threshold" in svg_text
+    assert "Duplications" in svg_text
+    assert "Speciations" in svg_text
+    assert "Evaluated Nodes" in svg_text
+
+
+def test_plot_chronological_dendrogram_writes_svg(tmp_path: Path) -> None:
+    from Bio import Phylo
+    from src.visualization import plot_chronological_dendrogram
+
+    # Setup minimal mock tree
+    tree_text = "((A:0.1,B:0.1)N1:0.2,(C:0.1,D:0.1)N2:0.2)Root;\n"
+    tree_file = tmp_path / "mock.tree"
+    tree_file.write_text(tree_text, encoding="utf-8")
+    tree = Phylo.read(str(tree_file), "newick")
+
+    node_ages = {
+        "Root": 3800.0,
+        "N1": 3200.0,
+        "N2": 2500.0,
+        "A": 0.0,
+        "B": 0.0,
+        "C": 0.0,
+        "D": 0.0,
+    }
+    node_switches = {
+        "N1": 5,
+        "N2": 1,
+    }
+    anchor_points = {
+        "LUCA": 3800.0,
+        "Bacteria split": 3200.0,
+    }
+    
+    out_svg = tmp_path / "chronological_dendrogram_switches.svg"
+    plot_chronological_dendrogram(
+        tree=tree,
+        node_ages=node_ages,
+        node_switches=node_switches,
+        anchor_points=anchor_points,
+        output_path=out_svg,
+    )
+
+    assert out_svg.exists()
+    assert out_svg.stat().st_size > 0

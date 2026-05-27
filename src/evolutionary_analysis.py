@@ -414,62 +414,118 @@ def _read_csv_if_exists(path: Path) -> pd.DataFrame:
 def build_global_layer_summary(scores_root: Path, output_csv: Optional[Path] = None) -> pd.DataFrame:
     scores_root = Path(scores_root)
     output_csv = Path(output_csv) if output_csv is not None else scores_root / "global_layer_summary.csv"
-    summary_path = scores_root / "global_layer_summary.csv"
-    legacy_summary_path = scores_root / "badasp_layer_summary.csv"
+    source_summary_path = scores_root / "badasp_layer_summary.csv"
+    layer_dirs = sorted(scores_root.glob("layer_*"), key=_layer_sort_key)
 
-    if summary_path.exists() and summary_path.stat().st_size > 0:
-        summary_df = pd.read_csv(summary_path)
-    elif legacy_summary_path.exists() and legacy_summary_path.stat().st_size > 0:
-        summary_df = pd.read_csv(legacy_summary_path)
-    else:
-        rows: List[dict] = []
-        layer_dirs = sorted(scores_root.glob("layer_*"), key=_layer_sort_key)
-        for layer_dir in layer_dirs:
-            combined_scores = _read_csv_if_exists(layer_dir / "badasp_scores_combined.csv")
-            combined_pairwise = _read_csv_if_exists(layer_dir / "raw_pairwise_combined.csv")
-            duplication_sdps = _read_csv_if_exists(layer_dir / "badasp_sdps_duplications.csv")
-            speciation_sdps = _read_csv_if_exists(layer_dir / "badasp_sdps_speciations.csv")
-            combined_sdps = _read_csv_if_exists(layer_dir / "badasp_sdps_combined.csv")
+    if not layer_dirs and source_summary_path.exists() and source_summary_path.stat().st_size > 0:
+        summary_df = pd.read_csv(source_summary_path)
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+        summary_df.to_csv(output_csv, index=False)
+        return summary_df
 
-            layer_index = int(re.search(r"layer_(\d+)", layer_dir.name).group(1)) if re.search(r"layer_(\d+)", layer_dir.name) else 0
-            linkage_threshold = float("nan")
-            if not combined_pairwise.empty and "layer_threshold" in combined_pairwise.columns:
-                thresholds = pd.to_numeric(combined_pairwise["layer_threshold"], errors="coerce").dropna()
-                if not thresholds.empty:
-                    linkage_threshold = float(thresholds.iloc[0])
+    rows: List[dict] = []
+    for layer_dir in layer_dirs:
+        combined_pairwise = _read_csv_if_exists(layer_dir / "raw_pairwise_combined.csv")
+        raw_dup = _read_csv_if_exists(layer_dir / "raw_pairwise_duplications.csv")
+        raw_spec = _read_csv_if_exists(layer_dir / "raw_pairwise_speciations.csv")
+        dup_node_source = raw_dup if not raw_dup.empty else _read_csv_if_exists(layer_dir / "badasp_sdps_duplications.csv")
+        spec_node_source = raw_spec if not raw_spec.empty else _read_csv_if_exists(layer_dir / "badasp_sdps_speciations.csv")
 
-            valid_pairs = 0
-            if not combined_pairwise.empty:
-                pair_cols = [col for col in ["duplication_node", "left_child", "right_child"] if col in combined_pairwise.columns]
-                if len(pair_cols) == 3:
-                    valid_pairs = int(combined_pairwise[pair_cols].drop_duplicates().shape[0])
-                elif "pair" in combined_pairwise.columns:
-                    valid_pairs = int(combined_pairwise[["pair"]].drop_duplicates().shape[0])
+        def _count_valid_nodes(df: pd.DataFrame) -> int:
+            if df.empty:
+                return 0
+            for column_name in ("duplication_node", "source_parent_node", "lca_node_name", "parent_node", "pair"):
+                if column_name in df.columns:
+                    values = df[column_name].dropna().astype(str)
+                    if not values.empty:
+                        return int(values.nunique())
+            return int(len(df))
 
-            percentile_threshold = float("nan")
-            if not combined_scores.empty and "global_threshold" in combined_scores.columns:
-                threshold_values = pd.to_numeric(combined_scores["global_threshold"], errors="coerce").dropna()
-                if not threshold_values.empty:
-                    percentile_threshold = float(threshold_values.iloc[0])
+        valid_duplication_nodes = _count_valid_nodes(dup_node_source)
+        valid_speciation_nodes = _count_valid_nodes(spec_node_source)
 
-            rows.append(
-                {
-                    "layer_index": layer_index,
-                    "linkage_threshold": linkage_threshold,
-                    "number_valid_pairs": valid_pairs,
-                    "95th_percentile_threshold": percentile_threshold,
-                    "total_duplication_sdps": int(len(duplication_sdps)),
-                    "total_speciation_sdps": int(len(speciation_sdps)),
-                    "total_combined_sdps": int(len(combined_sdps)),
-                }
-            )
+        layer_index = int(re.search(r"layer_(\d+)", layer_dir.name).group(1)) if re.search(r"layer_(\d+)", layer_dir.name) else 0
+        linkage_threshold = float("nan")
+        if not combined_pairwise.empty and "layer_threshold" in combined_pairwise.columns:
+            thresholds = pd.to_numeric(combined_pairwise["layer_threshold"], errors="coerce").dropna()
+            if not thresholds.empty:
+                linkage_threshold = float(thresholds.iloc[0])
 
-        summary_df = pd.DataFrame(rows)
-        if not summary_df.empty:
-            summary_df = summary_df.sort_values("layer_index").reset_index(drop=True)
+        valid_pairs = 0
+        if not combined_pairwise.empty:
+            pair_cols = [col for col in ["duplication_node", "left_child", "right_child"] if col in combined_pairwise.columns]
+            if len(pair_cols) == 3:
+                valid_pairs = int(combined_pairwise[pair_cols].drop_duplicates().shape[0])
+            elif "pair" in combined_pairwise.columns:
+                valid_pairs = int(combined_pairwise[["pair"]].drop_duplicates().shape[0])
+
+        # Comparisons (valid sister clade pairs)
+        dup_comps = raw_dup["pair"].nunique() if not raw_dup.empty and "pair" in raw_dup.columns else 0
+        spec_comps = raw_spec["pair"].nunique() if not raw_spec.empty and "pair" in raw_spec.columns else 0
+        comb_comps = combined_pairwise["pair"].nunique() if not combined_pairwise.empty and "pair" in combined_pairwise.columns else 0
+
+        # Switch events (rows >= 95th percentile score)
+        dup_switches = 0
+        if not raw_dup.empty and "score" in raw_dup.columns:
+            scores = pd.to_numeric(raw_dup["score"], errors="coerce").dropna()
+            if not scores.empty:
+                thresh = np.percentile(scores, 95)
+                dup_switches = int((scores >= thresh).sum())
+        else:
+            dup_sdps = _read_csv_if_exists(layer_dir / "badasp_sdps_duplications.csv")
+            dup_switches = len(dup_sdps)
+
+        spec_switches = 0
+        if not raw_spec.empty and "score" in raw_spec.columns:
+            scores = pd.to_numeric(raw_spec["score"], errors="coerce").dropna()
+            if not scores.empty:
+                thresh = np.percentile(scores, 95)
+                spec_switches = int((scores >= thresh).sum())
+        else:
+            spec_sdps = _read_csv_if_exists(layer_dir / "badasp_sdps_speciations.csv")
+            spec_switches = len(spec_sdps)
+
+        comb_switches = 0
+        if not combined_pairwise.empty and "score" in combined_pairwise.columns:
+            scores = pd.to_numeric(combined_pairwise["score"], errors="coerce").dropna()
+            if not scores.empty:
+                thresh = np.percentile(scores, 95)
+                comb_switches = int((scores >= thresh).sum())
+        else:
+            comb_sdps = _read_csv_if_exists(layer_dir / "badasp_sdps_combined.csv")
+            comb_switches = len(comb_sdps)
+
+        percentile_threshold = float("nan")
+        if not combined_pairwise.empty and "score" in combined_pairwise.columns:
+            scores = pd.to_numeric(combined_pairwise["score"], errors="coerce").dropna()
+            if not scores.empty:
+                percentile_threshold = float(np.percentile(scores, 95))
+
+        rows.append(
+            {
+                "layer_index": layer_index,
+                "linkage_threshold": linkage_threshold,
+                "number_valid_pairs": comb_comps if comb_comps > 0 else valid_pairs,
+                "number_duplication_pairs": dup_comps,
+                "number_speciation_pairs": spec_comps,
+                "valid_duplication_nodes": valid_duplication_nodes,
+                "valid_speciation_nodes": valid_speciation_nodes,
+                "total_valid_nodes": int(valid_duplication_nodes + valid_speciation_nodes),
+                "95th_percentile_threshold": percentile_threshold,
+                "total_duplication_sdps": dup_switches,
+                "total_speciation_sdps": spec_switches,
+                "total_combined_sdps": comb_switches,
+            }
+        )
+
+    summary_df = pd.DataFrame(rows)
+    if not summary_df.empty:
+        summary_df = summary_df.sort_values("layer_index").reset_index(drop=True)
 
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     summary_df.to_csv(output_csv, index=False)
+    if source_summary_path != output_csv:
+        summary_df.to_csv(source_summary_path, index=False)
     return summary_df
 
 
@@ -482,13 +538,55 @@ def plot_layerwise_switch_timeline(summary_df: pd.DataFrame, output_svg: Path) -
     fig, ax = plt.subplots(figsize=(11, 6))
     x = timeline["layer_index"].astype(int)
 
-    ax.plot(x, timeline["total_duplication_sdps"].astype(float), marker="o", linewidth=2.0, color="#B24A2A", label="Duplications")
-    ax.plot(x, timeline["total_speciation_sdps"].astype(float), marker="o", linewidth=2.0, color="#2A6FB2", label="Speciations")
+    duplication_nodes = (
+        timeline["valid_duplication_nodes"].astype(float)
+        if "valid_duplication_nodes" in timeline.columns
+        else timeline["number_duplication_pairs"].astype(float)
+        if "number_duplication_pairs" in timeline.columns
+        else pd.Series(0.0, index=timeline.index)
+    )
+    speciation_nodes = (
+        timeline["valid_speciation_nodes"].astype(float)
+        if "valid_speciation_nodes" in timeline.columns
+        else timeline["number_speciation_pairs"].astype(float)
+        if "number_speciation_pairs" in timeline.columns
+        else pd.Series(0.0, index=timeline.index)
+    )
+    total_nodes = (
+        timeline["number_valid_pairs"].astype(float)
+        if "number_valid_pairs" in timeline.columns
+        else timeline["candidate_pairs"].astype(float)
+        if "candidate_pairs" in timeline.columns
+        else duplication_nodes.add(speciation_nodes, fill_value=0.0)
+    )
+
+    duplication_switches = timeline.get("total_duplication_sdps", pd.Series(0.0, index=timeline.index)).astype(float)
+    speciation_switches = timeline.get("total_speciation_sdps", pd.Series(0.0, index=timeline.index)).astype(float)
+
+    duplication_rate = np.divide(
+        duplication_switches.to_numpy(dtype=float),
+        total_nodes.to_numpy(dtype=float),
+        out=np.zeros(len(timeline), dtype=float),
+        where=total_nodes.to_numpy(dtype=float) > 0,
+    )
+    speciation_rate = np.divide(
+        speciation_switches.to_numpy(dtype=float),
+        total_nodes.to_numpy(dtype=float),
+        out=np.zeros(len(timeline), dtype=float),
+        where=total_nodes.to_numpy(dtype=float) > 0,
+    )
+
+    ax.plot(x, duplication_rate, marker="o", linewidth=2.0, color="#B24A2A", label="Duplications")
+    ax.plot(x, speciation_rate, marker="o", linewidth=2.0, color="#2A6FB2", label="Speciations")
+
+    ax2 = ax.twinx()
+    ax2.plot(x, total_nodes.to_numpy(dtype=float), marker="o", linewidth=2.0, color="#666666", linestyle="--", label="Evaluated Nodes")
 
     ax.set_xlabel("Layer (ancient -> recent)")
-    ax.set_ylabel("Total SDP count")
+    ax.set_ylabel("Switches / Evaluated Nodes")
+    ax2.set_ylabel("Evaluated Nodes")
     ax.set_xticks(x.tolist())
-    ax.set_title("BADASP Dual-Track SDP Timeline")
+    ax.set_title("BADASP Switch Event Timeline")
 
     if "linkage_threshold" in timeline.columns and timeline["linkage_threshold"].notna().any():
         threshold_labels = [f"{float(val):.2f}" if pd.notna(val) else "" for val in timeline["linkage_threshold"]]
@@ -498,7 +596,9 @@ def plot_layerwise_switch_timeline(summary_df: pd.DataFrame, output_svg: Path) -
         top_axis.set_xticklabels(threshold_labels, rotation=45, ha="left")
         top_axis.set_xlabel("Linkage Threshold")
 
-    ax.legend(loc="best")
+    handles_left, labels_left = ax.get_legend_handles_labels()
+    handles_right, labels_right = ax2.get_legend_handles_labels()
+    ax.legend(handles_left + handles_right, labels_left + labels_right, loc="best")
     ax.grid(axis="y", color="#E6E6E6", linewidth=0.6)
     fig.tight_layout()
     fig.savefig(output_svg, format="svg")
@@ -638,6 +738,150 @@ def _plot_master_dendrogram(
     handles, labels = ax.get_legend_handles_labels()
     if handles and labels:
         ax.legend(title="Event Source", loc="upper left")
+    fig.tight_layout()
+    output_svg.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_svg, format="svg")
+    plt.close(fig)
+
+
+def _plot_linkage_master_dendrogram(
+    tree_path: Path,
+    events_by_level: Dict[str, pd.DataFrame],
+    output_svg: Path,
+) -> None:
+    """Draw one linkage cophenetic-distance master dendrogram with switch events from all hierarchy levels overlaid at LCA nodes."""
+    from scipy.cluster.hierarchy import dendrogram
+    from src.tree_cluster import tree_to_linkage
+    from src.visualization import _compute_dendrogram_node_coords
+
+    tree = Phylo.read(str(tree_path), "newick")
+    _ensure_node_names(tree)
+
+    labels, linkage_rows = tree_to_linkage(tree)
+    z = np.asarray(linkage_rows, dtype=float)
+    n_leaves = len(labels)
+    label_to_index = {name: i for i, name in enumerate(labels)}
+
+    dend_dict = dendrogram(z, no_plot=True)
+    leaves_order = dend_dict["leaves"]
+
+    x_by_node, y_by_node, descendants = _compute_dendrogram_node_coords(z, leaves_order)
+
+    fig, ax = plt.subplots(figsize=(12, 10))
+
+    for i, row in enumerate(z):
+        left = int(row[0])
+        right = int(row[1])
+        p = n_leaves + i
+        ax.plot([x_by_node[left], x_by_node[right]], [y_by_node[p], y_by_node[p]], color="#B0B0B0", linewidth=0.8, zorder=1)
+        ax.plot([x_by_node[left], x_by_node[left]], [y_by_node[left], y_by_node[p]], color="#B0B0B0", linewidth=0.8, zorder=1)
+        ax.plot([x_by_node[right], x_by_node[right]], [y_by_node[right], y_by_node[p]], color="#B0B0B0", linewidth=0.8, zorder=1)
+
+    level_colors = {
+        "groups": "#1F77B4",
+        "families": "#D95F02",
+        "subfamilies": "#2CA02C",
+        DUPLICATION_LEVEL: "#B24A2A",
+    }
+    level_labels = {
+        "groups": "Groups",
+        "families": "Families",
+        "subfamilies": "Subfamilies",
+        DUPLICATION_LEVEL: "Duplications",
+    }
+
+    node_by_name = {str(clade.name): clade for clade in tree.find_clades() if clade.name}
+    all_switch_counts: List[float] = []
+    grouped_by_level: Dict[str, pd.DataFrame] = {}
+
+    for level, events_df in events_by_level.items():
+        if events_df.empty:
+            continue
+        if "switch_count" in events_df.columns:
+            grouped = (
+                events_df.groupby("branch_id")
+                .agg(switch_count=("switch_count", "sum"))
+                .reset_index()
+            )
+        else:
+            grouped = (
+                events_df.groupby("branch_id")
+                .agg(switch_count=("position", "size"), mean_score=("score", "mean"))
+                .reset_index()
+            )
+        grouped_by_level[level] = grouped
+        all_switch_counts.extend(grouped["switch_count"].astype(float).tolist())
+
+    max_switch = max(all_switch_counts) if all_switch_counts else 1.0
+
+    gene_to_linkage_node = {}
+    for node_name, clade in node_by_name.items():
+        terminals = clade.get_terminals()
+        leaf_indices = frozenset(label_to_index[t.name] for t in terminals if t.name in label_to_index)
+        gene_to_linkage_node[node_name] = leaf_indices
+
+    descendants_to_linkage_id = {desc: nid for nid, desc in descendants.items()}
+
+    preferred_order = ["subfamilies", "families", "groups", DUPLICATION_LEVEL]
+    level_order = [level for level in preferred_order if level in grouped_by_level]
+    level_order.extend([level for level in grouped_by_level if level not in level_order])
+    style_map = {
+        "subfamilies": {"marker": "o", "alpha": 0.75, "filled": True, "zorder": 3, "base": 28.0, "scale": 180.0},
+        "families": {"marker": "o", "alpha": 0.95, "filled": False, "zorder": 4, "base": 40.0, "scale": 220.0},
+        "groups": {"marker": "s", "alpha": 1.0, "filled": False, "zorder": 5, "base": 52.0, "scale": 260.0},
+        DUPLICATION_LEVEL: {"marker": "o", "alpha": 0.9, "filled": True, "zorder": 4, "base": 34.0, "scale": 220.0},
+    }
+
+    for level in level_order:
+        grouped = grouped_by_level.get(level)
+        if grouped is None or grouped.empty:
+            continue
+
+        style = style_map.get(
+            level,
+            {"marker": "o", "alpha": 0.9, "filled": True, "zorder": 4, "base": 34.0, "scale": 220.0},
+        )
+        x_vals: List[float] = []
+        y_vals: List[float] = []
+        sizes: List[float] = []
+
+        for _, row in grouped.iterrows():
+            branch_id = str(row["branch_id"])
+            if branch_id not in node_by_name:
+                continue
+            leaf_indices = gene_to_linkage_node.get(branch_id)
+            if not leaf_indices:
+                continue
+            linkage_id = descendants_to_linkage_id.get(leaf_indices)
+            if linkage_id is None:
+                continue
+            x_vals.append(float(x_by_node[linkage_id]))
+            y_vals.append(float(y_by_node[linkage_id]))
+            sizes.append(float(style["base"]) + float(style["scale"]) * (float(row["switch_count"]) / float(max_switch)))
+
+        if not x_vals:
+            continue
+
+        ax.scatter(
+            x_vals,
+            y_vals,
+            s=sizes,
+            c=level_colors.get(level, "#444444") if style["filled"] else "none",
+            alpha=float(style["alpha"]),
+            linewidths=1.1,
+            edgecolors=level_colors.get(level, "#444444"),
+            marker=str(style["marker"]),
+            label=level_labels.get(level, level),
+            zorder=int(style["zorder"]),
+        )
+
+    ax.set_xlabel("Taxa / internal nodes")
+    ax.set_ylabel("Hierarchical Linkage Distance")
+    ax.set_xticks([])
+    ax.set_title("Master Linkage Dendrogram with BADASP Switch Events")
+    handles, labels = ax.get_legend_handles_labels()
+    if handles and labels:
+        ax.legend(title="Event Source", loc="upper right")
     fig.tight_layout()
     output_svg.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_svg, format="svg")
@@ -1190,6 +1434,8 @@ def run_phase7_analyses(
     _plot_switch_timeline(all_events, timeline_svg)
     master_dendrogram_svg = output_dir / "master_dendrogram_switches.svg"
     _plot_master_dendrogram(tree_path=tree_path, events_by_level=events_by_level, output_svg=master_dendrogram_svg)
+    master_linkage_dendrogram_svg = output_dir / "master_linkage_dendrogram_switches.svg"
+    _plot_linkage_master_dendrogram(tree_path=tree_path, events_by_level=events_by_level, output_svg=master_linkage_dendrogram_svg)
 
     community_rows: List[pd.DataFrame] = []
     tax_rows: List[pd.DataFrame] = []
@@ -1197,6 +1443,7 @@ def run_phase7_analyses(
     outputs: Dict[str, Path] = {
         "switch_timeline_svg": timeline_svg,
         "master_dendrogram_switches_svg": master_dendrogram_svg,
+        "master_linkage_dendrogram_switches_svg": master_linkage_dendrogram_svg,
     }
 
     for level in analysis_levels:
@@ -1400,6 +1647,88 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             )
             for label, path in outputs.items():
                 print(f"Saved {label}: {path}")
+
+        # Run time-calibrated chronological timeline analysis
+        try:
+            from src.chronological_timeline import run_chronology_pipeline, load_calibrations
+            from src.visualization import plot_chronological_dendrogram
+            from Bio import Phylo
+            from ete3 import NCBITaxa
+            import json
+            import numpy as np
+            import pandas as pd
+
+            chrono_svg = Path(args.output_dir) / "chronological_switch_timeline.svg"
+            asr_tree_path = Path(args.reference_asr_tree) if args.reference_asr_tree else Path("data/interim/asr_run.treefile")
+            
+            node_ages = run_chronology_pipeline(
+                tree_path=asr_tree_path,
+                fasta_path=Path(args.msa).parent / "IPR019888_length_filtered.fasta",
+                calibration_config=Path("data/time_calibration.json"),
+                duplications_path=scores_root / "raw_pairwise_duplications.csv",
+                speciations_path=scores_root / "raw_pairwise_speciations.csv",
+                output_svg=chrono_svg
+            )
+            print(f"Saved time-calibrated chronological timeline: {chrono_svg}")
+
+            # Plot chronological dendrogram with collapsed clades
+            print("Generating publication-ready time-calibrated chronological dendrogram...")
+            
+            # Load and resolve calibration anchors
+            calibrations = load_calibrations(Path("data/time_calibration.json"))
+            ncbi = NCBITaxa()
+            anchor_points = {}
+            for taxid, age in calibrations.items():
+                try:
+                    name = ncbi.get_taxid_translator([taxid]).get(taxid, str(taxid))
+                    anchor_points[f"{name} ({int(age)} Mya)"] = age
+                except Exception:
+                    anchor_points[f"TaxID {taxid} ({int(age)} Mya)"] = age
+
+            # Aggregate duplications and speciations switch counts (at 95th percentile)
+            node_switches = {}
+            def aggregate_switches(path: Path, node_col_candidates: tuple):
+                if not path.exists():
+                    return
+                df = pd.read_csv(path)
+                if "score" not in df.columns:
+                    return
+                scores = pd.to_numeric(df["score"], errors="coerce").dropna()
+                if scores.empty:
+                    return
+                threshold = np.percentile(scores, 95)
+                switched_df = df[df["score"] >= threshold]
+                
+                node_col = None
+                for c in node_col_candidates:
+                    if c in switched_df.columns:
+                        node_col = c
+                        break
+                if node_col:
+                    for node in switched_df[node_col].astype(str):
+                        if node and node != "nan":
+                            node_switches[node] = node_switches.get(node, 0) + 1
+
+            aggregate_switches(scores_root / "raw_pairwise_duplications.csv", ("duplication_node", "lca_node_name"))
+            aggregate_switches(scores_root / "raw_pairwise_speciations.csv", ("duplication_node", "lca_node_name"))
+
+            # Read full ASR tree
+            tree = Phylo.read(str(asr_tree_path), "newick")
+            dendrogram_path = Path(args.output_dir) / "chronological_dendrogram_switches.svg"
+            
+            plot_chronological_dendrogram(
+                tree=tree,
+                node_ages=node_ages,
+                node_switches=node_switches,
+                anchor_points=anchor_points,
+                output_path=dendrogram_path
+            )
+            print(f"Saved time-calibrated chronological dendrogram: {dendrogram_path}")
+
+        except Exception as e:
+            print(f"Warning: Failed to run chronological timeline/dendrogram pipeline: {e}")
+            import traceback
+            traceback.print_exc()
         return
 
     outputs = run_phase7_analyses(

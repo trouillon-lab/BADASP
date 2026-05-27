@@ -251,6 +251,7 @@ def _remap_reconciliation_events_to_asr_nodes(
     topology_tree: Tree,
     asr_tree: Tree,
 ) -> Dict[str, str]:
+    asr_raw_names = {str(node.name) for node in asr_tree.get_nonterminals() if node.name}
     topology_signatures = _build_named_node_signatures(topology_tree)
     asr_signature_to_name = {
         signature: node_name for node_name, signature in _build_named_node_signatures(asr_tree).items()
@@ -260,6 +261,14 @@ def _remap_reconciliation_events_to_asr_nodes(
     unmapped_topology_nodes: List[str] = []
 
     for topology_node_name, event_type in reconciliation_events.items():
+        if topology_node_name in asr_raw_names:
+            previous = remapped.get(topology_node_name)
+            if previous is None:
+                remapped[topology_node_name] = event_type
+            elif previous != event_type:
+                remapped[topology_node_name] = "Speciation" if "Speciation" in {previous, event_type} else event_type
+            continue
+
         topology_signature = topology_signatures.get(topology_node_name)
         if topology_signature is None:
             unmapped_topology_nodes.append(topology_node_name)
@@ -610,6 +619,8 @@ def _normalize_event_type(event_value: Optional[str]) -> str:
         return "Duplication"
     if label == "speciation":
         return "Speciation"
+    if label == "unresolved":
+        return "Unresolved"
     return "Unknown"
 
 
@@ -741,6 +752,8 @@ def _build_layer_sister_pairs(
             event_type_candidate = reconciliation_events.get(asr_sig_to_name[parent_signature])
         
         event_type = _normalize_event_type(event_type_candidate)
+        if event_type == "Unresolved":
+            continue
 
         sister_rows.append(
             {
@@ -977,11 +990,17 @@ def compute_multilevel_badasp_scores(
                 pairwise_df=track_pairwise_df,
                 aln_length=aln_length,
             )
+            if np.isfinite(track_threshold) and "score" in track_pairwise_df.columns:
+                track_scores = pd.to_numeric(track_pairwise_df["score"], errors="coerce")
+                track_switch_events = int(np.count_nonzero(track_scores.to_numpy(dtype=float) >= float(track_threshold)))
+            else:
+                track_switch_events = 0
             layer_track_results[track_name] = {
                 "scores": track_score_df,
                 "sdps": track_sdp_df,
                 "threshold": float(track_threshold),
                 "pairwise": track_pairwise_df,
+                "switch_events": int(track_switch_events),
             }
             per_layer_track_results[track_name][int(layer_index)] = {
                 "scores": track_score_df,
@@ -992,6 +1011,7 @@ def compute_multilevel_badasp_scores(
                 "scored_pairs": int(scored_pairs),
                 "linkage_threshold": float(layer_threshold),
                 "layer_threshold": float(layer_threshold),
+                "switch_events": int(track_switch_events),
             }
 
         duplication_threshold = float(cast(float, layer_track_results["duplications"]["threshold"]))
@@ -1006,9 +1026,9 @@ def compute_multilevel_badasp_scores(
                 "duplication_95th_percentile_threshold": float(cast(float, layer_track_results["duplications"]["threshold"])),
                 "speciation_95th_percentile_threshold": float(cast(float, layer_track_results["speciations"]["threshold"])),
                 "combined_95th_percentile_threshold": float(cast(float, layer_track_results["combined"]["threshold"])),
-                "total_duplication_sdps": int(len(cast(pd.DataFrame, layer_track_results["duplications"]["sdps"]))),
-                "total_speciation_sdps": int(len(cast(pd.DataFrame, layer_track_results["speciations"]["sdps"]))),
-                "total_combined_sdps": int(len(cast(pd.DataFrame, layer_track_results["combined"]["sdps"]))),
+                "total_duplication_sdps": int(cast(int, layer_track_results["duplications"].get("switch_events", 0))),
+                "total_speciation_sdps": int(cast(int, layer_track_results["speciations"].get("switch_events", 0))),
+                "total_combined_sdps": int(cast(int, layer_track_results["combined"].get("switch_events", 0))),
             }
         )
 

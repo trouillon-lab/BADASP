@@ -15,6 +15,7 @@ This repository implements a reproducible BADASP-inspired computational pipeline
 - **Dendrogram Visualizations**: ✓ Complete & Refined — Orientation standardization, style cleanup (endpoint removal), architecture normalization
 - All development uses TDD and the root virtual environment (`venv/`). Full test suite: **89/89 passing**.
 - **Reconciliation Audit Note**: The Phase 9 reconciliation output is under active audit because taxon resolution for some inputs previously defaulted to near-all duplications; the reconciliation code now prefers the header-rich clustered FASTA and is being revalidated against tiny-tree and real-data checks.
+- **New Pipeline Boundary**: Ongoing replacement work should live under `src/badasp_next/`; the existing `src/` modules and `scripts/` helpers are retained as legacy reference material.
 
 ## Methodology Summary
 
@@ -84,6 +85,7 @@ How scoring now works:
   - `pdb_mapper.py`: sequence-to-structure alignment + PyMOL/ChimeraX script generation
   - `evolutionary_analysis.py`: evolutionary timeline, structural clustering, coevolution, physicochemical analysis, multilevel synthesis
   - `visualization.py`: QC and clustering visual outputs including dendrogram rendering
+  - `badasp_next/`: isolated namespace for the replacement pipeline and new development
 - `tests/`: pytest suite for all core modules
 - `data/raw/`: source sequence inputs (gitignored)
 - `data/interim/`: intermediate artifacts (gitignored)

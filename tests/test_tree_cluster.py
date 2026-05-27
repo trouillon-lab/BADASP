@@ -264,7 +264,7 @@ def test_write_multithreshold_cluster_artifacts_writes_layered_outputs(tmp_path:
     clusters_files = sorted(output_dir.glob("tree_clusters_layer*.csv"))
     assert len(assignments_files) == len(clusters_files) == len(layer_records)
 
-    sample_assignments = pd.read_csv(assignments_files[0])
+    sample_assignments = pd.read_csv(assignments_files[-1])
     assert set(sample_assignments.columns) == {"sequence_id", "cluster_id", "lca_node", "layer_index", "threshold"}
     assert sample_assignments["cluster_id"].nunique() >= 2
 

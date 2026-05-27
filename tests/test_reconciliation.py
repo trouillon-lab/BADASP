@@ -117,7 +117,7 @@ def test_run_reconciliation_writes_csv_and_summary_counts(tmp_path: Path) -> Non
         phylo_tree_factory=_FakeGeneTree,
     )
 
-    assert counts == {"Duplication": 1, "Speciation": 1}
+    assert counts == {"Duplication": 1, "Speciation": 1, "Unresolved": 0}
     assert out_csv.exists()
 
     with out_csv.open("r", encoding="utf-8") as handle:
