@@ -8,6 +8,7 @@ TRIMMED_FASTA = config["paths"]["trimmed_fasta"]
 IQTREE_PREFIX = config["paths"]["iqtree_prefix"]
 IQTREE_TREEFILE = f"{IQTREE_PREFIX}.treefile"
 IQTREE_BOOTTREES = f"{IQTREE_PREFIX}.boottrees"
+IQTREE_ROOTED_TREE = config["paths"]["iqtree_rooted_tree"]
 SPECIES_TREE_SOURCE = config["paths"]["species_tree_source"]
 SPECIES_TREE_NORMALIZED = config["paths"]["species_tree_normalized"]
 ALERAX_MAPPING = config["paths"]["alerax_mapping"]
@@ -23,6 +24,7 @@ rule all:
         TRIMMED_FASTA,
         IQTREE_TREEFILE,
         IQTREE_BOOTTREES,
+        IQTREE_ROOTED_TREE,
         SPECIES_TREE_NORMALIZED,
         ALERAX_MAPPING,
         ALERAX_FAMILIES,
@@ -89,6 +91,24 @@ rule iqtree_bootstrap_tree_distribution:
         """
 
 
+rule mad_root_gene_tree:
+    input:
+        IQTREE_BOOTTREES,
+    output:
+        IQTREE_ROOTED_TREE,
+    params:
+        python=config["tools"]["python"],
+        rooting_method=config["parameters"]["gene_tree_rooting_method"],
+    shell:
+        """
+        set -euo pipefail
+        {params.python} -m src.badasp_next.alerax_inputs root-gene-tree \
+          --boot-trees {input} \
+          --output {output} \
+          --rooting-method {params.rooting_method}
+        """
+
+
 rule normalize_species_tree:
     input:
         source=SPECIES_TREE_SOURCE,
@@ -129,6 +149,7 @@ rule build_alerax_families:
     input:
         boottrees=IQTREE_BOOTTREES,
         mapping=ALERAX_MAPPING,
+        rooted_tree=IQTREE_ROOTED_TREE,
     output:
         ALERAX_FAMILIES,
     params:
@@ -139,6 +160,7 @@ rule build_alerax_families:
         set -euo pipefail
         {params.python} -m src.badasp_next.alerax_inputs families \
           --boot-trees {input.boottrees} \
+                    --resolved-gene-tree {input.rooted_tree} \
           --mapping {input.mapping} \
           --family-name {params.family_name} \
           --output {output}

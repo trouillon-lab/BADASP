@@ -3,6 +3,7 @@ from pathlib import Path
 from src.badasp_next.alerax_inputs import (
     build_alerax_family_file,
     build_alerax_mapping_file,
+    resolve_alerax_gene_tree,
     normalize_species_tree,
 )
 
@@ -56,3 +57,33 @@ def test_normalize_species_tree_prunes_unobserved_taxids(tmp_path: Path) -> None
     assert "1111" in normalized_text
     assert "2222" in normalized_text
     assert "3333" not in normalized_text
+
+
+def test_resolve_alerax_gene_tree_roots_sibling_treefile(tmp_path: Path) -> None:
+    boottrees = tmp_path / "IPR019888.boottrees"
+    treefile = tmp_path / "IPR019888.treefile"
+    rooted_output = tmp_path / "IPR019888_midpoint_rooted.tree"
+
+    boottrees.write_text("(A:0.1,B:0.1);\n", encoding="utf-8")
+    treefile.write_text("(A:0.1,B:0.1);\n", encoding="utf-8")
+
+    resolved = resolve_alerax_gene_tree(
+        bootstrapped_gene_trees=boottrees,
+        rooting_method="midpoint",
+        output_path=rooted_output,
+    )
+
+    assert resolved == rooted_output
+    assert rooted_output.exists()
+
+
+def test_resolve_alerax_gene_tree_falls_back_without_treefile(tmp_path: Path) -> None:
+    boottrees = tmp_path / "IPR019888.boottrees"
+    boottrees.write_text("(A:0.1,B:0.1);\n", encoding="utf-8")
+
+    resolved = resolve_alerax_gene_tree(
+        bootstrapped_gene_trees=boottrees,
+        rooting_method="mad",
+    )
+
+    assert resolved == boottrees

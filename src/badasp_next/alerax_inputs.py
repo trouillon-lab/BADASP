@@ -8,6 +8,8 @@ from typing import Iterable, Optional
 from Bio import SeqIO
 from ete3 import NCBITaxa, Tree
 
+from src.tree_rooting import root_tree
+
 
 _OX_PATTERN = re.compile(r"\bOX=(\d+)\b")
 _OS_PATTERN = re.compile(r"\bOS=([^=]+?)(?=\s[A-Z]{2}=|$)")
@@ -86,8 +88,17 @@ def build_alerax_family_file(
     mapping_file: Path,
     output_path: Path,
     family_name: str = "IPR019888",
+    resolved_gene_tree: Optional[Path] = None,
+    rooting_method: str = "mad",
 ) -> Path:
     """Write the minimal family file consumed by AleRax."""
+
+    gene_tree_for_alerax = resolved_gene_tree
+    if gene_tree_for_alerax is None:
+        gene_tree_for_alerax = resolve_alerax_gene_tree(
+            bootstrapped_gene_trees=bootstrapped_gene_trees,
+            rooting_method=rooting_method,
+        )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
@@ -95,7 +106,7 @@ def build_alerax_family_file(
             [
                 "[FAMILIES]",
                 f"- {family_name}",
-                f"gene_tree = {bootstrapped_gene_trees.resolve()}",
+                f"gene_tree = {gene_tree_for_alerax.resolve()}",
                 f"mapping = {mapping_file.resolve()}",
                 "",
             ]
@@ -103,6 +114,29 @@ def build_alerax_family_file(
         encoding="utf-8",
     )
     return output_path
+
+
+def resolve_alerax_gene_tree(
+    bootstrapped_gene_trees: Path,
+    rooting_method: str = "mad",
+    output_path: Optional[Path] = None,
+) -> Path:
+    """Resolve and optionally root the gene tree file consumed by AleRax.
+
+    Preference order:
+    1. Sibling IQ-TREE ML treefile (`*.treefile`) rooted with MAD/midpoint.
+    2. The provided tree path unchanged when no rootable single-tree file exists.
+    """
+
+    if rooting_method == "none":
+        return bootstrapped_gene_trees
+
+    ml_tree = bootstrapped_gene_trees.with_suffix(".treefile")
+    if not ml_tree.exists():
+        return bootstrapped_gene_trees
+
+    rooted_output = output_path or ml_tree.with_name(f"{ml_tree.stem}_{rooting_method}_rooted.tree")
+    return root_tree(input_tree=ml_tree, output_tree=rooted_output, method=rooting_method)
 
 
 def normalize_species_tree(
@@ -179,6 +213,13 @@ def build_parser() -> argparse.ArgumentParser:
     families_parser.add_argument("--mapping", required=True, type=Path)
     families_parser.add_argument("--output", required=True, type=Path)
     families_parser.add_argument("--family-name", default="IPR019888")
+    families_parser.add_argument("--resolved-gene-tree", type=Path, default=None)
+    families_parser.add_argument("--rooting-method", choices=["mad", "midpoint", "none"], default="mad")
+
+    root_parser = subparsers.add_parser("root-gene-tree", help="Root the IQ-TREE ML tree for AleRax.")
+    root_parser.add_argument("--boot-trees", required=True, type=Path)
+    root_parser.add_argument("--output", required=True, type=Path)
+    root_parser.add_argument("--rooting-method", choices=["mad", "midpoint", "none"], default="mad")
 
     return parser
 
@@ -209,7 +250,18 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             mapping_file=args.mapping,
             output_path=args.output,
             family_name=args.family_name,
+            resolved_gene_tree=args.resolved_gene_tree,
+            rooting_method=args.rooting_method,
         )
+        return 0
+
+    if args.command == "root-gene-tree":
+        resolved = resolve_alerax_gene_tree(
+            bootstrapped_gene_trees=args.boot_trees,
+            rooting_method=args.rooting_method,
+            output_path=args.output,
+        )
+        print(str(resolved))
         return 0
 
     parser.error(f"Unknown command: {args.command}")
