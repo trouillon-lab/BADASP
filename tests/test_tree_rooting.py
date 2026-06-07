@@ -75,6 +75,41 @@ def test_root_tree_mad_raises_if_no_rooted_output_found(monkeypatch, tmp_path: P
         )
 
 
+def test_root_tree_mad_raises_on_negative_branch_lengths_and_empty_output(
+    monkeypatch, tmp_path: Path
+) -> None:
+    input_tree = tmp_path / "input.tree"
+    output_tree = tmp_path / "mad_rooted.tree"
+    empty_rooted = tmp_path / "input.tree.rooted"
+    input_tree.write_text("((A:0.1,B:0.2):0.3,(C:0.2,D:0.1):0.4);\n", encoding="utf-8")
+
+    mad_exec = tmp_path / "mad.py"
+    mad_exec.write_text("#!/usr/bin/env python\n", encoding="utf-8")
+    monkeypatch.setattr("src.tree_rooting.CANONICAL_MAD_EXECUTABLE", mad_exec)
+
+    class _MockCompletedProcess:
+        stdout = (
+            "MAD phylogenetic rooting\n"
+            "<<< Error analyzing file 'input.tree':\n"
+            "<<<         Cowardly refusing to root trees with negative branch lengths.\n"
+        )
+        stderr = ""
+
+    def _mock_run(cmd, check, capture_output=False, text=False, **kwargs):
+        assert check is True
+        empty_rooted.write_text("", encoding="utf-8")
+        return _MockCompletedProcess()
+
+    monkeypatch.setattr("subprocess.run", _mock_run)
+
+    with pytest.raises(RuntimeError, match="Cowardly refusing"):
+        root_tree(
+            input_tree=input_tree,
+            output_tree=output_tree,
+            method="mad",
+        )
+
+
 def test_root_tree_mad_falls_back_to_midpoint_when_executable_missing(monkeypatch, tmp_path: Path) -> None:
     input_tree = tmp_path / "input.tree"
     output_tree = tmp_path / "fallback_rooted.tree"
