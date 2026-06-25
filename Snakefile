@@ -31,6 +31,8 @@ rule all:
         f"{ALERAX_OUTPUT_DIR}/reconciliations/{config['project']['family_name']}.nwk",
         "results/badasp_scoring/raw_node_scores.csv",
         "results/badasp_scoring/plots/tree_score_mapping.svg",
+        f"{ALERAX_OUTPUT_DIR}/plots/event_proportions_comparison.svg",
+        f"{ALERAX_OUTPUT_DIR}/plots/event_proportions_report.md",
 
 
 rule cdhit_cluster:
@@ -271,5 +273,27 @@ rule plot_node_scores:
         {params.python} src/badasp/plot_node_scores.py \
           --scores {input.scores} \
           --tree {input.tree} \
+          --outdir {params.outdir}
+        """
+
+rule compare_event_stats:
+    input:
+        scores="results/badasp_scoring/raw_node_scores.csv",
+        reconciled_tree=f"{ALERAX_OUTPUT_DIR}/reconciliations/{config['project']['family_name']}.nwk",
+    output:
+        comparison_svg=f"{ALERAX_OUTPUT_DIR}/plots/event_proportions_comparison.svg",
+        report_md=f"{ALERAX_OUTPUT_DIR}/plots/event_proportions_report.md",
+    params:
+        python=config["tools"]["python"],
+        family=config["project"]["family_name"],
+        reconc_dir=f"{ALERAX_OUTPUT_DIR}/reconciliations",
+        outdir=f"{ALERAX_OUTPUT_DIR}/plots",
+    shell:
+        """
+        set -euo pipefail
+        {params.python} scripts/compare_event_stats.py \
+          --family {params.family} \
+          --reconc-dir {params.reconc_dir} \
+          --scores {input.scores} \
           --outdir {params.outdir}
         """

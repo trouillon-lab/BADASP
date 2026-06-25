@@ -23,13 +23,20 @@ from ete3 import Tree
 
 
 def main():
-    family_name = "IPR019888"
-    root_dir = Path(project_root)
-    reconc_dir = root_dir / "results" / "reconciliation" / "alerax" / family_name / "reconciliations"
+    import argparse
+    parser = argparse.ArgumentParser(description="Compare event statistics across levels of analysis")
+    parser.add_argument("--family", required=True, help="Family name (e.g., IPR019888)")
+    parser.add_argument("--reconc-dir", type=Path, required=True, help="AleRax reconciliations directory")
+    parser.add_argument("--scores", type=Path, required=True, help="Path to raw_node_scores.csv")
+    parser.add_argument("--outdir", type=Path, required=True, help="Output directory for plots")
+    args = parser.parse_args()
+
+    family_name = args.family
+    reconc_dir = args.reconc_dir
     all_samples_dir = reconc_dir / "all"
     final_tree_path = reconc_dir / f"{family_name}.nwk"
-    badasp_scores_path = root_dir / "results" / "badasp_scoring" / "raw_node_scores.csv"
-    plots_dir = root_dir / "results" / "reconciliation" / "alerax" / family_name / "plots"
+    badasp_scores_path = args.scores
+    plots_dir = args.outdir
     plots_dir.mkdir(parents=True, exist_ok=True)
 
     print("================================================================================")
