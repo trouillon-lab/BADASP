@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from src.badasp_next.alerax_inputs import (
+from src.badasp.alerax_inputs import (
     build_alerax_family_file,
     build_alerax_mapping_file,
     resolve_alerax_gene_tree,
@@ -87,3 +87,34 @@ def test_resolve_alerax_gene_tree_falls_back_without_treefile(tmp_path: Path) ->
     )
 
     assert resolved == boottrees
+
+
+def test_build_alerax_family_file_concatenates_starting_tree_and_bootstraps(tmp_path: Path) -> None:
+    boot_trees = tmp_path / "IPR019888.boottrees"
+    resolved_tree = tmp_path / "IPR019888_mad_rooted.tree"
+    mapping_file = tmp_path / "treerecs_mapping.link"
+    family_file = tmp_path / "families.txt"
+
+    boot_trees.write_text("(A:0.1,B:0.1);\n(A:0.2,B:0.2);\n", encoding="utf-8")
+    resolved_tree.write_text("(A:0.15,B:0.15);\n", encoding="utf-8")
+    mapping_file.write_text("sp|A0A000|SEQ_A\t1111\n", encoding="utf-8")
+
+    build_alerax_family_file(
+        bootstrapped_gene_trees=boot_trees,
+        mapping_file=mapping_file,
+        output_path=family_file,
+        family_name="IPR019888",
+        resolved_gene_tree=resolved_tree,
+    )
+
+    # Check that the distribution file was created and contains both trees
+    dist_file = tmp_path / "IPR019888_distribution.nwk"
+    assert dist_file.exists()
+    dist_content = dist_file.read_text(encoding="utf-8").splitlines()
+    assert len(dist_content) == 3
+    assert dist_content[0] == "(A:0.15,B:0.15);"
+    assert dist_content[1] == "(A:0.1,B:0.1);"
+    assert dist_content[2] == "(A:0.2,B:0.2);"
+
+    family_text = family_file.read_text(encoding="utf-8")
+    assert f"gene_tree = {dist_file.resolve()}" in family_text

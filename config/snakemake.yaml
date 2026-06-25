@@ -7,7 +7,7 @@ tools:
   famsa: famsa
   trimal: trimal
   iqtree: iqtree2
-  alerax: alerax
+  alerax: tools/AleRax/build/bin/alerax
 
 parameters:
   cdhit_identity: 0.8
@@ -16,6 +16,8 @@ parameters:
   iqtree_model: LG+G
   iqtree_bootstrap: 1000
   gene_tree_rooting_method: mad
+  alerax_threads: 1
+
 
 paths:
   raw_fasta: data/raw/IPR019888.fasta

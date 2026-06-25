@@ -124,3 +124,27 @@ Generated CSV outputs under `results/` are treated as local analysis artifacts a
 - The tree-building stage now prefers a natively compiled `venv/bin/FastTreeMP` built from source with OpenMP for multicore Apple Silicon execution; single-threaded FastTree is only a fallback.
 - IQ-TREE2 benchmark outputs are written to `results/iqtree_scaling.csv` and `results/iqtree_scaling_plot.svg`; the benchmark samples 500/1000/2000/4000-sequence subsets from the full alignment/tree.
 - IQ-TREE2 extrapolation plotting now marks the 24,608-sequence 0.80 threshold and saves the result to `results/iqtree_scaling_plot_extrapolated.svg`.
+
+## HPC Cluster & Computationally Heavy Execution Details
+Because building the tree distribution and optimizing the DTL parameters on a 21k gene / 8.8k species dataset are extremely computationally expensive, these steps were run as follows:
+
+1. **IQ-TREE 2 (Local Run)**:
+   - **Command**: `iqtree2 -s data/interim/IPR019888_trimmed.aln -m LG+G -T AUTO --wbt -B 1000 --prefix data/interim/iqtree/IPR019888`
+   - **Resources**: Run locally on **2 cores** (automatically selected by IQ-TREE auto-detect as optimal thread count).
+   - **Runtime**: **256 hours 53 minutes 26 seconds** (~10.7 days).
+
+2. **AleRax Reconciliation (Euler HPC Run)**:
+   - **Command**: `alerax -f data/interim/alerax/IPR019888.families.txt -s data/interim/alerax/IPR019888_species_tree.nwk -p results/reconciliation/alerax/IPR019888 --prune-species-tree`
+   - **Resources**: Run on **1 core** (no MPI parallelization was used as AleRax only parallelizes MPI across multiple gene families; here we have a single family).
+   - **Memory Savings**: **OFF** (memory was sufficient on Euler, so `--memory-savings` was omitted to speed up execution).
+   - **Runtime**: **110 hours 48 minutes 27 seconds** (~4.6 days).
+
+3. **Replicating & Bypassing Heavy Steps Locally**:
+   - To replicate without rerunning the 10.7-day tree search or 4.6-day DTL parameter optimization, scientists should transfer pre-computed results to `results/reconciliation/alerax/IPR019888/`.
+   - Copy the consensus tree to the expected target:
+     `cp results/reconciliation/alerax/IPR019888/reconciliations/summaries/IPR019888_consensus_50.newick results/reconciliation/alerax/IPR019888/reconciliations/IPR019888.nwk`
+   - Touch Snakemake checkpoints so it doesn't trigger a rebuild:
+     `./venv/bin/python -m snakemake --touch --cores 1 --rerun-incomplete`
+   - Run the downstream steps:
+     `./venv/bin/python -m snakemake --cores 1`
+

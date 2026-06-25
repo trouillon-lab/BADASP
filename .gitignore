@@ -27,6 +27,8 @@ docs/
 data/raw/**
 data/interim/**
 data/processed/**
+data/sandbox_alerax/
+data/*.csv
 
 # Keep directory scaffolding tracked
 !data/raw/.gitkeep
@@ -63,6 +65,7 @@ test_layer_dendrograms.py
 # Agent and local instruction scratch files
 .github/instructions/*.instructions.md
 PIPELINE_STATE.md
+scratch/
 
 # Archived snapshot artifacts
 _archive_v1/
