@@ -33,6 +33,7 @@ def generate_animation_cxc(track: str, base_dir: Path, wait_frames: int = 25) ->
         f"# Master ChimeraX Animation for {track.capitalize()} layers 1-20",
         "del all",  # Close any previously loaded models/objects
         pdb_line,
+        "delete /C:1-8,33-40 /D:1-8,33-40",  # Shorten DNA by 20% on both ends
         "set bgColor white",
         "lighting soft",
         "lighting shadows false",

@@ -70,3 +70,6 @@ scratch/
 # Archived snapshot artifacts
 _archive_v1/
 _archive_v2*/
+
+# Local data file
+ncbi_taxonomy_map.csv

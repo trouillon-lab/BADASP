@@ -83,7 +83,9 @@ def generate_cxc_for_track(track_name: str, csv_filename: str, output_filename: 
     lines = [
         "del all",
         f"open {pdb_path.absolute()}",
+        "delete /C:1-8,33-40 /D:1-8,33-40",  # Shorten DNA by 20% on both ends
         "view",
+        "graphics silhouettes true color black width 4",
         "color protein gainsboro",
         "color nucleic lightsteelblue",
     ]
@@ -114,6 +116,19 @@ def generate_cxc_for_track(track_name: str, csv_filename: str, output_filename: 
     for color, resnums in sorted(color_groups.items()):
         res_str = ",".join(resnums)
         lines.append(f"color /A,B:{res_str} {color}")
+
+    # Automatic snapshots
+    front_png = output_cxc.with_name(f"{output_cxc.stem}_front.png")
+    rotated_png = output_cxc.with_name(f"{output_cxc.stem}_rotated.png")
+    lines.extend([
+        "",
+        "# Save snapshots: front view and 90-degree rotated view",
+        "view",
+        f"save {front_png.name} width 4000 supersample 3",
+        "turn y 90",
+        f"save {rotated_png.name} width 4000 supersample 3",
+        "turn y -90",  # Reset view
+    ])
 
     output_cxc.parent.mkdir(parents=True, exist_ok=True)
     with output_cxc.open("w", encoding="utf-8") as f:
