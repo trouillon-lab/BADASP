@@ -238,14 +238,20 @@ def main():
     # -------------------------------------------------------------------------
     # 5. Plot Proportions Comparison
     # -------------------------------------------------------------------------
-    categories = ["Level 1: Posterior Samples\n(Global Mean)", 
-                  "Level 2: Consensus Tree\n(All Classified)", 
-                  "Level 3: BADASP Scored\n(Deep Nodes Only)"]
+    categories = ["Level 1: Posterior Samples", 
+                  "Level 2: Consensus Tree", 
+                  "Level 3: BADASP Scored"]
     
     event_data = {
         "Speciation": [pct_s_mean, pct_s_final, pct_s_scored],
         "Duplication": [pct_d_mean, pct_d_final, pct_d_scored],
         "Transfer": [pct_t_mean, pct_t_final, pct_t_scored]
+    }
+    
+    event_counts = {
+        "Speciation": [mean_s, final_counts["Speciation"], scored_s],
+        "Duplication": [mean_d, final_counts["Duplication"], scored_d],
+        "Transfer": [mean_t, final_counts["Transfer"], scored_t]
     }
 
     x = np.arange(len(categories))
@@ -256,9 +262,9 @@ def main():
     ax.set_facecolor("white")
 
     colors = {
-        "Speciation": "#1f77b4",  # Blue
-        "Duplication": "#d62728", # Red
-        "Transfer": "#2ca02c"     # Green
+        "Speciation": "#a9cce3",   # Pastel Blue
+        "Duplication": "#f5b7b1",  # Pastel Coral/Pink
+        "Transfer": "#abebc6"      # Pastel Green
     }
 
     # Plot grouped bars
@@ -270,21 +276,28 @@ def main():
     ax.set_title("Evolutionary Event Proportions Across Levels of Analysis", fontsize=14, fontweight="bold", pad=15)
     ax.set_xticks(x)
     ax.set_xticklabels(categories, fontsize=11, fontweight="semibold")
-    ax.set_ylim(0, 70)
+    ax.set_ylim(0, 80)
     
     # Add values on top of bars
-    def autolabel(rects):
-        for rect in rects:
+    def autolabel(rects, name):
+        for i, rect in enumerate(rects):
             height = rect.get_height()
-            ax.annotate(f"{height:.1f}%",
+            count = event_counts[name][i]
+            if isinstance(count, float):
+                count_str = f"{count:,.1f}"
+            else:
+                count_str = f"{count:,}"
+            
+            label_text = f"{count_str}\n({height:.1f}%)"
+            ax.annotate(label_text,
                         xy=(rect.get_x() + rect.get_width() / 2, height),
                         xytext=(0, 3),  # 3 points vertical offset
                         textcoords="offset points",
                         ha="center", va="bottom", fontsize=9, fontweight="bold")
 
-    autolabel(rects1)
-    autolabel(rects2)
-    autolabel(rects3)
+    autolabel(rects1, "Speciation")
+    autolabel(rects2, "Duplication")
+    autolabel(rects3, "Transfer")
 
     ax.legend(fontsize=11, frameon=True, facecolor="white", edgecolor="none")
     ax.spines["top"].set_visible(False)

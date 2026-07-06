@@ -44,41 +44,75 @@ GRAY = "#a0a0a0"
 # ---------------------------------------------------------------------------
 # Distribution plots
 # ---------------------------------------------------------------------------
-def plot_score_distributions(scores_df: pd.DataFrame, out_dir: Path) -> None:
+def plot_score_distributions(scores_df: pd.DataFrame, out_dir: Path, alignment_path: Path) -> None:
     """Plot statistical distributions of the BADASP scores."""
+    from Bio import AlignIO
+    
+    # 1. Compute MSA column occupancies
+    print(f"Loading alignment from {alignment_path} to calculate column occupancies...")
+    alignment = AlignIO.read(alignment_path, "fasta")
+    num_seqs = len(alignment)
+    aln_len = alignment.get_alignment_length()
+    
+    occupancies = {}
+    for col in range(aln_len):
+        chars = [alignment[seq_idx][col] for seq_idx in range(num_seqs)]
+        gaps = sum(1 for c in chars if c in {'-', '.'})
+        occupancies[col + 1] = 1.0 - (gaps / num_seqs)
+
+    # 2. Filter scores by occupancy >= 80%
+    scores_filtered = scores_df.copy()
+    scores_filtered["occupancy"] = scores_filtered["position"].map(occupancies)
+    scores_filtered = scores_filtered[scores_filtered["occupancy"] >= 0.8].copy()
+    
+    # Compute max score per node-position comparison
+    scores_filtered["max_score"] = scores_filtered[["badasp_score_left", "badasp_score_right"]].max(axis=1)
+
+    # 3. Calculate category-specific 95th percentile of max site scores (similar to event decoupling)
+    thresholds = {}
+    for ev in ["Duplication", "Speciation", "Transfer"]:
+        ev_scores = scores_filtered[scores_filtered["event_type"] == ev]["max_score"].dropna()
+        if not ev_scores.empty:
+            thresholds[ev] = float(np.percentile(ev_scores, 95))
+
+    # 4. Melt directional scores for violin plot
     scores_melted = pd.melt(
-        scores_df,
+        scores_filtered,
         id_vars=["node_name", "event_type", "position"],
         value_vars=["badasp_score_left", "badasp_score_right"],
         var_name="direction",
         value_name="badasp_score",
     )
 
-    # Violin plot by event type
+    # Violin plot by event type (horizontal orientation)
     plt.figure(figsize=(10, 6))
     sns.violinplot(
-        data=scores_melted, x="event_type", y="badasp_score",
-        inner="quartile", palette="Set2",
+        data=scores_melted, y="event_type", x="badasp_score",
+        inner="quartile", palette=EVENT_COLORS,
     )
-    plt.title("Distribution of Directional BADASP Scores by Event Type")
-    plt.ylabel("BADASP Score")
-    plt.xlabel("Event Type")
+    # Add vertical dashed lines for category-specific 95th percentile thresholds
+    for ev, thresh in thresholds.items():
+        color = EVENT_COLORS.get(ev, "black")
+        plt.axvline(
+            thresh, color=color, linestyle="--", linewidth=1.5,
+            label=f"{ev} 95th% ({thresh:.3f})"
+        )
+    plt.title("Distribution of Directional BADASP Scores (Occupancy >= 80%)")
+    plt.xlabel("BADASP Score")
+    plt.ylabel("Event Type")
+    plt.legend(loc="upper right", frameon=True, facecolor="white", edgecolor="none")
     plt.tight_layout()
     plt.savefig(out_dir / "score_distribution_by_event.svg", format="svg")
     plt.close()
 
-    # Max score per node histogram
-    max_scores = (
-        scores_melted.groupby(["node_name", "event_type"])["badasp_score"]
-        .max()
-        .reset_index()
-    )
+    # Max score per site histogram (filtered)
     plt.figure(figsize=(10, 6))
     sns.histplot(
-        data=max_scores, x="badasp_score", hue="event_type",
+        data=scores_filtered, x="max_score", hue="event_type",
         element="step", stat="density", common_norm=False,
+        palette=EVENT_COLORS,
     )
-    plt.title("Distribution of Maximum BADASP Scores per Node")
+    plt.title("Distribution of Maximum BADASP Scores per Site (Occupancy >= 80%)")
     plt.xlabel("Max BADASP Score")
     plt.ylabel("Density")
     plt.tight_layout()
@@ -686,13 +720,14 @@ if __name__ == "__main__":
     parser.add_argument("--scores", type=Path, required=True, help="Path to raw_node_scores.csv")
     parser.add_argument("--tree", type=Path, required=True, help="Path to ASR treefile")
     parser.add_argument("--outdir", type=Path, required=True, help="Output directory for plots")
+    parser.add_argument("--alignment", type=Path, default=Path("data/interim/IPR019888_trimmed.aln"), help="Path to trimmed alignment FASTA")
     args = parser.parse_args()
 
     args.outdir.mkdir(parents=True, exist_ok=True)
     scores = pd.read_csv(args.scores)
 
     print("Generating statistical plots...")
-    plot_score_distributions(scores, args.outdir)
+    plot_score_distributions(scores, args.outdir, args.alignment)
 
     print("Generating relationship plots and statistics...")
     plot_score_relationships(scores, args.outdir)

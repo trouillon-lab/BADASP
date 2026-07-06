@@ -15,6 +15,10 @@ ALERAX_MAPPING = config["paths"]["alerax_mapping"]
 ALERAX_FAMILIES = config["paths"]["alerax_families"]
 ALERAX_OUTPUT_DIR = config["paths"]["alerax_output_dir"]
 
+BADASP_MIN_OCCUPANCY = config["parameters"].get("badasp_min_occupancy", 0.8)
+OCC_DIR = f"results/badasp_scoring/threshold_comparison/occupancy_{int(float(BADASP_MIN_OCCUPANCY)*100)}"
+EV_DEC_DIR = f"results/badasp_scoring/event_decoupling/occupancy_{int(float(BADASP_MIN_OCCUPANCY)*100)}"
+
 
 rule all:
     input:
@@ -33,6 +37,21 @@ rule all:
         "results/badasp_scoring/plots/tree_score_mapping.svg",
         f"{ALERAX_OUTPUT_DIR}/plots/event_proportions_comparison.svg",
         f"{ALERAX_OUTPUT_DIR}/plots/event_proportions_report.md",
+        "results/badasp_scoring/plots/tree_losses_mapping.svg",
+        "results/badasp_scoring/analyses/branch_loss_counts.csv",
+        f"{OCC_DIR}/threshold_comparison_stats.csv",
+        f"{OCC_DIR}/positional_switches_comparison.csv",
+        f"{OCC_DIR}/switch_threshold_comparison.svg",
+        f"{OCC_DIR}/hard_thresholds_domain_counts.csv",
+        f"{OCC_DIR}/hard_thresholds_details.svg",
+        f"{OCC_DIR}/percentile_thresholds_domain_counts.csv",
+        f"{OCC_DIR}/percentile_thresholds_details.svg",
+        f"{OCC_DIR}/sequence_bins_stats.csv",
+        f"{OCC_DIR}/sequence_bins_score_distribution.svg",
+        f"{OCC_DIR}/sequence_bins_violin_distribution.svg",
+        f"{OCC_DIR}/hard_threshold_1.7_significance.svg",
+        f"{EV_DEC_DIR}/decoupled_event_switches_comparison.svg",
+        f"{EV_DEC_DIR}/decoupled_event_switches_hard1.7_comparison.svg",
 
 
 rule cdhit_cluster:
@@ -262,6 +281,7 @@ rule plot_node_scores:
     input:
         scores="results/badasp_scoring/raw_node_scores.csv",
         tree=f"data/interim/iqtree_asr/{config['project']['family_name']}.treefile",
+        alignment=TRIMMED_FASTA,
     output:
         "results/badasp_scoring/plots/tree_score_mapping.svg",
     params:
@@ -273,6 +293,7 @@ rule plot_node_scores:
         {params.python} src/badasp/plot_node_scores.py \
           --scores {input.scores} \
           --tree {input.tree} \
+          --alignment {input.alignment} \
           --outdir {params.outdir}
         """
 
@@ -296,4 +317,138 @@ rule compare_event_stats:
           --reconc-dir {params.reconc_dir} \
           --scores {input.scores} \
           --outdir {params.outdir}
+        """
+
+rule plot_tree_losses:
+    input:
+        reconciled_tree=f"{ALERAX_OUTPUT_DIR}/reconciliations/{config['project']['family_name']}.nwk",
+        tree=f"data/interim/iqtree_asr/{config['project']['family_name']}.treefile",
+    output:
+        plot="results/badasp_scoring/plots/tree_losses_mapping.svg",
+        csv="results/badasp_scoring/analyses/branch_loss_counts.csv",
+    params:
+        python=config["tools"]["python"],
+        xml_dir=f"{ALERAX_OUTPUT_DIR}/reconciliations/all",
+        outdir="results/badasp_scoring/plots",
+    shell:
+        """
+        set -euo pipefail
+        {params.python} src/badasp/plot_tree_losses.py \
+          --tree {input.tree} \
+          --xml-dir {params.xml_dir} \
+          --outdir {params.outdir}
+        """
+
+
+rule compare_thresholds:
+    input:
+        scores="results/badasp_scoring/raw_node_scores.csv",
+        alignment=TRIMMED_FASTA,
+    output:
+        stats=f"{OCC_DIR}/threshold_comparison_stats.csv",
+        positional=f"{OCC_DIR}/positional_switches_comparison.csv",
+        plot_svg=f"{OCC_DIR}/switch_threshold_comparison.svg",
+        plot_png=f"{OCC_DIR}/switch_threshold_comparison.png",
+    params:
+        python=config["tools"]["python"],
+        min_occupancy=BADASP_MIN_OCCUPANCY,
+    shell:
+        """
+        set -euo pipefail
+        {params.python} scripts/compare_thresholds.py \
+          --scores {input.scores} \
+          --alignment {input.alignment} \
+          --min-occupancy {params.min_occupancy}
+        """
+
+
+rule plot_hard_threshold_details:
+    input:
+        positional=f"{OCC_DIR}/positional_switches_comparison.csv",
+    output:
+        csv=f"{OCC_DIR}/hard_thresholds_domain_counts.csv",
+        plot_svg=f"{OCC_DIR}/hard_thresholds_details.svg",
+        plot_png=f"{OCC_DIR}/hard_thresholds_details.png",
+        pct_csv=f"{OCC_DIR}/percentile_thresholds_domain_counts.csv",
+        pct_plot_svg=f"{OCC_DIR}/percentile_thresholds_details.svg",
+        pct_plot_png=f"{OCC_DIR}/percentile_thresholds_details.png",
+    params:
+        python=config["tools"]["python"],
+        min_occupancy=BADASP_MIN_OCCUPANCY,
+    shell:
+        """
+        set -euo pipefail
+        {params.python} scripts/plot_hard_threshold_details.py \
+          --min-occupancy {params.min_occupancy} \
+          --positional {input.positional}
+        """
+
+
+rule plot_sequence_bins_distribution:
+    input:
+        scores="results/badasp_scoring/raw_node_scores.csv",
+        alignment=TRIMMED_FASTA,
+    output:
+        stats=f"{OCC_DIR}/sequence_bins_stats.csv",
+        plot_svg=f"{OCC_DIR}/sequence_bins_score_distribution.svg",
+        plot_png=f"{OCC_DIR}/sequence_bins_score_distribution.png",
+        violin_svg=f"{OCC_DIR}/sequence_bins_violin_distribution.svg",
+        violin_png=f"{OCC_DIR}/sequence_bins_violin_distribution.png",
+    params:
+        python=config["tools"]["python"],
+        min_occupancy=BADASP_MIN_OCCUPANCY,
+    shell:
+        """
+        set -euo pipefail
+        {params.python} scripts/plot_sequence_bins_distribution.py \
+          --scores {input.scores} \
+          --alignment {input.alignment} \
+          --min-occupancy {params.min_occupancy}
+        """
+
+
+rule plot_hard_threshold_significance:
+    input:
+        scores="results/badasp_scoring/raw_node_scores.csv",
+        alignment=TRIMMED_FASTA,
+        positional=f"{OCC_DIR}/positional_switches_comparison.csv",
+    output:
+        plot_svg=f"{OCC_DIR}/hard_threshold_1.7_significance.svg",
+        plot_png=f"{OCC_DIR}/hard_threshold_1.7_significance.png",
+    params:
+        python=config["tools"]["python"],
+        min_occupancy=BADASP_MIN_OCCUPANCY,
+    shell:
+        """
+        set -euo pipefail
+        {params.python} scripts/plot_hard_threshold_significance.py \
+          --scores {input.scores} \
+          --alignment {input.alignment} \
+          --positional {input.positional} \
+          --min-occupancy {params.min_occupancy}
+        """
+
+
+rule plot_decoupled_event_switches:
+    input:
+        scores="results/badasp_scoring/raw_node_scores.csv",
+        alignment=TRIMMED_FASTA,
+    output:
+        stats=f"{EV_DEC_DIR}/event_decoupled_stats.csv",
+        pos_csv=f"{EV_DEC_DIR}/event_positional_switches.csv",
+        domain_csv=f"{EV_DEC_DIR}/event_domain_densities.csv",
+        plot_svg=f"{EV_DEC_DIR}/decoupled_event_switches_comparison.svg",
+        plot_png=f"{EV_DEC_DIR}/decoupled_event_switches_comparison.png",
+        plot_h17_svg=f"{EV_DEC_DIR}/decoupled_event_switches_hard1.7_comparison.svg",
+        plot_h17_png=f"{EV_DEC_DIR}/decoupled_event_switches_hard1.7_comparison.png",
+    params:
+        python=config["tools"]["python"],
+        min_occupancy=BADASP_MIN_OCCUPANCY,
+    shell:
+        """
+        set -euo pipefail
+        {params.python} scripts/plot_decoupled_event_switches.py \
+          --scores {input.scores} \
+          --alignment {input.alignment} \
+          --min-occupancy {params.min_occupancy}
         """

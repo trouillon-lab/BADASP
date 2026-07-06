@@ -17,6 +17,7 @@ parameters:
   iqtree_bootstrap: 1000
   gene_tree_rooting_method: mad
   alerax_threads: 1
+  badasp_min_occupancy: 0.8
 
 
 paths:
