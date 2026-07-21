@@ -1,150 +1,204 @@
-# BADASP Pipeline (IPR019888)
+# BADASP Evolutionary Analysis Pipeline (IPR019888)
 
-## Purpose
-This repository implements a reproducible BADASP-inspired computational pipeline focused on the IPR019888 transcription factor family. The workflow performs sequence ingestion, quality-controlled alignment/phylogeny generation, and dual-track BADASP scoring across a 20-layer linear evolutionary timeline to support downstream specificity-determining position analysis.
+[![Python 3.9](https://img.shields.io/badge/python-3.9-blue.svg)](https://www.python.org/)
+[![Snakemake](https://img.shields.io/badge/snakemake-≥7.0-brightgreen.svg)](https://snakemake.readthedocs.io/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-## Current Status
-- **Phase 1 (Architecture & Data Ingestion)**: ✓ Complete
-- **Phase 2 (Alignment & Phylogeny)**: ✓ Complete — CD-HIT (default 0.80), FAMSA/MAFFT, trimAl, native OpenMP FastTreeMP
-- **Phase 3 (Topological Subfamily Clustering)**: ✓ Complete — archival support only; downstream scoring now uses duplication-directed clade pairs
-- **Phase 4 (Ancestral Sequence Reconstruction)**: ✓ Complete — single-pass global IQ-TREE2 ASR with hierarchical LCA extraction
-- **Phase 5 (Restricted BADASP Scoring)**: ✓ Complete — Dual-Track (Duplications, Speciations, Combined) scoring, LDO/MDO asymmetric branch tagging, 20-layer evaluation
-- **Phase 6 (Structural Mapping)**: ✓ Complete — PyMOL/ChimeraX script generation, sequence-to-structure alignment mapping, per-layer track scripts
-- **Phase 7 (Evolutionary & Physicochemical Analysis)**: ✓ Complete — Linear layer timeline, structural clustering, co-evolution networks, multi-level synthesis
-- **Phase 7b (Advanced Synthesis)**: ✓ Complete — Architectural domain mapping, community extraction, taxonomic distribution
-- **Dendrogram Visualizations**: ✓ Complete & Refined — Orientation standardization, style cleanup (endpoint removal), architecture normalization
-- All development uses TDD and the root virtual environment (`venv/`). Full test suite: **89/89 passing**.
-- **Reconciliation Audit Note**: The Phase 9 reconciliation output is under active audit because taxon resolution for some inputs previously defaulted to near-all duplications; the reconciliation code now prefers the header-rich clustered FASTA and is being revalidated against tiny-tree and real-data checks.
-- **New Pipeline Boundary**: Ongoing replacement work should live under `src/badasp_next/`; the existing `src/` modules and `scripts/` helpers are retained as legacy reference material.
+An advanced computational biology pipeline implementing the **BADASP** (Burst After Duplication with Ancestral Sequence Predictions) evolutionary analysis framework (Edwards & Shields, 2005) adapted with the analytical framework of Bradley & Beltrao (2019) and integrated with phylogenetic species reconciliation via AleRax (Morel et al., 2024). Applied to the **IPR019888** AsnC/Lrp-like transcriptional regulator family.
 
-## Methodology Summary
+---
 
-### Phase 1-2: Sequence Ingestion & Alignment
-1. Fetch IPR019888 sequences from UniProt/InterPro (117k raw sequences).
-2. Filter sequences by domain length (130-200 AA; 110k retained).
-3. Perform CD-HIT representative clustering (5.9k clusters at 80% identity default for the tuned pipeline; benchmarked across 0.65-0.80).
-4. Build MSA with FAMSA by default (MAFFT remains available); trim columns with trimAl (`-gt 0.2`; 165 columns).
-5. Build ML phylogeny with native OpenMP FastTreeMP on Apple Silicon, with automatic fallback to FastTree if needed.
+## Table of Contents
+- [Overview](#overview)
+- [Pipeline Architecture](#pipeline-architecture)
+- [Installation & Environment](#installation--environment)
+- [How to Run the Pipeline](#how-to-run-the-pipeline)
+  - [Full Pipeline Execution](#full-pipeline-execution)
+  - [Bypassing Heavy Computations (Fast Reproduction)](#bypassing-heavy-computations-fast-reproduction)
+  - [Parallel Species Reconciliation Validation (`rec_check`)](#parallel-species-reconciliation-validation-rec_check)
+- [HPC & Computing Environment Details](#hpc--computing-environment-details)
+- [Key Features & Methodological Advances](#key-features--methodological-advances)
+- [Repository Structure](#repository-structure)
+- [Testing](#testing)
 
-### Phase 3: Topological Subfamily Clustering
-6. Root tree with the canonical MAD Python implementation (`venv/bin/mad.py`); if unavailable, fall back to midpoint rooting.
-7. Perform high-efficiency O(N) tree slicing via `--multi-layer <int>` (bypassing legacy memory-intensive SciPy linkage).
-8. Cut the tree evenly into N discrete topological layers. The pipeline now defaults to a 20-layer linear evolutionary timeline (`--multi-layer 20`), which slices the tree linkage distance into 20 evenly spaced thresholds to improve temporal resolution of divergence events.
-9. Retain clades ≥5 sequences per layer.
-10. Identify and extract clade Last Common Ancestors (LCAs).
+---
 
-### Phase 4-5: Ancestral Reconstruction & Dual-Track Scoring
-11. Run IQ-TREE2 ASR once on the full alignment/tree (`-asr -T AUTO`) to infer ancestral amino acid sequences.
-12. Map dynamic layer LCA nodes onto the ASR tree to extract the corresponding ancestral sequences from the global reconstruction.
-13. Compute Dual-Track BADASP scores across "Duplication", "Speciation", and combined event tracks, analyzing left-vs-right clades at each threshold layer.
-14. Assign LDO (Least Diverged Ortholog) and MDO (Most Diverged Ortholog) asymmetric branches utilizing direct ASR-resolved node distances.
-15. Score formula: `RC - (AC * p(AC))` where RC=conservation, AC=ancestral call, p(AC)=posterior probability.
-16. Calculate 95th percentile threshold on raw pairwise scores across tracks; identify Specificity Determining Positions (SDPs).
+## Overview
 
-### Reconciliation Refinement: Cluster-Expanded Fuzzy Logic
-The reconciliation stage expands each tree leaf (CD-HIT representative at 80% identity) to the full species set in its `.clstr` cluster before classifying events.
+The BADASP pipeline isolates **Specificity Determining Positions (SDPs)**—amino acid positions that have undergone functional divergence following duplication or speciation events—by comparing ancestral sequence predictions (ASR) across deep phylogenetic nodes.
 
-Why this is required:
-1. Representative bias: a single metagenome/environmental representative can hide many real species inside the cluster.
-2. Dense paralog families: strict binary overlap can overcall duplication in the presence of minor horizontal transfer signal.
+### Key Objectives:
+1. **Large-Scale Data Ingestion & Quality Control**: Fetch, clean, and cluster >110,000 sequences for InterPro family `IPR019888`.
+2. **Species Reconciliation**: Reconstruct maximum-likelihood gene trees and reconcile them against NCBI species trees using **AleRax**.
+3. **MAD Rooting & Node Mapping**: Perform **Minimal Ancestor Deviation (MAD)** tree rooting and transfer ASR node names using invariant leaf-set signature mapping.
+4. **Decoupled Event BADASP Scoring**: Compute `Score = RC - (AC * p(AC))` for sister-clade pairs across Duplication, Speciation, and Transfer nodes.
+5. **Adaptive Clade-Size Adjusted Thresholding**: Apply non-parametric percentile thresholds (95th, 97th, 99th, 99.9th) binned strictly by clade size deciles (calculated across all scores in one go per decile) to isolate true functional bursts from mutational drift, plotting switch events decoupled by event type.
+6. **Structural Mapping**: Map identified SDP switches onto reference 3D PDB structures (e.g., `2CG4`) and generate ChimeraX/PyMOL visualization scripts (`.cxc`).
 
-Current reconciliation policy:
-1. Cluster expansion: each leaf is assigned the union of species/taxids from all members of its CD-HIT cluster.
-2. Garbage filtering: taxa labeled metagenome/environmental/uncultured are excluded from species-set construction.
-3. Fuzzy classification: an internal node is treated as Speciation when overlap between left/right species sets is <=2 species or <5% of their union; otherwise Duplication.
+---
 
-This preserves biological signal while preventing false duplication inflation from metadata artifacts.
+## Pipeline Architecture
 
-### Architecture Evolution: Multi-Threshold Dual-Track Scoring
-Phase 5 uses a 20-layer linear evolutionary timeline rather than static Group/Family/Subfamily tiers. The dendrogram is sliced into evenly spaced linkage thresholds (`tree_cluster.py --multi-layer 20`), ordered from ancient to recent, and the downstream outputs are emitted for three tracks at every layer: `duplications`, `speciations`, and `combined`.
+```mermaid
+graph TD
+    A[UniProt / InterPro Raw FASTA] -->|Length Filter 130-200 AA| B[Filtered FASTA]
+    B -->|CD-HIT 80% Identity| C[Clustered Representatives]
+    C -->|FAMSA / MAFFT| D[Multiple Sequence Alignment]
+    D -->|trimAl -gt 0.2| E[Trimmed Alignment]
+    E -->|IQ-TREE2 -m LG+G -B 1000| F[ML Phylogeny & Bootstraps]
+    F -->|AleRax + NCBI Species Tree| G[Reconciled Tree Topology]
+    G -->|IQ-TREE2 -asr| H[ASR Ancestral States & Treefile]
+    H -->|MAD Rooting & Leaf-Set Node Mapping| I[Rooted & Mapped ASR Tree]
+    I -->|Decoupled BADASP Scoring| J[Raw Pairwise Node Scores]
+    J -->|Clade-Size Decile Thresholding| K[99.9th% SDP Switches]
+    K -->|PDB Mapper| L[ChimeraX / PyMOL 3D Structural Scripts]
+```
 
-The pipeline uses a "Roll-Down Inheritance" model: assignments propagate from deep to shallow layers so slowly evolving lineages remain coherently assigned rather than being fragmented at shallow cuts. That keeps the timeline comparable across all 20 layers.
+---
 
-How scoring now works:
-1. Ingest reconciliation logic to identify Duplication and Speciation internal nodes.
-2. For each defined layer (`layer_01` to `layer_20`), assess clade pairs. Keep nodes whose left and right descendant clades each contain at least 5 sequences.
-3. Compute distances from the immediate parent node to the ASR-resolved LCA node for both branches to establish the Least Diverged Ortholog (LDO) and Most Diverged Ortholog (MDO) tags.
-4. Separate the raw pairwise metrics and threshold-passing scores into three tracks per layer: `combined`, `duplications`, and `speciations`.
-5. Downstream processing (Phase 6 mapping, Phase 7 timelines) ingests these discrete tracks dynamically to decouple event types without muddying the phylogenetic signals.
+## Installation & Environment
 
-### Phase 6-7: Structural & Evolutionary Analysis (Complete)
-16. Map trimmed alignment columns to PDB residue numbers; generate PyMOL/ChimeraX scripts for SDP visualization.
-17. Analyze SDP evolution: phylogenetic depth timeline, 3D spatial clustering, co-evolution networks, physicochemical trajectories.
-18. Perform multilevel (Groups/Families/Subfamilies) architectural domain mapping, community extraction from coevolution matrices, and taxonomic SDP distribution analysis.
-19. Generate publication-ready visualizations with architectural switch distributions, compact count-based boxplots, and hierarchical dendrograms with refined styling.
+### Prerequisites
+- Operating System: macOS or Linux
+- Python: 3.9+
+- Third-Party Bioinformatics Tools: `iqtree2`, `famsa`, `trimal`, `cd-hit`, `alerax`
 
-## Repository Structure
-- `src/`: pipeline modules
-  - `data_fetcher.py`: InterPro/UniProt sequence ingestion
-  - `sequence_cluster.py`: length filtering + CD-HIT clustering
-  - `msa_builder.py`: MAFFT alignment + trimAl trimming
-  - `tree_builder.py`: FastTree tree construction
-  - `tree_cluster.py`: topological clade clustering + LCA reporting
-  - `badasp_core.py`: duplication-directed BADASP scoring + SDP identification
-  - `asr_runner.py`: IQ-TREE2 ancestral sequence reconstruction
-  - `pdb_mapper.py`: sequence-to-structure alignment + PyMOL/ChimeraX script generation
-  - `evolutionary_analysis.py`: evolutionary timeline, structural clustering, coevolution, physicochemical analysis, multilevel synthesis
-  - `visualization.py`: QC and clustering visual outputs including dendrogram rendering
-  - `badasp_next/`: isolated namespace for the replacement pipeline and new development
-- `tests/`: pytest suite for all core modules
-- `data/raw/`: source sequence inputs (gitignored)
-- `data/interim/`: intermediate artifacts (gitignored)
-- `data/processed/`: processed artifacts (gitignored)
-- `results/`: vector graphics and tabular outputs organized by analysis
-  - `results/sequence_filtering/`
-  - `results/alignment_qc/`
-  - `results/topological_clustering/`
-  - `results/badasp_scoring/`
-  - `results/structural_mapping/`
-  - `results/evolutionary_analysis/`
+### Setup Virtual Environment
+```bash
+# Clone the repository
+git clone https://github.com/laflucETH/BADASP.git
+cd BADASP
 
-## Results Organization Policy
-Results are grouped by analysis purpose and never by phase number:
-- `results/sequence_filtering/`: sequence-length QC outputs
-- `results/alignment_qc/`: MSA quality outputs
-- `results/topological_clustering/`: tree-clade assignments, LCA summaries, and dendrograms (rotated, color-refined, architecture-normalized)
-- `results/badasp_scoring/`: duplication-directed BADASP scores, switch distributions, and SDP tables
-  - `raw_pairwise_<track>.csv`: pooled left-vs-right clade pair scores for `duplications`, `speciations`, or `combined`
-  - `badasp_scores_<track>.csv`: position-level pooled score table for each track
-  - `badasp_sdps_<track>.csv`: final SDP calls after track-specific 95th-percentile thresholding
-  - `global_layer_summary.csv`: 20-row cross-layer summary with linkage threshold, valid pair counts, and duplication/speciation SDP totals
-- `results/structural_mapping/`: ChimeraX/PyMOL visualization scripts, PDB mappings, and legends
-- `results/evolutionary_analysis/`: phylogenetic timelines, structural clustering heatmaps, coevolution matrices, physicochemical shifts, architectural domain distributions, compact count-based boxplots, taxonomic SDP mapping, and multilevel synthesized outputs
+# Create and activate virtual environment
+python3 -m venv venv
+source venv/bin/activate
 
-Generated CSV outputs under `results/` are treated as local analysis artifacts and are not tracked in git; tree files and SVG figures remain available for committed outputs when needed.
+# Install dependencies
+pip install -r requirements.txt
+```
 
-## Reproducibility Notes
-- Use root virtual environment commands, for example: `./venv/bin/python -m pytest -q`.
-- Snakemake workflow entry point: `./venv/bin/python -m snakemake -n -j1 --snakefile Snakefile`.
-- The reconciliation workflow stages AleRax inputs under `data/interim/alerax/` and writes final outputs under `results/reconciliation/alerax/`.
-- IQ-TREE2 `--wbt` requires at least 1000 replicates in this release, so the workflow uses `-B 1000` even though the original launch request used 100.
-- Generate vector figures as SVG by default.
-- `_archive_v1/` is excluded from active development and execution.
-- The pipeline intentionally uses a single MAD execution path through `venv/bin/mad.py` (no separate binary-mode integration in pipeline code).
-- The tree-building stage now prefers a natively compiled `venv/bin/FastTreeMP` built from source with OpenMP for multicore Apple Silicon execution; single-threaded FastTree is only a fallback.
-- IQ-TREE2 benchmark outputs are written to `results/iqtree_scaling.csv` and `results/iqtree_scaling_plot.svg`; the benchmark samples 500/1000/2000/4000-sequence subsets from the full alignment/tree.
-- IQ-TREE2 extrapolation plotting now marks the 24,608-sequence 0.80 threshold and saves the result to `results/iqtree_scaling_plot_extrapolated.svg`.
+---
 
-## HPC Cluster & Computationally Heavy Execution Details
-Because building the tree distribution and optimizing the DTL parameters on a 21k gene / 8.8k species dataset are extremely computationally expensive, these steps were run as follows:
+## How to Run the Pipeline
 
-1. **IQ-TREE 2 (Local Run)**:
+### Full Pipeline Execution
+The pipeline is fully orchestrated using **Snakemake**.
+
+```bash
+# Run the full pipeline with Snakemake (adjust cores as available)
+venv/bin/snakemake --cores 8
+```
+
+#### Key Pipeline Configurations (`config/snakemake.yaml`):
+| Parameter | Default | Description |
+| :--- | :--- | :--- |
+| `cdhit_identity` | `0.8` | CD-HIT sequence clustering identity threshold |
+| `trimal_gap_threshold` | `0.2` | Minimum column occupancy for trimAl trimming |
+| `iqtree_model` | `LG+G` | Amino acid substitution model for IQ-TREE2 |
+| `iqtree_bootstrap` | `1000` | Ultrafast bootstrap replicates (`-B 1000`) |
+| `gene_tree_rooting_method` | `mad` | Rooting method (`mad` via `mad.py` or `midpoint`) |
+| `badasp_min_occupancy` | `0.8` | Minimum alignment position occupancy for SDP scoring |
+
+---
+
+### Bypassing Heavy Computations (Fast Reproduction)
+
+Because building the ML tree distribution and running AleRax species reconciliation on 21k sequences / 8.8k species are computationally intensive, pre-computed reconciliation files can be used to execute downstream MAD rooting, scoring, adaptive thresholding, and structural mapping locally in seconds.
+
+```bash
+# 1. Ensure pre-computed AleRax reconciliations are placed in results/reconciliation/alerax/IPR019888/
+# 2. Touch Snakemake target checkpoints to skip heavy tree search/reconciliation steps:
+venv/bin/snakemake --touch --cores 1
+
+# 3. Run downstream MAD rooting, scoring, plotting, and structural mapping:
+venv/bin/snakemake --cores 4
+```
+
+---
+
+### Parallel Species Reconciliation Validation (`rec_check`)
+
+To validate that species reconciliation ratios and event identifications are not biased by sequence density, a dedicated parallel pipeline (`Snakefile_rec_check`) is available. It performs a **Minimum Species Set Cover** to isolate a representative subset of species while maintaining 100% coverage of sequence clusters:
+
+```bash
+# Run the parallel species reconciliation validation pipeline
+venv/bin/snakemake -s Snakefile_rec_check --configfile config/snakemake_rec_check.yaml --cores 4
+```
+
+---
+
+## HPC & Computing Environment Details
+
+Computational work is divided based on resource requirements and CPU performance:
+
+1. **IQ-TREE 2 ML Tree Search & Bootstrap (Local Run)**:
+   - **Environment**: Executed locally on Apple Silicon MacBook for superior single-thread and multi-core CPU execution.
    - **Command**: `iqtree2 -s data/interim/IPR019888_trimmed.aln -m LG+G -T AUTO --wbt -B 1000 --prefix data/interim/iqtree/IPR019888`
-   - **Resources**: Run locally on **2 cores** (automatically selected by IQ-TREE auto-detect as optimal thread count).
+   - **Resources**: Run on **2 cores** (optimal thread count auto-detected by IQ-TREE).
    - **Runtime**: **256 hours 53 minutes 26 seconds** (~10.7 days).
 
-2. **AleRax Reconciliation (Euler HPC Run)**:
+2. **AleRax Species Reconciliation (ETH Euler HPC Run)**:
+   - **Environment**: Submitted as a high-memory batch job on the ETH Euler HPC cluster due to heavy memory allocation required for full DTL reconciliation across 21k sequences / 8.8k species.
    - **Command**: `alerax -f data/interim/alerax/IPR019888.families.txt -s data/interim/alerax/IPR019888_species_tree.nwk -p results/reconciliation/alerax/IPR019888 --prune-species-tree`
-   - **Resources**: Run on **1 core** (no MPI parallelization was used as AleRax only parallelizes MPI across multiple gene families; here we have a single family).
-   - **Memory Savings**: **OFF** (memory was sufficient on Euler, so `--memory-savings` was omitted to speed up execution).
+   - **Resources**: **1 core** (AleRax single-family mode) with full memory allocation.
    - **Runtime**: **110 hours 48 minutes 27 seconds** (~4.6 days).
 
-3. **Replicating & Bypassing Heavy Steps Locally**:
-   - To replicate without rerunning the 10.7-day tree search or 4.6-day DTL parameter optimization, scientists should transfer pre-computed results to `results/reconciliation/alerax/IPR019888/`.
-   - Copy the consensus tree to the expected target:
-     `cp results/reconciliation/alerax/IPR019888/reconciliations/summaries/IPR019888_consensus_50.newick results/reconciliation/alerax/IPR019888/reconciliations/IPR019888.nwk`
-   - Touch Snakemake checkpoints so it doesn't trigger a rebuild:
-     `./venv/bin/python -m snakemake --touch --cores 1 --rerun-incomplete`
-   - Run the downstream steps:
-     `./venv/bin/python -m snakemake --cores 1`
+---
 
+## Key Features & Methodological Advances
+
+- **MAD Tree Rooting Integration (`scripts/root_and_map_tree.py`)**: Roots trees using Minimal Ancestor Deviation and transfers unrooted ASR node names (`Node53`, `Node52`, etc.) via leaf-set signature mapping (direct & complement matching), preventing node misalignment.
+- **Clade-Size Adjusted Adaptive Thresholding**: Bins sister-clade comparisons into deciles strictly by minimum clade size. Calculates unified non-parametric percentile cutoffs (95th–99.9th) across all scores in each decile, then plots switch distributions decoupled by event type (Duplication, Speciation, Transfer).
+- **Automated PDB Mapping (`src/badasp/pdb_mapper.py`)**: Aligns target sequence candidates against reference PDB models (e.g. `2CG4`) and outputs ChimeraX scripts (`.cxc`) highlighting top SDP switches in 3D.
+
+---
+
+## Repository Structure
+
+```
+BADASP/
+├── Snakefile                               # Main Snakemake workflow definition
+├── Snakefile_rec_check                     # Parallel species reconciliation validation workflow
+├── config/
+│   ├── snakemake.yaml                      # Primary pipeline configuration
+│   └── snakemake_rec_check.yaml            # Validation pipeline configuration
+├── src/
+│   └── badasp/                             # Core Python package
+│       ├── alerax_inputs.py                # AleRax family and mapping file generation
+│       ├── scoring.py                      # Node-wise BADASP scoring algorithm
+│       ├── plot_node_scores.py             # Score mapping & tree diagnostics visualization
+│       ├── plot_tree_losses.py             # Branch loss count visualizations
+│       ├── pdb_mapper.py                   # PDB structure alignment & ChimeraX script generator
+│       └── tree_rooting.py                 # Canonical MAD / midpoint rooting wrapper
+├── scripts/
+│   ├── root_and_map_tree.py                # MAD tree rooting & leaf-set node mapping CLI
+│   ├── compare_rootings.py                 # Fast O(N) side-by-side tree rooting comparator
+│   ├── prepare_rec_check.py                # Sequence extraction for species set cover
+│   ├── exploratory_set_cover.py            # Exact & greedy Minimum Species Set Cover solver
+│   ├── plot_decoupled_event_switches_clade_adjusted.py  # Adaptive thresholding & switch plot generator
+│   ├── plot_switches_vs_clade_size.py      # Switch count vs clade size decile analyzer
+│   └── plot_switches_vs_root_distance.py   # Switch count vs root distance analyzer
+├── tests/                                  # Pytest unit & integration test suite
+└── PIPELINE_STATE.md                       # Comprehensive state management document
+```
+
+---
+
+## Testing
+
+All pipeline components follow strict Test-Driven Development (TDD).
+
+To run the complete test suite:
+
+```bash
+PYTHONPATH=. venv/bin/pytest tests/
+```
+
+---
+
+## References
+
+1. **Edwards, R. J., & Shields, D. C.** (2005). BADASP: predicting specificity-determining residues using ancestral sequence prediction. *Bioinformatics*, 21(22), 4190-4191.
+2. **Bradley, D., & Beltrao, P.** (2019). Evolution of protein interaction specificity through ancestral sequence reconstruction and reconciliation. *Nature Communications*, 10(1), 1-12.
+3. **Morel, B., Williams, T. A., & Stamatakis, A.** (2024). AleRax: A tool for gene family species tree reconciliation and gene tree rooting. *Bioinformatics*, 40(4), btae162. https://doi.org/10.1093/bioinformatics/btae162
+4. **Tria, F. D. K., Landan, G., & Dagan, T.** (2017). Phylogenetic rooting using minimal ancestor deviation. *Nature Ecology & Evolution*, 1(7), 0193.
