@@ -521,7 +521,10 @@ def main() -> None:
     args = parser.parse_args()
 
     occ_pct = int(args.min_occupancy * 100)
-    out_dir = Path(f"results/badasp_scoring/clade_size_adjusted/min_clade_{args.min_clade_size}/occupancy_{occ_pct}")
+    p_str = str(args.percentile).replace(".", "_")
+    if p_str.endswith("_0"):
+        p_str = p_str[:-2]
+    out_dir = Path(f"results/badasp_scoring/clade_size_adjusted/p{p_str}/min_clade_{args.min_clade_size}/occupancy_{occ_pct}")
     out_dir.mkdir(parents=True, exist_ok=True)
     
     # 1. Load data
@@ -567,8 +570,11 @@ def main() -> None:
     df_filtered["bin_left"] = df_filtered["clade_size_left"].apply(_map_to_bin)
     df_filtered["bin_right"] = df_filtered["clade_size_right"].apply(_map_to_bin)
     
-    # 4. Calculate adaptive thresholds for multiple percentiles: 95, 97, 99, 99.9
     percentiles_to_check = [95.0, 97.0, 99.0, 99.9]
+    if args.percentile not in percentiles_to_check:
+        percentiles_to_check.append(args.percentile)
+        percentiles_to_check.sort()
+        
     all_thresholds = {}
     for p in percentiles_to_check:
         all_thresholds[p] = calculate_bin_thresholds(melted_df, "score", "clade_bin", percentile=p)

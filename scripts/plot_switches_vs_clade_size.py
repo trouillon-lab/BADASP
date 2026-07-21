@@ -25,13 +25,26 @@ EVENT_COLORS = {
 }
 
 def main():
-    scores_path = Path("results/badasp_scoring/raw_node_scores.csv")
-    alignment_path = Path("data/interim/IPR019888_trimmed.aln")
-    min_clade_size = 5
-    min_occupancy = 0.8
-    percentile = 99.9
+    import argparse
+    parser = argparse.ArgumentParser(description="Plot Switches vs Clade Size")
+    parser.add_argument("--scores", type=Path, default=Path("results/badasp_scoring/raw_node_scores.csv"))
+    parser.add_argument("--alignment", type=Path, default=Path("data/interim/IPR019888_trimmed.aln"))
+    parser.add_argument("--min-occupancy", type=float, default=0.8)
+    parser.add_argument("--percentile", type=float, default=99.9)
+    parser.add_argument("--min-clade-size", type=int, default=5)
+    args = parser.parse_args()
 
-    out_dir = Path("results/badasp_scoring/clade_size_adjusted/min_clade_5/occupancy_80")
+    scores_path = args.scores
+    alignment_path = args.alignment
+    min_clade_size = args.min_clade_size
+    min_occupancy = args.min_occupancy
+    percentile = args.percentile
+
+    occ_pct = int(min_occupancy * 100)
+    p_str = str(percentile).replace(".", "_")
+    if p_str.endswith("_0"):
+        p_str = p_str[:-2]
+    out_dir = Path(f"results/badasp_scoring/clade_size_adjusted/p{p_str}/min_clade_{min_clade_size}/occupancy_{occ_pct}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if not scores_path.exists():
@@ -165,7 +178,7 @@ def main():
         palette=[EVENT_COLORS["Duplication"], EVENT_COLORS["Speciation"], EVENT_COLORS["Transfer"]],
         ax=ax
     )
-    ax.set_title("A. 99.9th% Overall Switches Binned by Min Clade Size", fontsize=13, fontweight="bold", pad=12)
+    ax.set_title(f"A. {percentile}th% Overall Switches Binned by Min Clade Size", fontsize=13, fontweight="bold", pad=12)
     ax.set_xlabel("Minimum Clade Size of Sister Pairs (Decile Bins)", fontsize=11)
     ax.set_ylabel("Number of Switches", fontsize=11)
     ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha="right")

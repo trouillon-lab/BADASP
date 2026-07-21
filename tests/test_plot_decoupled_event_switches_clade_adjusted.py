@@ -182,7 +182,7 @@ def test_plot_decoupled_event_switches_clade_adjusted_main(mock_data_dir):
             main()
             
     # Check that outputs were generated in the redirected directory
-    redirected_out_dir = temp_path / "clade_size_adjusted" / f"min_clade_{min_clade}" / f"occupancy_{occ_pct}"
+    redirected_out_dir = temp_path / "clade_size_adjusted" / "p99" / f"min_clade_{min_clade}" / f"occupancy_{occ_pct}"
     stats_csv = redirected_out_dir / "event_decoupled_stats_clade_adjusted.csv"
     pos_csv = redirected_out_dir / "event_positional_switches_clade_adjusted.csv"
     domain_csv = redirected_out_dir / "event_domain_densities_clade_adjusted.csv"
