@@ -28,6 +28,8 @@ data/raw/**
 data/interim/**
 data/processed/**
 data/sandbox_alerax/
+data/rec_check/
+results/rec_check/
 data/*.csv
 
 # Keep directory scaffolding tracked
@@ -73,3 +75,7 @@ _archive_v2*/
 
 # Local data file
 ncbi_taxonomy_map.csv
+
+# Compiled tools and submodules
+tools/
+

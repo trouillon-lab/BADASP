@@ -110,6 +110,7 @@ rule iqtree_bootstrap_tree_distribution:
     shell:
         """
         set -euo pipefail
+        rm -f {params.prefix}.ckp.gz {params.prefix}.log
         {params.binary} -s {input} -m {params.model} -T AUTO --wbt -B {params.bootstrap} --prefix {params.prefix}
         """
 
@@ -254,10 +255,25 @@ rule iqtree_asr_reconciled:
         {params.binary} -s {input.alignment} -m {params.model} -te {input.reconciled_tree} -asr --prefix {params.prefix}
         """
 
+rule root_and_map_asr_tree:
+    input:
+        treefile=f"data/interim/iqtree_asr/{config['project']['family_name']}.treefile",
+    output:
+        rooted_tree=f"data/interim/iqtree_asr/{config['project']['family_name']}_rooted.tree",
+    params:
+        python=config["tools"]["python"],
+    shell:
+        """
+        set -euo pipefail
+        {params.python} scripts/root_and_map_tree.py \
+          --unrooted-tree {input.treefile} \
+          --output-tree {output.rooted_tree}
+        """
+
 rule badasp_node_scoring:
     input:
         alerax_tree=f"{ALERAX_OUTPUT_DIR}/reconciliations/{config['project']['family_name']}.nwk",
-        asr_tree=f"data/interim/iqtree_asr/{config['project']['family_name']}.treefile",
+        asr_tree=f"data/interim/iqtree_asr/{config['project']['family_name']}_rooted.tree",
         state=f"data/interim/iqtree_asr/{config['project']['family_name']}.state",
         alignment=TRIMMED_FASTA,
     output:
@@ -280,7 +296,7 @@ rule badasp_node_scoring:
 rule plot_node_scores:
     input:
         scores="results/badasp_scoring/raw_node_scores.csv",
-        tree=f"data/interim/iqtree_asr/{config['project']['family_name']}.treefile",
+        tree=f"data/interim/iqtree_asr/{config['project']['family_name']}_rooted.tree",
         alignment=TRIMMED_FASTA,
     output:
         "results/badasp_scoring/plots/tree_score_mapping.svg",
@@ -322,7 +338,7 @@ rule compare_event_stats:
 rule plot_tree_losses:
     input:
         reconciled_tree=f"{ALERAX_OUTPUT_DIR}/reconciliations/{config['project']['family_name']}.nwk",
-        tree=f"data/interim/iqtree_asr/{config['project']['family_name']}.treefile",
+        tree=f"data/interim/iqtree_asr/{config['project']['family_name']}_rooted.tree",
     output:
         plot="results/badasp_scoring/plots/tree_losses_mapping.svg",
         csv="results/badasp_scoring/analyses/branch_loss_counts.csv",
