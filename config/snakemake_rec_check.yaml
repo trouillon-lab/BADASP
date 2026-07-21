@@ -1,0 +1,35 @@
+project:
+  family_name: IPR019888
+
+tools:
+  python: ./venv/bin/python
+  cd_hit: cd-hit
+  famsa: famsa
+  trimal: trimal
+  iqtree: iqtree2
+  alerax: tools/AleRax/build/bin/alerax
+
+parameters:
+  cdhit_identity: 1.0
+  cdhit_word_size: 5
+  trimal_gap_threshold: 0.2
+  iqtree_model: LG+G
+  iqtree_bootstrap: 1000
+  gene_tree_rooting_method: mad
+  alerax_threads: 1
+  badasp_min_occupancy: 0.8
+
+paths:
+  raw_fasta: data/rec_check/IPR019888_rec_check_raw.fasta
+  clustered_fasta: data/rec_check/IPR019888_rec_check.fasta
+  clustered_clstr: data/rec_check/IPR019888_rec_check.fasta.clstr
+  aligned_fasta: data/rec_check/IPR019888_rec_check.aln.fasta
+  trimmed_fasta: data/rec_check/IPR019888_rec_check_trimmed.aln
+  iqtree_prefix: data/rec_check/iqtree/IPR019888
+  iqtree_bootstrap_trees: data/rec_check/iqtree/IPR019888.ufboot
+  iqtree_rooted_tree: data/rec_check/iqtree/IPR019888_mad_rooted.tree
+  species_tree_source: data/interim/ncbi_species_tree.nwk
+  species_tree_normalized: data/rec_check/alerax/IPR019888_species_tree.nwk
+  alerax_mapping: data/rec_check/alerax/IPR019888.treerecs_mapping.link
+  alerax_families: data/rec_check/alerax/IPR019888.families.txt
+  alerax_output_dir: results/rec_check/reconciliation/alerax/IPR019888

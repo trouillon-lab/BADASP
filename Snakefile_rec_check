@@ -1,0 +1,157 @@
+configfile: "config/snakemake_rec_check.yaml"
+
+RAW_FASTA = config["paths"]["raw_fasta"]
+CLUSTERED_FASTA = config["paths"]["clustered_fasta"]
+CLUSTERED_CLSTR = config["paths"]["clustered_clstr"]
+ALIGNED_FASTA = config["paths"]["aligned_fasta"]
+TRIMMED_FASTA = config["paths"]["trimmed_fasta"]
+IQTREE_PREFIX = config["paths"]["iqtree_prefix"]
+IQTREE_TREEFILE = f"{IQTREE_PREFIX}.contree"
+IQTREE_BOOTTREES = config["paths"]["iqtree_bootstrap_trees"]
+IQTREE_ROOTED_TREE = config["paths"]["iqtree_rooted_tree"]
+SPECIES_TREE_SOURCE = config["paths"]["species_tree_source"]
+SPECIES_TREE_NORMALIZED = config["paths"]["species_tree_normalized"]
+ALERAX_MAPPING = config["paths"]["alerax_mapping"]
+ALERAX_FAMILIES = config["paths"]["alerax_families"]
+
+rule all:
+    input:
+        CLUSTERED_FASTA,
+        CLUSTERED_CLSTR,
+        ALIGNED_FASTA,
+        TRIMMED_FASTA,
+        IQTREE_TREEFILE,
+        IQTREE_BOOTTREES,
+        IQTREE_ROOTED_TREE,
+        SPECIES_TREE_NORMALIZED,
+        ALERAX_MAPPING,
+        ALERAX_FAMILIES
+
+rule cdhit_cluster:
+    input:
+        RAW_FASTA,
+    output:
+        fasta=CLUSTERED_FASTA,
+        clstr=CLUSTERED_CLSTR,
+    shell:
+        """
+        set -euo pipefail
+        cp {input} {output.fasta}
+        touch {output.clstr}
+        """
+
+rule famsa_align:
+    input:
+        CLUSTERED_FASTA,
+    output:
+        ALIGNED_FASTA,
+    shell:
+        """
+        set -euo pipefail
+        famsa {input} {output}
+        """
+
+rule trimal_trim:
+    input:
+        ALIGNED_FASTA,
+    output:
+        TRIMMED_FASTA,
+    params:
+        gap_threshold=config["parameters"]["trimal_gap_threshold"],
+    shell:
+        """
+        set -euo pipefail
+        trimal -in {input} -out {output} -gt {params.gap_threshold}
+        """
+
+rule iqtree_bootstrap_tree_distribution:
+    input:
+        TRIMMED_FASTA,
+    output:
+        treefile=IQTREE_TREEFILE,
+        boottrees=IQTREE_BOOTTREES,
+    params:
+        prefix=IQTREE_PREFIX,
+        model=config["parameters"]["iqtree_model"],
+        bootstrap=config["parameters"]["iqtree_bootstrap"],
+        binary=config["tools"]["iqtree"],
+    shell:
+        """
+        set -euo pipefail
+        rm -f {params.prefix}.ckp.gz {params.prefix}.log
+        {params.binary} -s {input} -m {params.model} -T AUTO --wbt -B {params.bootstrap} --prefix {params.prefix}
+        """
+
+rule mad_root_gene_tree:
+    input:
+        IQTREE_TREEFILE,
+    output:
+        IQTREE_ROOTED_TREE,
+    params:
+        python=config["tools"]["python"],
+        rooting_method=config["parameters"]["gene_tree_rooting_method"],
+    shell:
+        """
+        set -euo pipefail
+        {params.python} -m src.badasp.alerax_inputs root-gene-tree \
+          --boot-trees {input} \
+          --output {output} \
+          --rooting-method {params.rooting_method}
+        """
+
+rule normalize_species_tree:
+    input:
+        source=SPECIES_TREE_SOURCE,
+        clustered=CLUSTERED_FASTA,
+    output:
+        SPECIES_TREE_NORMALIZED,
+    params:
+        python=config["tools"]["python"],
+    shell:
+        """
+        set -euo pipefail
+        {params.python} -m src.badasp.alerax_inputs species-tree \
+          --source-tree {input.source} \
+          --raw-fasta {input.clustered} \
+          --output {output}
+        """
+
+rule build_alerax_mapping:
+    input:
+        clustered=CLUSTERED_FASTA,
+        raw=RAW_FASTA,
+        species_tree=SPECIES_TREE_NORMALIZED,
+    output:
+        ALERAX_MAPPING,
+    params:
+        python=config["tools"]["python"],
+    shell:
+        """
+        set -euo pipefail
+        {params.python} -m src.badasp.alerax_inputs mapping \
+          --clustered-fasta {input.clustered} \
+          --raw-fasta {input.raw} \
+          --species-tree {input.species_tree} \
+          --output {output}
+        """
+
+rule build_alerax_families:
+    input:
+        boottrees=IQTREE_BOOTTREES,
+        mapping=ALERAX_MAPPING,
+        rooted_tree=IQTREE_ROOTED_TREE,
+    output:
+        ALERAX_FAMILIES,
+    params:
+        python=config["tools"]["python"],
+        family_name=config["project"]["family_name"],
+    shell:
+        """
+        set -euo pipefail
+        {params.python} -m src.badasp.alerax_inputs families \
+          --boot-trees {input.boottrees} \
+          --resolved-gene-tree {input.rooted_tree} \
+          --mapping {input.mapping} \
+          --family-name {params.family_name} \
+          --output {output}
+        """
