@@ -53,7 +53,11 @@ def plot_score_distributions(scores_df: pd.DataFrame, out_dir: Path, alignment_p
     alignment = AlignIO.read(alignment_path, "fasta")
     num_seqs = len(alignment)
     aln_len = alignment.get_alignment_length()
-    
+
+    if num_seqs == 0:
+        print("Warning: alignment is empty; skipping occupancy filtering.")
+        return
+
     occupancies = {}
     for col in range(aln_len):
         chars = [alignment[seq_idx][col] for seq_idx in range(num_seqs)]
@@ -435,7 +439,8 @@ def plot_scoring_diagnostics(tree_path: Path, scores_df: pd.DataFrame, out_dir: 
     """
     from ete3 import Tree as EteTree
     
-    family_name = tree_path.stem
+    stem = tree_path.stem
+    family_name = stem.removesuffix("_rooted")
     root_dir = Path.cwd()
     alerax_tree_path = root_dir / "results" / "reconciliation" / "alerax" / family_name / "reconciliations" / f"{family_name}.nwk"
     state_path = tree_path.parent / f"{family_name}.state"
@@ -507,6 +512,7 @@ def plot_scoring_diagnostics(tree_path: Path, scores_df: pd.DataFrame, out_dir: 
     # Map ASR Nodes
     asr_tree = EteTree(str(tree_path), format=1)
     asr_nodes_to_events = {}
+    leaf_sig_to_event = {}  # bio.Phylo nodes may be unnamed; key by leaf-sig instead
     idx = 1
     for node in asr_tree.traverse("preorder"):
         if not node.is_leaf():
@@ -514,7 +520,9 @@ def plot_scoring_diagnostics(tree_path: Path, scores_df: pd.DataFrame, out_dir: 
                 node.name = f"Node{idx}"
             idx += 1
             sig = tuple(sorted(leaf.name for leaf in node.get_leaves()))
-            asr_nodes_to_events[node.name] = alerax_events.get(sig, "Unresolved")
+            ev = alerax_events.get(sig, "Unresolved")
+            asr_nodes_to_events[node.name] = ev
+            leaf_sig_to_event[sig] = ev
 
     ancestral_seqs = {}
     for node_name in asr_nodes_to_events:
@@ -544,8 +552,9 @@ def plot_scoring_diagnostics(tree_path: Path, scores_df: pd.DataFrame, out_dir: 
             node_categories[clade] = "Unnamed Children"
             continue
             
-        # 3. Event type check
-        event_type = asr_nodes_to_events.get(clade.name, "Unresolved")
+        # 3. Event type check (Bio.Phylo may leave internal nodes unnamed; look up by leaf sig)
+        clade_sig = tuple(sorted(t.name for t in clade.get_terminals() if t.name))
+        event_type = leaf_sig_to_event.get(clade_sig, "Unresolved")
         if event_type not in {"Speciation", "Duplication", "Transfer"}:
             node_categories[clade] = "Unresolved/Ignored Event"
             continue

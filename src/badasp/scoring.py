@@ -1,5 +1,5 @@
 import argparse
-import csv
+import warnings
 from collections import Counter
 from functools import lru_cache
 from pathlib import Path
@@ -113,13 +113,14 @@ def load_state_file(state_path: Path) -> Dict[str, pd.DataFrame]:
     state_data: Dict[str, List[Dict[str, object]]] = {}
     with state_path.open("r", encoding="utf-8") as handle:
         for line in handle:
-            if line.strip().startswith("#") or (line.strip().startswith("Node") and "Site" in line):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
                 continue
-            if not line.strip():
-                continue
-            parts = line.strip().split("\t")
+            parts = stripped.split("\t")
             if len(parts) < 4:
                 continue
+            if parts[0] == "Node" and parts[1] == "Site":
+                continue  # header row
             try:
                 node = parts[0]
                 site = int(parts[1])
@@ -127,6 +128,10 @@ def load_state_file(state_path: Path) -> Dict[str, pd.DataFrame]:
                 probs = [float(p) for p in parts[3:]]
                 state_data.setdefault(node, []).append({"Site": site, "State": state, "probs": probs})
             except (ValueError, IndexError):
+                warnings.warn(
+                    f"Skipping malformed line in state file '{state_path}': {stripped[:80]}",
+                    stacklevel=2,
+                )
                 continue
     return {node: pd.DataFrame(rows) for node, rows in state_data.items()}
 
@@ -347,8 +352,7 @@ def score_tree_nodes(
 
             rc_left = _rc(left_name, pos, left_leaves)
             rc_right = _rc(right_name, pos, right_leaves)
-            rc = (rc_left + rc_right) / 2.0
-            
+
             ac = calculate_ancestral_conservation(aa_left, aa_right)
             
             # Asymmetric p(AC) calculation based on Bradley & Beltrao (2019)

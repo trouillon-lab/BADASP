@@ -15,9 +15,8 @@ if project_root not in sys.path:
 
 import argparse
 import xml.etree.ElementTree as ET
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Tuple
 import pandas as pd
-import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -100,7 +99,7 @@ def parse_sample_losses(xml_path: Path, leaf_sig_to_node: Dict, ns: Dict) -> Tup
         tree_xml = ET.parse(xml_path)
     except Exception as e:
         print(f"Error parsing XML file {xml_path}: {e}")
-        return [], 0
+        return None, 0
         
     root_xml = tree_xml.getroot()
     rec_gene_tree = root_xml.find('.//ns:recGeneTree', ns)
@@ -220,21 +219,25 @@ if __name__ == "__main__":
     # 4. Parse XML files and aggregate counts
     print("Parsing sample files and mapping losses...")
     ns = {'ns': 'http://www.recg.org'}
-    
+
     # Track counts of SL and TL per branch (identified by sibling signature in master tree)
     branch_sl_counts = {}
     branch_tl_counts = {}
     total_unmapped = 0
     total_losses_parsed = 0
+    n_parsed = 0  # only count successfully parsed files for frequency denominator
 
     for idx, xml_path in enumerate(xml_files):
         if (idx + 1) % 10 == 0 or (idx + 1) == n_samples:
             print(f"  Parsed {idx + 1}/{n_samples} samples...")
-            
+
         events, unmapped = parse_sample_losses(xml_path, leaf_sig_to_node, ns)
+        if events is None:
+            continue  # XML parse failure; skip but don't count toward denominator
+        n_parsed += 1
         total_unmapped += unmapped
         total_losses_parsed += len(events) + unmapped
-        
+
         for sig, loss_type in events:
             if loss_type == 'SL':
                 branch_sl_counts[sig] = branch_sl_counts.get(sig, 0) + 1
@@ -277,9 +280,9 @@ if __name__ == "__main__":
                 "speciation_losses": sl_c,
                 "transfer_losses": tl_c,
                 "total_losses": sl_c + tl_c,
-                "speciation_loss_frequency": sl_c / n_samples,
-                "transfer_loss_frequency": tl_c / n_samples,
-                "total_loss_frequency": (sl_c + tl_c) / n_samples
+                "speciation_loss_frequency": sl_c / n_parsed if n_parsed > 0 else 0.0,
+                "transfer_loss_frequency": tl_c / n_parsed if n_parsed > 0 else 0.0,
+                "total_loss_frequency": (sl_c + tl_c) / n_parsed if n_parsed > 0 else 0.0
             })
             
     df_losses = pd.DataFrame(csv_rows)

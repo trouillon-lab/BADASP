@@ -27,7 +27,8 @@ def generate_animation_cxc(track: str, base_dir: Path, wait_frames: int = 25) ->
         print(f"Error: No .cxc files found for track '{track}'", file=sys.stderr)
         sys.exit(1)
         
-    pdb_line = "open /Users/lucla/Desktop/repos/BADASP/data/raw/AF_with_loop.cif"
+    pdb_path = Path(__file__).resolve().parent.parent / "data/raw/AF_with_loop.cif"
+    pdb_line = f"open {pdb_path}"
     
     lines = [
         f"# Master ChimeraX Animation for {track.capitalize()} layers 1-20",

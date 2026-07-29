@@ -6,7 +6,7 @@ from pathlib import Path
 from Bio import Phylo
 
 
-CANONICAL_MAD_EXECUTABLE = Path("venv/bin/mad.py")
+CANONICAL_MAD_EXECUTABLE = Path(__file__).resolve().parent.parent.parent / "venv/bin/mad.py"
 
 
 def _summarize_mad_output(stdout: str, stderr: str) -> str:
@@ -61,7 +61,6 @@ def root_tree(
 
     result = subprocess.run(
         [str(mad_script), str(input_tree)],
-        check=True,
         capture_output=True,
         text=True,
     )
@@ -69,7 +68,7 @@ def root_tree(
     stdout = getattr(result, "stdout", "") or ""
     stderr = getattr(result, "stderr", "") or ""
     combined_output = "\n".join(part for part in [stdout, stderr] if part)
-    if "<<< Error" in combined_output or "Cowardly refusing" in combined_output:
+    if result.returncode != 0 or "<<< Error" in combined_output or "Cowardly refusing" in combined_output:
         raise RuntimeError(
             f"MAD failed to root '{input_tree}': {_summarize_mad_output(stdout, stderr)}"
         )

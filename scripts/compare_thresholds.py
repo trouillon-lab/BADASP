@@ -46,6 +46,7 @@ def main() -> None:
     parser.add_argument("--scores", type=Path, default=Path("results/badasp_scoring/raw_node_scores.csv"))
     parser.add_argument("--alignment", type=Path, default=Path("data/interim/IPR019888_trimmed.aln"))
     parser.add_argument("--min-occupancy", type=float, default=0.8, help="Filter out positions with occupancy below this value (0.0 to 1.0)")
+    parser.add_argument("--outdir", type=Path, default=None, help="Output directory for results")
     args = parser.parse_args()
 
     # 1. Load Raw Scores
@@ -82,7 +83,10 @@ def main() -> None:
     
     # Setup output directories based on occupancy threshold
     occ_pct = int(args.min_occupancy * 100)
-    out_dir = Path(f"results/badasp_scoring/threshold_comparison/occupancy_{occ_pct}")
+    if args.outdir is not None:
+        out_dir = args.outdir
+    else:
+        out_dir = Path(f"results/badasp_scoring/threshold_comparison/occupancy_{occ_pct}")
     out_dir.mkdir(parents=True, exist_ok=True)
     
     # 3. Calculate Thresholds and Filter Switches

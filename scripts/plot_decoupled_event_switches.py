@@ -70,12 +70,16 @@ def main() -> None:
     parser.add_argument("--scores", type=Path, default=Path("results/badasp_scoring/raw_node_scores.csv"))
     parser.add_argument("--alignment", type=Path, default=Path("data/interim/IPR019888_trimmed.aln"))
     parser.add_argument("--min-occupancy", type=float, default=0.8, help="Occupancy threshold used for filtering (0.0 to 1.0)")
+    parser.add_argument("--outdir", type=Path, default=None, help="Output directory for results")
     args = parser.parse_args()
 
     occ_pct = int(args.min_occupancy * 100)
     
     # Setup Output Directory
-    out_dir = Path(f"results/badasp_scoring/event_decoupling/occupancy_{occ_pct}")
+    if args.outdir is not None:
+        out_dir = args.outdir
+    else:
+        out_dir = Path(f"results/badasp_scoring/event_decoupling/occupancy_{occ_pct}")
     out_dir.mkdir(parents=True, exist_ok=True)
     
     # 1. Load Data
@@ -122,6 +126,8 @@ def main() -> None:
         
         if total_comp == 0:
             print(f"Warning: No scored records found for event type: {event_type}")
+            for label in ["p95", "p97", "p99", "h17", "h18", "h19"]:
+                df_pos[f"{event_type.lower()}_switches_{label}"] = 0
             continue
             
         # Calculate event-specific percentiles
@@ -213,39 +219,42 @@ def main() -> None:
     fig, axes = plt.subplots(4, 1, figsize=(18, 24), sharey=False)
     
     # Styling configurations for panels A, B, C
+    def _get_stat(event_type, col):
+        mask = df_stats["event_type"] == event_type
+        return float(df_stats.loc[mask, col].values[0]) if mask.any() else 0.0
+
     panel_cfgs = {
         "Duplication": {
             "title": "A. Duplication-Arising Switches (Specific 97th% = {thresh:.3f})",
             "ax": axes[0],
-            "color": "#c0392b",   # Dark Red
-            "raw_color": "#e74c3c", # Light Red
+            "color": "#c0392b",
+            "raw_color": "#e74c3c",
             "col_p97": "duplication_switches_p97",
             "col_h17": "duplication_switches_h17",
-            "thresh_p97": df_stats.loc[df_stats["event_type"] == "Duplication", "p97_threshold"].values[0] if len(df_stats) > 0 else 0.0
+            "thresh_p97": _get_stat("Duplication", "p97_threshold"),
         },
         "Speciation": {
             "title": "B. Speciation-Arising Switches (Specific 97th% = {thresh:.3f})",
             "ax": axes[1],
-            "color": "#2980b9",   # Dark Blue
-            "raw_color": "#3498db", # Light Blue
+            "color": "#2980b9",
+            "raw_color": "#3498db",
             "col_p97": "speciation_switches_p97",
             "col_h17": "speciation_switches_h17",
-            "thresh_p97": df_stats.loc[df_stats["event_type"] == "Speciation", "p97_threshold"].values[0] if len(df_stats) > 0 else 0.0
+            "thresh_p97": _get_stat("Speciation", "p97_threshold"),
         },
         "Transfer": {
             "title": "C. Transfer-Arising Switches (Specific 97th% = {thresh:.3f})",
             "ax": axes[2],
-            "color": "#27ae60",   # Dark Green
-            "raw_color": "#2ecc71", # Light Green
+            "color": "#27ae60",
+            "raw_color": "#2ecc71",
             "col_p97": "transfer_switches_p97",
             "col_h17": "transfer_switches_h17",
-            "thresh_p97": df_stats.loc[df_stats["event_type"] == "Transfer", "p97_threshold"].values[0] if len(df_stats) > 0 else 0.0
-        }
+            "thresh_p97": _get_stat("Transfer", "p97_threshold"),
+        },
     }
-    
+
     # Common vertical shading colors for domains
     domain_colors = ["#ecf0f1", "#d5dbdb", "#a2d9ce", "#abebc6", "#fadbd8", "#fdebd0"]
-    window_size = 5
     
     for ev_type, cfg in panel_cfgs.items():
         ax = cfg["ax"]
@@ -307,8 +316,12 @@ def main() -> None:
     # Prepare labels and data
     x_labels = []
     for name in domains.keys():
-        row_dup = df_domains[(df_domains["domain"] == name) & (df_domains["event_type"] == "Duplication")].iloc[0]
-        x_labels.append(f"{name}\n({row_dup['active_sites']}/{row_dup['total_sites']} sites active)")
+        dup_rows = df_domains[(df_domains["domain"] == name) & (df_domains["event_type"] == "Duplication")]
+        if dup_rows.empty:
+            x_labels.append(f"{name}\n(N/A)")
+        else:
+            row_dup = dup_rows.iloc[0]
+            x_labels.append(f"{name}\n({row_dup['active_sites']}/{row_dup['total_sites']} sites active)")
         
     sns.barplot(
         data=df_domains,
@@ -340,18 +353,18 @@ def main() -> None:
             
     # Add Filtered Out indicator
     for i, name in enumerate(domains.keys()):
-        row_dup = df_domains[(df_domains["domain"] == name) & (df_domains["event_type"] == "Duplication")].iloc[0]
-        if row_dup["active_sites"] == 0:
+        dup_rows = df_domains[(df_domains["domain"] == name) & (df_domains["event_type"] == "Duplication")]
+        if not dup_rows.empty and dup_rows.iloc[0]["active_sites"] == 0:
             axes[3].text(
-                i, 0.02, 
-                "FILTERED", 
-                ha="center", va="bottom", 
+                i, 0.02,
+                "FILTERED",
+                ha="center", va="bottom",
                 fontsize=9, color="#7f8c8d", fontweight="bold",
                 bbox=dict(boxstyle="round,pad=0.3", fc="#f8f9f9", ec="#bdc3c7", lw=1)
             )
-            
+
     plt.tight_layout()
-    
+
     plot_svg = out_dir / "decoupled_event_switches_comparison.svg"
     plot_png = out_dir / "decoupled_event_switches_comparison.png"
     
@@ -473,18 +486,18 @@ def main() -> None:
             
     # Add Filtered Out indicator
     for i, name in enumerate(domains.keys()):
-        row_dup = df_domains[(df_domains["domain"] == name) & (df_domains["event_type"] == "Duplication")].iloc[0]
-        if row_dup["active_sites"] == 0:
+        dup_rows = df_domains[(df_domains["domain"] == name) & (df_domains["event_type"] == "Duplication")]
+        if not dup_rows.empty and dup_rows.iloc[0]["active_sites"] == 0:
             axes[3].text(
-                i, 0.02, 
-                "FILTERED", 
-                ha="center", va="bottom", 
+                i, 0.02,
+                "FILTERED",
+                ha="center", va="bottom",
                 fontsize=9, color="#7f8c8d", fontweight="bold",
                 bbox=dict(boxstyle="round,pad=0.3", fc="#f8f9f9", ec="#bdc3c7", lw=1)
             )
-            
+
     plt.tight_layout()
-    
+
     plot_h17_svg = out_dir / "decoupled_event_switches_hard1.7_comparison.svg"
     plot_h17_png = out_dir / "decoupled_event_switches_hard1.7_comparison.png"
     
@@ -606,18 +619,18 @@ def main() -> None:
             
     # Add Filtered Out indicator
     for i, name in enumerate(domains.keys()):
-        row_dup = df_domains[(df_domains["domain"] == name) & (df_domains["event_type"] == "Duplication")].iloc[0]
-        if row_dup["active_sites"] == 0:
+        dup_rows = df_domains[(df_domains["domain"] == name) & (df_domains["event_type"] == "Duplication")]
+        if not dup_rows.empty and dup_rows.iloc[0]["active_sites"] == 0:
             axes[3].text(
-                i, 0.02, 
-                "FILTERED", 
-                ha="center", va="bottom", 
+                i, 0.02,
+                "FILTERED",
+                ha="center", va="bottom",
                 fontsize=9, color="#7f8c8d", fontweight="bold",
                 bbox=dict(boxstyle="round,pad=0.3", fc="#f8f9f9", ec="#bdc3c7", lw=1)
             )
-            
+
     plt.tight_layout()
-    
+
     plot_h19_svg = out_dir / "decoupled_event_switches_hard1.9_comparison.svg"
     plot_h19_png = out_dir / "decoupled_event_switches_hard1.9_comparison.png"
     

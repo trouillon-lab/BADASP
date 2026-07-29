@@ -8,7 +8,7 @@ from typing import Iterable, Optional
 from Bio import SeqIO
 from ete3 import NCBITaxa, Tree
 
-from src.badasp.tree_rooting import root_tree
+from .tree_rooting import root_tree
 
 
 _OX_PATTERN = re.compile(r"\bOX=(\d+)\b")
@@ -76,8 +76,8 @@ def build_alerax_mapping_file(
                     lineage = ncbi.get_lineage(int(leaf_name))
                     for anc in lineage:
                         ancestor_to_leaves.setdefault(anc, []).append(leaf_name)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"Warning: NCBI lineage lookup failed for '{leaf_name}': {e}")
         except Exception as e:
             print(f"Warning: Failed to load species tree for mapping fallback: {e}")
 
@@ -112,6 +112,7 @@ def build_alerax_mapping_file(
         gene_id = str(record.id)
         species = raw_taxa.get(gene_id) or raw_taxa.get(_accession_key(gene_id))
         if species is None:
+            print(f"Warning: Could not resolve species for gene '{gene_id}', skipping.")
             continue
         lines.append(f"{gene_id}\t{species}")
 

@@ -7,6 +7,7 @@ ALIGNED_FASTA = config["paths"]["aligned_fasta"]
 TRIMMED_FASTA = config["paths"]["trimmed_fasta"]
 IQTREE_PREFIX = config["paths"]["iqtree_prefix"]
 IQTREE_TREEFILE = f"{IQTREE_PREFIX}.contree"
+IQTREE_ML_TREE = f"{IQTREE_PREFIX}.treefile"
 IQTREE_BOOTTREES = config["paths"]["iqtree_bootstrap_trees"]
 IQTREE_ROOTED_TREE = config["paths"]["iqtree_rooted_tree"]
 SPECIES_TREE_SOURCE = config["paths"]["species_tree_source"]
@@ -101,6 +102,7 @@ rule iqtree_bootstrap_tree_distribution:
         TRIMMED_FASTA,
     output:
         treefile=IQTREE_TREEFILE,
+        ml_treefile=IQTREE_ML_TREE,
         boottrees=IQTREE_BOOTTREES,
     params:
         prefix=IQTREE_PREFIX,
@@ -117,7 +119,8 @@ rule iqtree_bootstrap_tree_distribution:
 
 rule mad_root_gene_tree:
     input:
-        IQTREE_TREEFILE,
+        boottrees=IQTREE_TREEFILE,
+        ml_treefile=IQTREE_ML_TREE,
     output:
         IQTREE_ROOTED_TREE,
     params:
@@ -127,7 +130,7 @@ rule mad_root_gene_tree:
         """
         set -euo pipefail
         {params.python} -m src.badasp.alerax_inputs root-gene-tree \
-          --boot-trees {input} \
+          --boot-trees {input.boottrees} \
           --output {output} \
           --rooting-method {params.rooting_method}
         """
@@ -213,9 +216,9 @@ rule alerax_reconcile:
         # Run on a single core (no MPI) as AleRax only uses MPI parallelization across multiple families.
         # Memory-savings is omitted here for high-resource cluster nodes, but can be added back if needed.
         if [ {threads} -gt 1 ]; then
-            mpirun -n {threads} {params.binary} -f {input.families} -s {input.species_tree} --rec-model UndatedDTL -p {params.prefix} --prune-species-tree
+            mpirun -n {threads} {params.binary} -f "{input.families}" -s "{input.species_tree}" --rec-model UndatedDTL -p "{params.prefix}" --prune-species-tree
         else
-            {params.binary} -f {input.families} -s {input.species_tree} --rec-model UndatedDTL -p {params.prefix} --prune-species-tree
+            {params.binary} -f "{input.families}" -s "{input.species_tree}" --rec-model UndatedDTL -p "{params.prefix}" --prune-species-tree
         fi
 
         # Post-process: ensure the expected reconciled tree exists.
@@ -381,6 +384,7 @@ rule compare_thresholds:
 rule plot_hard_threshold_details:
     input:
         positional=f"{OCC_DIR}/positional_switches_comparison.csv",
+        alignment=TRIMMED_FASTA,
     output:
         csv=f"{OCC_DIR}/hard_thresholds_domain_counts.csv",
         plot_svg=f"{OCC_DIR}/hard_thresholds_details.svg",
@@ -396,7 +400,8 @@ rule plot_hard_threshold_details:
         set -euo pipefail
         {params.python} scripts/plot_hard_threshold_details.py \
           --min-occupancy {params.min_occupancy} \
-          --positional {input.positional}
+          --positional {input.positional} \
+          --alignment {input.alignment}
         """
 
 
