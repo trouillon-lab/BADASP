@@ -242,7 +242,7 @@ def plot_taxonomic_dendrogram(
 def main():
     parser = argparse.ArgumentParser(description="Plot Taxonomic Leaf-Colored Dendrograms")
     parser.add_argument(
-        "--tree", type=Path, default=Path("data/interim/iqtree_asr/IPR019888.treefile"),
+        "--tree", type=Path, default=Path("data/interim/iqtree_asr/IPR019888_rooted.tree"),
         help="Path to ASR treefile."
     )
     parser.add_argument(

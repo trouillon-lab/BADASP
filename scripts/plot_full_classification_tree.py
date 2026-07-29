@@ -59,7 +59,7 @@ def _build_y_positions(tree) -> Dict:
 def main():
     parser = argparse.ArgumentParser(description="Plot Full Classification Tree Dendrogram")
     parser.add_argument(
-        "--tree", type=Path, default=Path("data/interim/iqtree_asr/IPR019888.treefile"),
+        "--tree", type=Path, default=Path("data/interim/iqtree_asr/IPR019888_rooted.tree"),
         help="Path to ASR treefile."
     )
     parser.add_argument(
