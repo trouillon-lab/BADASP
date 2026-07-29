@@ -1,4 +1,4 @@
 [FAMILIES]
 - IPR019888
-gene_tree = /cluster/project/beltrao/lucla/repos/badasp/data/interim/alerax/IPR019888_distribution.nwk
-mapping = /cluster/project/beltrao/lucla/repos/badasp/data/interim/alerax/IPR019888.treerecs_mapping.link
+gene_tree = /cluster/project/beltrao/lucla/repos/badasp/data/interim/alerax_clean/IPR019888_distribution_clean.nwk
+mapping = /cluster/project/beltrao/lucla/repos/badasp/data/interim/alerax_clean/IPR019888_treerecs_mapping_clean.link
