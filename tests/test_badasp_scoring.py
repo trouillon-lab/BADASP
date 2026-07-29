@@ -32,7 +32,7 @@ def test_load_state_file(tmp_path: Path) -> None:
 def test_conservation_calculations() -> None:
     # Test calculate_recent_conservation
     seqs = ["MKT", "MKT", "MKT"]
-    assert pytest.approx(calculate_recent_conservation(seqs, 0), 1e-4) == 0.6  # Perfect M conservation normalized
+    assert calculate_recent_conservation(seqs, 0) == pytest.approx(0.6, abs=1e-4)  # Perfect M conservation normalized
     
     # Test calculate_ancestral_conservation
     assert calculate_ancestral_conservation("A", "A") == 1.0

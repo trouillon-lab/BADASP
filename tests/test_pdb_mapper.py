@@ -20,6 +20,7 @@ from src.pdb_mapper import PDBMapper, main
 class TestPDBDownloader:
     """Test PDB file acquisition and caching."""
 
+    @pytest.mark.network
     def test_download_pdb_file(self):
         """
         Download a target PDB file using Bio.PDB.PDBList.
@@ -40,6 +41,7 @@ class TestPDBDownloader:
             content = f.read()
             assert "ATOM" in content or "HETATM" in content
 
+    @pytest.mark.network
     def test_pdb_cache_reuse(self):
         """
         Verify that repeated downloads use cached version.
@@ -68,10 +70,11 @@ class TestPDBDownloader:
         """
         # Using the existing structure in data/raw/
         pdb_path = Path("data/raw/2cg4.cif")
-        if pdb_path.exists():
-            mapper = PDBMapper(pdb_id="2cg4", pdb_file=str(pdb_path))
-            retrieved_path = mapper.download_pdb()
-            assert retrieved_path == str(pdb_path)
+        if not pdb_path.exists():
+            pytest.skip("data/raw/2cg4.cif not available on this checkout")
+        mapper = PDBMapper(pdb_id="2cg4", pdb_file=str(pdb_path))
+        retrieved_path = mapper.download_pdb()
+        assert retrieved_path == str(pdb_path)
 
 
 class TestSequenceToStructureAlignment:
@@ -87,6 +90,8 @@ class TestSequenceToStructureAlignment:
         - No gaps in mapping (gapped positions handled)
         """
         alignment_path = Path("data/interim/IPR019888_trimmed.aln")
+        if not alignment_path.exists():
+            pytest.skip("data/interim/IPR019888_trimmed.aln not available on this checkout")
         pdb_id = "2cg4"
 
         mapper = PDBMapper(pdb_id=pdb_id)
@@ -114,6 +119,8 @@ class TestSequenceToStructureAlignment:
         - Aligned and ungapped positions map 1:1 to PDB structure
         """
         alignment_path = Path("data/interim/IPR019888_trimmed.aln")
+        if not alignment_path.exists():
+            pytest.skip("data/interim/IPR019888_trimmed.aln not available on this checkout")
         pdb_id = "2cg4"
 
         mapper = PDBMapper(pdb_id=pdb_id)
@@ -139,6 +146,8 @@ class TestSequenceToStructureAlignment:
         - No out-of-range column indices
         """
         alignment_path = Path("data/interim/IPR019888_trimmed.aln")
+        if not alignment_path.exists():
+            pytest.skip("data/interim/IPR019888_trimmed.aln not available on this checkout")
         pdb_id = "2cg4"
         alignment_length = len(next(SeqIO.parse(str(alignment_path), "fasta")).seq)
 
@@ -167,6 +176,8 @@ class TestPyMOLScriptGeneration:
         pdb_id = "2cg4"
         alignment_path = Path("data/interim/IPR019888_trimmed.aln")
         sdp_csv_groups = Path("results/badasp_scoring/badasp_scores_groups.csv")
+        if not alignment_path.exists() or not sdp_csv_groups.exists():
+            pytest.skip("Alignment or BADASP score CSVs not available on this checkout")
         sdp_csv_families = Path("results/badasp_scoring/badasp_scores_families.csv")
         sdp_csv_subfamilies = Path("results/badasp_scoring/badasp_scores_subfamilies.csv")
 
@@ -204,6 +215,8 @@ class TestPyMOLScriptGeneration:
         pdb_id = "2cg4"
         alignment_path = Path("data/interim/IPR019888_trimmed.aln")
         sdp_csv_groups = Path("results/badasp_scoring/badasp_scores_groups.csv")
+        if not alignment_path.exists() or not sdp_csv_groups.exists():
+            pytest.skip("Alignment or BADASP score CSVs not available on this checkout")
         sdp_csv_families = Path("results/badasp_scoring/badasp_scores_families.csv")
         sdp_csv_subfamilies = Path("results/badasp_scoring/badasp_scores_subfamilies.csv")
 
@@ -237,6 +250,8 @@ class TestPyMOLScriptGeneration:
         pdb_id = "2cg4"
         alignment_path = Path("data/interim/IPR019888_trimmed.aln")
         sdp_csv_groups = Path("results/badasp_scoring/badasp_scores_groups.csv")
+        if not alignment_path.exists() or not sdp_csv_groups.exists():
+            pytest.skip("Alignment or BADASP score CSVs not available on this checkout")
         sdp_csv_families = Path("results/badasp_scoring/badasp_scores_families.csv")
         sdp_csv_subfamilies = Path("results/badasp_scoring/badasp_scores_subfamilies.csv")
 
@@ -275,6 +290,8 @@ class TestChimeraXScriptGeneration:
         sdp_csv_groups = Path("results/badasp_scoring/badasp_scores_groups.csv")
         sdp_csv_families = Path("results/badasp_scoring/badasp_scores_families.csv")
         sdp_csv_subfamilies = Path("results/badasp_scoring/badasp_scores_subfamilies.csv")
+        if not alignment_path.exists() or not sdp_csv_groups.exists():
+            pytest.skip("Alignment or BADASP score CSVs not available on this checkout")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -355,6 +372,101 @@ class TestChimeraXScriptGeneration:
                 else:
                     assert f"/{chain}:{residue}" in content
 
+    def test_chimerax_scripts_include_standalone_png_legends(self):
+        """Verify that each level has a standalone PNG colorbar legend."""
+        alignment_path = Path("data/interim/IPR019888_trimmed.aln")
+        groups_csv = Path("results/badasp_scoring/badasp_scores_groups.csv")
+        if not alignment_path.exists() or not groups_csv.exists():
+            pytest.skip("BADASP score CSVs not available on this checkout")
+        mapper = PDBMapper(pdb_id="2cg4")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            mapper.generate_chimerax_scripts(
+                alignment_path=alignment_path,
+                sdp_csv_groups=groups_csv,
+                sdp_csv_families=Path("results/badasp_scoring/badasp_scores_families.csv"),
+                sdp_csv_subfamilies=Path("results/badasp_scoring/badasp_scores_subfamilies.csv"),
+                output_dir=output_dir,
+            )
+            for legend_name in ("legend_groups.png", "legend_families.png", "legend_subfamilies.png"):
+                legend_path = output_dir / legend_name
+                assert legend_path.exists()
+                assert legend_path.stat().st_size > 0
+
+    def test_chimerax_scripts_do_not_use_key_command(self):
+        """Ensure we avoid ChimeraX key syntax due to the palette lookup bug."""
+        alignment_path = Path("data/interim/IPR019888_trimmed.aln")
+        groups_csv = Path("results/badasp_scoring/badasp_scores_groups.csv")
+        if not alignment_path.exists() or not groups_csv.exists():
+            pytest.skip("BADASP score CSVs not available on this checkout")
+        mapper = PDBMapper(pdb_id="2cg4")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            outputs = mapper.generate_chimerax_scripts(
+                alignment_path=alignment_path,
+                sdp_csv_groups=groups_csv,
+                sdp_csv_families=Path("results/badasp_scoring/badasp_scores_families.csv"),
+                sdp_csv_subfamilies=Path("results/badasp_scoring/badasp_scores_subfamilies.csv"),
+                output_dir=output_dir,
+            )
+            for script_path in outputs.values():
+                content = script_path.read_text()
+                assert "\nkey " not in content
+
+    def test_chimerax_scripts_write_base_commands_when_no_switches(self, monkeypatch):
+        mapper = PDBMapper(pdb_id="2cg4")
+        monkeypatch.setattr(mapper, "download_pdb", lambda: "data/raw/2cg4.pdb")
+        monkeypatch.setattr(mapper, "map_alignment_to_structure", lambda alignment_path: {10: 100, 20: 200})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            no_switch_csv = tmp / "no_switch.csv"
+            no_switch_csv.write_text(
+                "position,max_score,switch_count\n10,0.2,0\n20,0.3,0\n",
+                encoding="utf-8",
+            )
+            outputs = mapper.generate_chimerax_scripts(
+                alignment_path=Path("data/interim/IPR019888_trimmed.aln"),
+                sdp_csv_groups=no_switch_csv,
+                sdp_csv_families=no_switch_csv,
+                sdp_csv_subfamilies=no_switch_csv,
+                output_dir=tmp,
+            )
+            for path in outputs.values():
+                content = path.read_text(encoding="utf-8")
+                assert path.stat().st_size > 0
+                assert "open " in content
+                assert "_residues: none" in content
+                assert "reason: no switch_count > 0 rows" in content
+
+    def test_generate_physicochemical_chimerax_script(self, monkeypatch):
+        """Generate a physicochemical-shift ChimeraX script with rule-based coloring."""
+        mapper = PDBMapper(pdb_id="2cg4")
+        monkeypatch.setattr(mapper, "download_pdb", lambda: "data/raw/2cg4.pdb")
+        monkeypatch.setattr(mapper, "map_alignment_to_structure", lambda alignment_path: {10: 101, 20: 205, 30: 333})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            shifts_csv = tmp / "physicochemical_shifts.csv"
+            shifts_csv.write_text(
+                "\n".join([
+                    "position,charge_change,hydrophobicity_change,volume_change",
+                    "10,neutral->positive,polar->polar,1.0",
+                    "20,neutral->neutral,polar->hydrophobic,2.0",
+                    "30,neutral->neutral,polar->polar,60.0",
+                ]) + "\n"
+            )
+            output_cxc = tmp / "highlight_physicochemistry.cxc"
+            out = mapper.generate_physicochemical_chimerax_script(
+                alignment_path=Path("data/interim/IPR019888_trimmed.aln"),
+                physicochemical_csv=shifts_csv,
+                output_cxc=output_cxc,
+            )
+            assert out.exists()
+            content = out.read_text()
+            assert "color :101 #D62728" in content
+            assert "color :205 #2CA02C" in content
+            assert "color :333 #1F77B4" in content
+            assert "set bgColor white" in content
+
 
 def test_generate_single_chimerax_script_supports_event_and_mdo_filters(tmp_path: Path, monkeypatch) -> None:
     pdb_path = tmp_path / "toy.pdb"
@@ -391,114 +503,6 @@ def test_generate_single_chimerax_script_supports_event_and_mdo_filters(tmp_path
     text = out_cxc.read_text(encoding="utf-8")
     assert "/A:1" in text
 
-    def test_chimerax_scripts_include_standalone_png_legends(self):
-        """
-        Verify that each level has a standalone PNG colorbar legend.
-
-        Expected:
-        - legend_groups.png, legend_families.png, legend_subfamilies.png are generated
-        - files are non-empty raster artifacts
-        """
-        alignment_path = Path("data/interim/IPR019888_trimmed.aln")
-        mapper = PDBMapper(pdb_id="2cg4")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output_dir = Path(tmpdir)
-            mapper.generate_chimerax_scripts(
-                alignment_path=alignment_path,
-                sdp_csv_groups=Path("results/badasp_scoring/badasp_scores_groups.csv"),
-                sdp_csv_families=Path("results/badasp_scoring/badasp_scores_families.csv"),
-                sdp_csv_subfamilies=Path("results/badasp_scoring/badasp_scores_subfamilies.csv"),
-                output_dir=output_dir,
-            )
-
-            for legend_name in ("legend_groups.png", "legend_families.png", "legend_subfamilies.png"):
-                legend_path = output_dir / legend_name
-                assert legend_path.exists()
-                assert legend_path.stat().st_size > 0
-
-    def test_chimerax_scripts_do_not_use_key_command(self):
-        """Ensure we avoid ChimeraX key syntax due to the palette lookup bug."""
-        alignment_path = Path("data/interim/IPR019888_trimmed.aln")
-        mapper = PDBMapper(pdb_id="2cg4")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output_dir = Path(tmpdir)
-            outputs = mapper.generate_chimerax_scripts(
-                alignment_path=alignment_path,
-                sdp_csv_groups=Path("results/badasp_scoring/badasp_scores_groups.csv"),
-                sdp_csv_families=Path("results/badasp_scoring/badasp_scores_families.csv"),
-                sdp_csv_subfamilies=Path("results/badasp_scoring/badasp_scores_subfamilies.csv"),
-                output_dir=output_dir,
-            )
-
-            for script_path in outputs.values():
-                content = script_path.read_text()
-                assert "\nkey " not in content
-
-    def test_chimerax_scripts_write_base_commands_when_no_switches(self, monkeypatch):
-        mapper = PDBMapper(pdb_id="2cg4")
-
-        monkeypatch.setattr(mapper, "download_pdb", lambda: "data/raw/2cg4.pdb")
-        monkeypatch.setattr(mapper, "map_alignment_to_structure", lambda alignment_path: {10: 100, 20: 200})
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            no_switch_csv = tmp / "no_switch.csv"
-            no_switch_csv.write_text(
-                "position,max_score,switch_count\n10,0.2,0\n20,0.3,0\n",
-                encoding="utf-8",
-            )
-
-            outputs = mapper.generate_chimerax_scripts(
-                alignment_path=Path("data/interim/IPR019888_trimmed.aln"),
-                sdp_csv_groups=no_switch_csv,
-                sdp_csv_families=no_switch_csv,
-                sdp_csv_subfamilies=no_switch_csv,
-                output_dir=tmp,
-            )
-
-            for path in outputs.values():
-                content = path.read_text(encoding="utf-8")
-                assert path.stat().st_size > 0
-                assert "open " in content
-                assert "_residues: none" in content
-                assert "reason: no switch_count > 0 rows" in content
-
-    def test_generate_physicochemical_chimerax_script(self, monkeypatch):
-        """Generate a physicochemical-shift ChimeraX script with rule-based coloring."""
-        mapper = PDBMapper(pdb_id="2cg4")
-
-        monkeypatch.setattr(mapper, "download_pdb", lambda: "data/raw/2cg4.pdb")
-        monkeypatch.setattr(mapper, "map_alignment_to_structure", lambda alignment_path: {10: 101, 20: 205, 30: 333})
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            shifts_csv = tmp / "physicochemical_shifts.csv"
-            shifts_csv.write_text(
-                "\n".join(
-                    [
-                        "position,charge_change,hydrophobicity_change,volume_change",
-                        "10,neutral->positive,polar->polar,1.0",
-                        "20,neutral->neutral,polar->hydrophobic,2.0",
-                        "30,neutral->neutral,polar->polar,60.0",
-                    ]
-                )
-                + "\n"
-            )
-            output_cxc = tmp / "highlight_physicochemistry.cxc"
-
-            out = mapper.generate_physicochemical_chimerax_script(
-                alignment_path=Path("data/interim/IPR019888_trimmed.aln"),
-                physicochemical_csv=shifts_csv,
-                output_cxc=output_cxc,
-            )
-
-            assert out.exists()
-            content = out.read_text()
-            assert "color :101 #D62728" in content
-            assert "color :205 #2CA02C" in content
-            assert "color :333 #1F77B4" in content
-            assert "set bgColor white" in content
-
 
 class TestPDBMapperEndToEnd:
     """Integration tests for end-to-end structural mapping."""
@@ -517,6 +521,7 @@ class TestPDBMapperEndToEnd:
 
         assert mapper.pdb_id == pdb_id
 
+    @pytest.mark.network
     def test_pdb_mapper_with_custom_cache(self):
         """
         Test PDBMapper with custom cache directory.
@@ -532,6 +537,7 @@ class TestPDBMapperEndToEnd:
 
             assert str(pdb_path).startswith(tmpdir) or Path(pdb_path).exists()
 
+    @pytest.mark.network
     def test_complete_workflow(self):
         """
         Test the complete Phase 6 workflow: download, map, script generation.
@@ -544,6 +550,8 @@ class TestPDBMapperEndToEnd:
         """
         pdb_id = "2cg4"
         alignment_path = Path("data/interim/IPR019888_trimmed.aln")
+        if not alignment_path.exists():
+            pytest.skip("data/interim/IPR019888_trimmed.aln not available on this checkout")
         sdp_csv_groups = Path("results/badasp_scoring/badasp_scores_groups.csv")
         sdp_csv_families = Path("results/badasp_scoring/badasp_scores_families.csv")
         sdp_csv_subfamilies = Path("results/badasp_scoring/badasp_scores_subfamilies.csv")

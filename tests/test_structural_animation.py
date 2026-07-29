@@ -33,7 +33,7 @@ def test_generate_animation_cxc_creates_script():
         content = output_path.read_text(encoding="utf-8")
         
         assert "Master ChimeraX Animation for Duplications" in content
-        assert "open /Users/lucla/Desktop/repos/BADASP/data/raw/AF_with_loop.cif" in content
+        assert "AF_with_loop.cif" in content
         assert "del all" in content
         assert "view" in content
         assert "color nucleic lightsteelblue" in content
