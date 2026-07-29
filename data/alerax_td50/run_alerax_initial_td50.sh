@@ -27,7 +27,7 @@ REPO=/cluster/project/beltrao/lucla/repos/badasp
 
 ALERAX=${REPO}/tools/AleRax/build/bin/alerax
 FAMILIES=${REPO}/data/alerax_td50/IPR019888_initial_td50.families.txt
-SPECIES_TREE=${REPO}/data/interim/alerax/IPR019888_species_tree.nwk
+SPECIES_TREE=${REPO}/data/interim/alerax_clean/IPR019888_species_tree_clean.nwk
 PARAM_FILE=${REPO}/data/alerax_td50/model_params_initial_td50.txt
 OUTPUT_PREFIX=${REPO}/results/dtl_sensitivity/alerax_initial_td50/IPR019888
 
