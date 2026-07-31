@@ -370,12 +370,22 @@ def ac_plus1_control(
     ac: np.ndarray,
     t: Optional[float],
     max_null_sample: int = 200_000,
+    null_ac: Optional[np.ndarray] = None,
 ) -> dict:
     """AC=+1 rows can contain no genuine switch (AC=+1 means the ancestral
     reconstruction did not even change state, so there is nothing for a
     "switch" to be about); any gap between the observed and null score
     distribution restricted to these rows is therefore measured
     misspecification, not signal.
+
+    Each dataset must be restricted by *its own* AC. AC is an outcome of the
+    reconstruction, not a fixed property of a comparison, so a test with AC=+1
+    in the observed data often has AC=-1 in a given replicate. Masking the null
+    with the observed AC therefore mixes in null rows whose ancestral states did
+    change, and those score ``RC + p_AC`` rather than ``RC - p_AC``. That is
+    detectable: it puts null "AC=+1" mass above 1.0, which is unreachable when
+    AC=+1 (RC <= 1 and p_AC >= 0). ``null_ac`` is the (R, n_tests) matrix of the
+    replicates' own AC values; without it this comparison is not meaningful.
     """
     mask = ac == 1
     n_rows = int(mask.sum())
@@ -384,8 +394,15 @@ def ac_plus1_control(
 
     obs_sub = obs_stat[mask]
     obs_finite = obs_sub[np.isfinite(obs_sub)]
-    null_sub = null_stat[:, mask]
-    null_finite = null_sub[np.isfinite(null_sub)]
+    if null_ac is None:
+        return {
+            "skipped": "null AC matrix not supplied; refusing to mask the null "
+                       "with the observed AC, which would compare different "
+                       "score definitions.",
+            "n_rows": n_rows,
+        }
+    null_mask = (null_ac == 1) & np.isfinite(null_stat)
+    null_finite = null_stat[null_mask]
 
     rng = np.random.default_rng(0)
     if null_finite.size > max_null_sample:
@@ -732,7 +749,9 @@ def main(argv=None) -> int:
         plot_flatness(flatness_df, plots_dir / "exceedance_flatness.png")
     diagnostics["exceedance_flatness"] = {**flatness_note, "n_rows": int(len(flatness_df))}
 
-    diagnostics["ac_plus1_control"] = ac_plus1_control(obs_stat, null_stat, keys["ac"].to_numpy(), result.t)
+    diagnostics["ac_plus1_control"] = ac_plus1_control(
+        obs_stat, null_stat, keys["ac"].to_numpy(), result.t, null_ac=null_ac
+    )
     if result.t is not None:
         plot_ac_plus1_control(obs_stat, null_stat, keys["ac"].to_numpy(), plots_dir / "ac_plus1_control.png")
 
