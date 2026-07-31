@@ -334,6 +334,22 @@ def apply_gap_mask(sim_fasta_path: Path, mask_seqs: dict[str, str]) -> tuple[int
 
 
 def main() -> None:
+    # Pre-parse only --config, on a separate add_help=False parser, so that
+    # --help exits early here (showing just --config) instead of on the real
+    # parser below, which has every other option. The real parser (with
+    # add_help defaulted to True) is what --help/-h ends up hitting.
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG,
+    )
+    known_args, _ = pre_parser.parse_known_args()
+    cfg = load_config(known_args.config)
+    nc = cfg.get("null_calibration", {})
+    paths = cfg.get("paths", {})
+    tools = cfg.get("tools", {})
+
     parser = argparse.ArgumentParser(
         description="Simulate a per-site (per-column) frequency null alignment "
                     "with IQ-TREE AliSim via a NEXUS --mdef model file.",
@@ -345,12 +361,6 @@ def main() -> None:
         default=DEFAULT_CONFIG,
         help="Path to config/snakemake.yaml (source of a few defaults below).",
     )
-    known_args, _ = parser.parse_known_args()
-    cfg = load_config(known_args.config)
-    nc = cfg.get("null_calibration", {})
-    paths = cfg.get("paths", {})
-    tools = cfg.get("tools", {})
-
     parser.add_argument(
         "--composition-alignment",
         type=Path,
