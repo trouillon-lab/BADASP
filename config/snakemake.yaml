@@ -34,3 +34,47 @@ paths:
   alerax_mapping: data/interim/alerax/IPR019888.treerecs_mapping.link
   alerax_families: data/interim/alerax/IPR019888.families.txt
   alerax_output_dir: results/reconciliation/alerax/IPR019888
+
+null_calibration:
+  # Simulation-based null for calibrating BADASP switch thresholds.
+  #
+  # flavour "persite" is the adopted null: per-column amino-acid frequency
+  # vectors supplied to AliSim via a NEXUS --mdef model file plus one
+  # single-site partition per column, so the simulator does no mixture fitting.
+  # The null hypothesis it encodes is "each site keeps its usual amino-acid
+  # constraint, and that constraint does not differ between sister clades".
+  #
+  # Two alternatives were measured and rejected; see the null-calibration
+  # report for the numbers. Both fall below their own metric noise floor,
+  # measured as the correlation between two realisations of the same model:
+  #   "homogeneous" (LG+G4)        0.606/0.565 vs a 0.856/0.685 ceiling
+  #   "c20" (LG+C20 AliSim mimic)  0.774/0.661 vs a 0.819/0.727 ceiling
+  #                                and needs ~46 GB RAM at full scale
+  # "persite" scores 0.925/0.843, i.e. above that ceiling.
+  flavour: persite
+  replicates: 1000
+  seed: 20260731
+
+  # sim_tree must carry ML branch lengths in substitutions/site. The AleRax
+  # reconciled newick has every branch length set to the placeholder 0.1 and
+  # must NOT be used here.
+  sim_tree: data/interim/iqtree_asr/IPR019888.treefile
+
+  # Exchangeability matrix for simulation, and the gamma shape fitted by the
+  # real ASR run (data/interim/iqtree_asr/IPR019888.iqtree).
+  sim_model: LG+G4{1.7211}
+
+  # Weight mixed into each per-column frequency vector from the reference
+  # (LG equilibrium) distribution. Guards against zero frequencies and bounds
+  # how much real switch signal leaks from a column's own composition into the
+  # null. Fidelity improves monotonically as this falls (0.925 -> 0.941 entropy
+  # from 0.15 -> 0.05), so this trades fidelity against leakage.
+  shrinkage: 0.15
+
+  # ASR model for each replicate: must match the real run's model exactly, so
+  # the null inherits the same reconstruction error and misspecification.
+  asr_model: LG+G
+
+  target_fdr: 0.05
+  fwer_alpha: 0.05
+  fdp_quantile: 0.90
