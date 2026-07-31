@@ -3,13 +3,21 @@ import warnings
 from collections import Counter
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
-from Bio import AlignIO, SeqIO
+from Bio import SeqIO
 from ete3 import Tree
 from tqdm import tqdm
+
+try:
+    from .state_io import AlignmentMatrix, StateArray, load_alignment_matrix, load_state_array
+except ImportError:  # executed as a plain script (e.g. `python src/badasp/scoring.py`)
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from state_io import AlignmentMatrix, StateArray, load_alignment_matrix, load_state_array
 
 
 @lru_cache(maxsize=1)
@@ -136,6 +144,65 @@ def load_state_file(state_path: Path) -> Dict[str, pd.DataFrame]:
     return {node: pd.DataFrame(rows) for node, rows in state_data.items()}
 
 
+@lru_cache(maxsize=1)
+def _get_blosum62_matrix256() -> np.ndarray:
+    """256x256 BLOSUM62 lookup indexed by ASCII code, built from ``_blosum62_pair_score``.
+
+    Reuses the existing scalar function (rather than duplicating the matrix values)
+    so upper-casing and the "0.0 for any unrecognized pair" default are inherited
+    automatically for every ASCII code, not just the 20 canonical residues.
+    """
+    matrix = np.zeros((256, 256), dtype=np.float64)
+    for i in range(256):
+        for j in range(256):
+            matrix[i, j] = _blosum62_pair_score(chr(i), chr(j))
+    return matrix
+
+
+def calculate_recent_conservation_counts(counts: np.ndarray) -> float:
+    """Vectorized form of :func:`calculate_recent_conservation`.
+
+    ``counts`` is a length-256 vector of raw-character ASCII counts for one
+    alignment column (e.g. from ``AlignmentMatrix.column_counts``). Gap
+    characters ("-", ".") are excluded here so callers may pass a raw
+    bincount that still includes them.
+
+    Uses the identity (derived from expanding ``sum_{i<j} c_i c_j B_ij`` via
+    ``0.5 * (c@B@c - sum_i c_i^2 B_ii)`` and adding the same-residue term
+    ``c_i(c_i-1)/2 * B_ii``, which cancels the ``c_i^2`` term):
+
+        weighted_pair_sum = 0.5 * (c @ B @ c - sum_i(c_i * B_ii))
+
+    Verified against the original loop implementation in
+    ``tests/test_badasp_scoring.py::test_recent_conservation_vectorized_matches_loop``.
+    """
+    c = np.asarray(counts, dtype=np.float64).copy()
+    c[ord("-")] = 0.0
+    c[ord(".")] = 0.0
+
+    n = c.sum()
+    if n <= 0:
+        return 0.0
+    if n == 1:
+        return 1.0
+
+    total_pairs = n * (n - 1) / 2.0
+    if total_pairs == 0:
+        return 0.0
+
+    matrix = _get_blosum62_matrix256()
+    diag = np.diagonal(matrix)
+    # np.dot rather than the @ operator: mathematically identical, but avoids a
+    # spurious "invalid value encountered in matmul" RuntimeWarning from the
+    # Accelerate BLAS backend on this platform for this vector length (result
+    # is numerically identical either way; verified against the loop oracle).
+    weighted_pair_sum = 0.5 * (np.dot(c, np.dot(matrix, c)) - np.dot(c, diag))
+
+    mean_score = weighted_pair_sum / total_pairs
+    normalized_score = (mean_score + 4.0) / 15.0
+    return float(np.clip(normalized_score, 0.0, 1.0))
+
+
 def calculate_recent_conservation(sequences: List[str], position: int) -> float:
     if not sequences:
         return 0.0
@@ -145,25 +212,9 @@ def calculate_recent_conservation(sequences: List[str], position: int) -> float:
     if len(residues) == 1:
         return 1.0
 
-    counts = Counter(residues)
-    residue_types = list(counts)
-    total_pairs = (len(residues) * (len(residues) - 1)) // 2
-    if total_pairs == 0:
-        return 0.0
-
-    weighted_pair_sum = 0.0
-    for i, aa_i in enumerate(residue_types):
-        count_i = counts[aa_i]
-        same_pairs = (count_i * (count_i - 1)) // 2
-        if same_pairs:
-            weighted_pair_sum += same_pairs * _blosum62_pair_score(aa_i, aa_i)
-
-        for aa_j in residue_types[i + 1 :]:
-            weighted_pair_sum += (count_i * counts[aa_j]) * _blosum62_pair_score(aa_i, aa_j)
-
-    mean_score = weighted_pair_sum / float(total_pairs)
-    normalized_score = (mean_score + 4.0) / 15.0
-    return float(np.clip(normalized_score, 0.0, 1.0))
+    codes = np.frombuffer("".join(residues).encode("ascii", "replace"), dtype=np.uint8)
+    counts = np.bincount(codes, minlength=256).astype(np.float64)
+    return calculate_recent_conservation_counts(counts)
 
 
 def calculate_ancestral_conservation(aa1: str, aa2: str) -> float:
@@ -209,12 +260,40 @@ def score_tree_nodes(
     alignment_path: Path,
     output_csv: Path,
     min_clade_size: int = 5,
+    node_naming: str = "legacy",
 ) -> None:
+    """Score ASR tree node pairs.
+
+    Args:
+        node_naming: how to name internal nodes of ``asr_tree`` that arrive
+            with no name (this happens when the ASR tree was produced by
+            rooting a polytomous tree with a tool -- e.g. MAD without ``-p``
+            -- that arbitrarily resolves multifurcations into new zero-length
+            bifurcations; those new nodes have no ``.state`` record).
+
+            - ``"legacy"`` (default): assign ``f"Node{idx}"`` from a fresh
+              preorder counter, exactly as the original implementation did.
+              These fabricated names can collide with real, pre-existing
+              node names elsewhere in the same tree, in which case a
+              name-keyed lookup (event type, ancestral sequence, RC cache)
+              silently returns data belonging to a *different* clade. This
+              is a known, reproduced bug in existing output; kept as the
+              default so ``results/badasp_scoring/raw_node_scores.csv``
+              stays bit-for-bit reproducible unless a caller opts in to the
+              fix.
+            - ``"strict"``: fabricated names are guaranteed not to collide
+              with any real name (so a fabricated-name node's ``.state``
+              lookup correctly returns nothing and the node is skipped by
+              the pre-existing empty-ancestral-sequence ``continue``
+              instead of borrowing another node's data), and the RC/row
+              caches are keyed by node identity rather than by name so RC
+              cannot leak between clades that happen to share a name.
+    """
+    if node_naming not in {"legacy", "strict"}:
+        raise ValueError(f"node_naming must be 'legacy' or 'strict', got {node_naming!r}")
     print("Loading data...")
-    state_data = load_state_file(state_path)
-    alignment = AlignIO.read(alignment_path, "fasta")
-    aln_length = alignment.get_alignment_length()
-    seq_dict = {record.id: str(record.seq) for record in alignment}
+    alignment_matrix: AlignmentMatrix = load_alignment_matrix(alignment_path)
+    aln_length = alignment_matrix.n_sites
 
     alerax_tree = Tree(str(alerax_tree_path), format=1)
     asr_tree = Tree(str(asr_tree_path), format=1)
@@ -277,69 +356,129 @@ def score_tree_nodes(
     # 2. Map ASR Nodes
     asr_nodes_to_events: Dict[str, str] = {}
     idx = 1
+    n_fabricated_names = 0
+    n_collisions_avoided = 0
+    fabricated_names: Set[str] = set()
+    if node_naming == "strict":
+        # Names already present on the tree before any fabrication, i.e. the
+        # ones a legacy fabricated "NodeN" name could collide with.
+        pre_existing_names = {
+            node.name for node in asr_tree.traverse() if not node.is_leaf() and node.name
+        }
     for node in asr_tree.traverse("preorder"):
         if not node.is_leaf():
             if not node.name:
-                node.name = f"Node{idx}"
+                if node_naming == "strict":
+                    legacy_name_would_be = f"Node{idx}"
+                    if legacy_name_would_be in pre_existing_names:
+                        n_collisions_avoided += 1
+                    node.name = f"_unnamed_{idx}"
+                    fabricated_names.add(node.name)
+                    n_fabricated_names += 1
+                else:
+                    node.name = f"Node{idx}"
             idx += 1
             sig = tuple(sorted(leaf.name for leaf in node.get_leaves()))
             asr_nodes_to_events[node.name] = alerax_events.get(sig, "Unresolved")
 
     print(f"Mapped {len(asr_nodes_to_events)} internal nodes.")
-    
-    # Pre-reconstruct ancestral sequences
-    ancestral_seqs: Dict[str, str] = {}
-    for node_name in asr_nodes_to_events:
-        seq = _reconstruct_ancestral_sequence_from_state(state_data, node_name)
-        if seq:
-            ancestral_seqs[node_name] = seq
+    if node_naming == "strict":
+        print(
+            f"[strict] {n_fabricated_names} internal node(s) had no name in the ASR "
+            f"tree; {n_collisions_avoided} of the legacy fabricated names "
+            "('Node{idx}') would have collided with a pre-existing node name."
+        )
 
-    rc_cache: Dict[Tuple[str, int], float] = {}
-    posterior_cache: Dict[Tuple[str, int, str], float] = {}
+    # 3a. Walk the tree once (node.name is already assigned above) to determine
+    # which parent/children triples will actually be scored, *before* loading
+    # the (potentially huge) .state file, so it can be loaded restricted to
+    # just the nodes that are needed.
+    Qualifying = Tuple[object, object, object, str, str, List[str], List[str], str]
+    qualifying: List[Qualifying] = []
+    needed_state_nodes: Set[str] = set()
 
-    def _rc(node_name: str, pos: int, leaves: List[str]) -> float:
-        key = (node_name, pos)
-        if key not in rc_cache:
-            sequences = [seq_dict[leaf] for leaf in leaves if leaf in seq_dict]
-            rc_cache[key] = calculate_recent_conservation(sequences, pos)
-        return rc_cache[key]
-
-    def _posterior(node: str, site: int, aa: str) -> float:
-        key = (node, site, aa)
-        if key not in posterior_cache:
-            posterior_cache[key] = extract_posterior_probability(state_data, node, site, aa)
-        return posterior_cache[key]
-
-    output_rows = []
-    
-    # 3. Traverse ASR tree
     internal_nodes = [node for node in asr_tree.traverse("postorder") if not node.is_leaf()]
-    for parent in tqdm(internal_nodes, desc="Scoring nodes"):
+    for parent in internal_nodes:
         if len(parent.children) != 2:
             continue
-            
+
         left, right = parent.children
         left_name = getattr(left, "name", None)
         right_name = getattr(right, "name", None)
-        
+
         if not left_name or not right_name:
             continue
-            
+
         event_type = asr_nodes_to_events.get(parent.name, "Unresolved")
         if event_type not in {"Speciation", "Duplication", "Transfer"}:
             continue
 
         left_leaves = [leaf.name for leaf in left.get_leaves() if leaf.name]
         right_leaves = [leaf.name for leaf in right.get_leaves() if leaf.name]
-        
+
         if len(left_leaves) < min_clade_size or len(right_leaves) < min_clade_size:
             continue
 
-        left_sequence = ancestral_seqs.get(left_name, "")
-        right_sequence = ancestral_seqs.get(right_name, "")
-        
+        qualifying.append((parent, left, right, left_name, right_name, left_leaves, right_leaves, event_type))
+        needed_state_nodes.add(left_name)
+        needed_state_nodes.add(right_name)
+
+    print(f"{len(qualifying)} node pairs qualify for scoring; loading {len(needed_state_nodes)} state records...")
+    state: StateArray = load_state_array(state_path, nodes=needed_state_nodes, n_sites=aln_length)
+    # Hard-fail immediately, naming the offending nodes, rather than letting a
+    # missing posterior silently collapse to 0.0 (which turns into a p_ac of
+    # 1.0 at AC == -1, the maximum possible switch bonus, unnoticed).
+    #
+    # Under 'strict', fabricated names are *expected* to have no record (that
+    # is the entire point -- they get skipped below via the empty-ancestral-
+    # sequence 'continue' instead of borrowing another node's data), so they
+    # are excluded from this guard; only genuinely-named nodes are required
+    # to have a record.
+    required_nodes = needed_state_nodes - fabricated_names if node_naming == "strict" else needed_state_nodes
+    state.require_nodes(required_nodes)
+
+    # NOTE (see acceptance-test findings): 'legacy' keys these per-clade caches
+    # by node *name* -- matching the pre-refactor design exactly, including
+    # its exposure to the ASR tree's node-name collisions (see the report for
+    # root cause and exact magnitude of the resulting corruption). 'strict'
+    # keys by node identity instead, so RC cannot leak between two clades
+    # that happen to share a name.
+    rc_cache: Dict[Tuple[object, int], float] = {}
+    row_cache: Dict[object, np.ndarray] = {}
+
+    def _cache_key(node_obj: object, node_name: str) -> object:
+        return id(node_obj) if node_naming == "strict" else node_name
+
+    def _rows_for(node_obj: object, node_name: str, leaves: List[str]) -> np.ndarray:
+        key = _cache_key(node_obj, node_name)
+        if key not in row_cache:
+            row_cache[key] = alignment_matrix.row_indices(leaves)
+        return row_cache[key]
+
+    def _rc(node_obj: object, node_name: str, pos: int, rows: np.ndarray) -> float:
+        key = (_cache_key(node_obj, node_name), pos)
+        if key not in rc_cache:
+            counts = alignment_matrix.column_counts(rows, pos)
+            rc_cache[key] = calculate_recent_conservation_counts(counts)
+        return rc_cache[key]
+
+    output_rows = []
+    n_skipped_no_state = 0
+
+    # 3b. Score each qualifying node pair.
+    for parent, left, right, left_name, right_name, left_leaves, right_leaves, event_type in tqdm(
+        qualifying, desc="Scoring nodes"
+    ):
+        left_sequence = state.ancestral_sequence(left_name) or ""
+        right_sequence = state.ancestral_sequence(right_name) or ""
+
         if not left_sequence or not right_sequence:
+            if node_naming == "strict":
+                n_skipped_no_state += 1
             continue
+
+        left_rows = _rows_for(left, left_name, left_leaves)
+        right_rows = _rows_for(right, right_name, right_leaves)
 
         for pos in range(aln_length):
             if pos >= len(left_sequence) or pos >= len(right_sequence):
@@ -350,19 +489,19 @@ def score_tree_nodes(
             if aa_left in {"-", "."} or aa_right in {"-", "."}:
                 continue
 
-            rc_left = _rc(left_name, pos, left_leaves)
-            rc_right = _rc(right_name, pos, right_leaves)
+            rc_left = _rc(left, left_name, pos, left_rows)
+            rc_right = _rc(right, right_name, pos, right_rows)
 
             ac = calculate_ancestral_conservation(aa_left, aa_right)
-            
+
             # Asymmetric p(AC) calculation based on Bradley & Beltrao (2019)
             if ac == 1.0:
-                p_ac_left = _posterior(right_name, pos + 1, aa_right)
-                p_ac_right = _posterior(left_name, pos + 1, aa_left)
+                p_ac_left = state.posterior(right_name, pos + 1, aa_right)
+                p_ac_right = state.posterior(left_name, pos + 1, aa_left)
             else:
-                p_ac_left = 1.0 - _posterior(right_name, pos + 1, aa_left)
-                p_ac_right = 1.0 - _posterior(left_name, pos + 1, aa_right)
-            
+                p_ac_left = 1.0 - state.posterior(right_name, pos + 1, aa_left)
+                p_ac_right = 1.0 - state.posterior(left_name, pos + 1, aa_right)
+
             score_left = rc_left - (ac * p_ac_left)
             score_right = rc_right - (ac * p_ac_right)
 
@@ -387,6 +526,12 @@ def score_tree_nodes(
                 "clade_size_total": len(left_leaves) + len(right_leaves),
             })
 
+    if node_naming == "strict":
+        print(
+            f"[strict] {n_skipped_no_state} parent/child pair(s) were skipped because "
+            "a child node had no ancestral-state record."
+        )
+
     print(f"Writing {len(output_rows)} scored sites to {output_csv}...")
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(output_rows)
@@ -401,13 +546,25 @@ if __name__ == "__main__":
     parser.add_argument("--alignment", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--min-clade", type=int, default=5)
+    parser.add_argument(
+        "--node-naming",
+        choices=["legacy", "strict"],
+        default="legacy",
+        help=(
+            "How to name unnamed internal ASR-tree nodes (see score_tree_nodes "
+            "docstring). 'legacy' (default) reproduces existing output "
+            "bit-for-bit, including a known name-collision bug. 'strict' fixes "
+            "it, changing output."
+        ),
+    )
     args = parser.parse_args()
-    
+
     score_tree_nodes(
         alerax_tree_path=args.alerax_tree,
         asr_tree_path=args.asr_tree,
         state_path=args.state,
         alignment_path=args.alignment,
         output_csv=args.output,
-        min_clade_size=args.min_clade
+        min_clade_size=args.min_clade,
+        node_naming=args.node_naming,
     )
