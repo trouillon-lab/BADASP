@@ -27,7 +27,12 @@ def main():
             sys.exit(1)
 
         print(f"Running MAD rooting on {args.unrooted_tree}...")
-        subprocess.run([sys.executable, str(mad_script), str(args.unrooted_tree)], check=True)
+        # -p: keep polytomies flat instead of arbitrarily resolving them into
+        #     zero-length branches (these fabricated nodes have no ancestral-state
+        #     record, since they don't exist in the ASR treefile).
+        # -t: retain tiny (<1e-6) branch lengths instead of contracting them to 0.0,
+        #     which would otherwise recreate the same problem.
+        subprocess.run([sys.executable, str(mad_script), "-p", "-t", str(args.unrooted_tree)], check=True)
 
         if not rooted_tmp.exists():
             rooted_tmp = args.unrooted_tree.with_name(f"{args.unrooted_tree.name}.rooted")
