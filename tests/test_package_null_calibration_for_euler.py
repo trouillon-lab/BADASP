@@ -6,10 +6,10 @@ import pytest
 import yaml
 
 from scripts.package_null_calibration_for_euler import (
+    ARRAY_THROTTLE_DEFAULT,
     SCORE_ASR_MEASURED_MEM_GB,
-    SCORE_ASR_MEASURED_SECONDS,
+    SCORE_LOADED_MINUTES_HIGH,
     SCORE_MEM_HEADROOM_GB,
-    SCORE_SCORING_MEASURED_SECONDS,
     SCORE_THREADS,
     SCORE_WALLTIME_SAFETY_FACTOR,
     SIMULATE_MEASURED_MEM_GB,
@@ -125,13 +125,56 @@ def test_resource_block_matches_measured_constants(package):
     assert f"#SBATCH --mem-per-cpu={expected_sim_mem}" in simulate
 
     score = (package_dir / "run_score_null_calibration_array.sh").read_text()
-    expected_score_time = _fmt_hms(
-        (SCORE_ASR_MEASURED_SECONDS + SCORE_SCORING_MEASURED_SECONDS) * SCORE_WALLTIME_SAFETY_FACTOR
-    )
+    expected_score_time = _fmt_hms(SCORE_LOADED_MINUTES_HIGH * 60 * SCORE_WALLTIME_SAFETY_FACTOR)
     expected_score_mem_mb = round((SCORE_ASR_MEASURED_MEM_GB + SCORE_MEM_HEADROOM_GB) * 1024 / SCORE_THREADS)
     assert f"#SBATCH --time={expected_score_time}" in score
     assert f"#SBATCH --mem-per-cpu={expected_score_mem_mb}M" in score
     assert f"--cpus-per-task={SCORE_THREADS}" in score
+
+
+def test_score_walltime_derived_from_loaded_not_standalone_measurement(package):
+    """The scoring array's walltime must come from the contention-realistic
+    40-46 min/replicate figure, not the superseded standalone-measurement
+    estimate (446 s x 1.6 = 11:54) that this script previously used and that
+    did not survive contact with load."""
+    _, package_dir = package
+    score = (package_dir / "run_score_null_calibration_array.sh").read_text()
+    assert "#SBATCH --time=00:11:54" not in score
+    expected_score_time = _fmt_hms(SCORE_LOADED_MINUTES_HIGH * 60 * SCORE_WALLTIME_SAFETY_FACTOR)
+    assert f"#SBATCH --time={expected_score_time}" in score
+    # Sanity: the corrected walltime must be substantially larger than the
+    # old, wrong estimate -- guards against silently reverting the fix.
+    old_wrong_seconds = (313 + 133) * 1.6
+    new_seconds = SCORE_LOADED_MINUTES_HIGH * 60 * SCORE_WALLTIME_SAFETY_FACTOR
+    assert new_seconds > old_wrong_seconds * 2
+
+
+def test_array_throttle_default_is_lowered_for_bandwidth_bound_workload():
+    """The default array throttle must reflect that this workload is
+    memory-bandwidth-bound (packing many tasks per node does not scale
+    throughput), not the old core-bound-assuming default of 50."""
+    assert ARRAY_THROTTLE_DEFAULT < 50
+
+
+def test_score_array_documents_bandwidth_bound_node_packing_tradeoff(package):
+    _, package_dir = package
+    score = (package_dir / "run_score_null_calibration_array.sh").read_text()
+    assert "memory-bandwidth" in score
+    assert "--exclusive" in score
+    assert "--ntasks-per-node" in score
+    assert "NodeList" in score
+
+
+def test_pilot_and_instructions_flag_different_hardware(package):
+    _, package_dir = package
+    score = (package_dir / "run_score_null_calibration_array.sh").read_text()
+    assert "DIFFERENT HARDWARE" in score
+    assert "Apple Silicon" in score
+
+    instructions = (package_dir / "INSTRUCTIONS.txt").read_text()
+    assert "DIFFERENT" in instructions
+    assert "Apple Silicon" in instructions
+    assert "NodeList" in instructions
 
 
 def test_score_array_reuses_is_valid_npz_not_reimplemented(package):

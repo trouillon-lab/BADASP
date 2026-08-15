@@ -49,14 +49,52 @@ Sized from the measured, task-provided per-invocation figures, not padding:
     measured, so the simulate job's walltime below is a flagged, generous
     starting estimate, not a tight measured bound.
   * score_null_replicate.py, one replicate: ASR 313 s at ~3.3 GB peak, then
-    scoring 133 s at under 1 GB. The two phases run sequentially within one
-    task, so a task's peak memory need is the larger of the two (~3.3 GB),
-    not their sum.
-Both remain ESTIMATES until run on Euler itself: a 2-task pilot of the
-scoring array is required before submitting the full array (see that
-script's own leading comment), checked with `seff <jobid>` or
-`sacct --format=MaxRSS,TotalCPU,Elapsed,ReqMem,ReqCPUS`, and the resource
-block re-derived from that pilot rather than trusted as final.
+    scoring 133 s at under 1 GB, measured STANDALONE (no other job
+    competing for the machine). That standalone figure does NOT survive
+    contact with load: this workload is memory-bandwidth-bound, not
+    core-bound. Measured: one IQ-TREE ASR process holds ~116% CPU whether
+    run alone or with a second ASR running; two concurrent ASRs each still
+    sat at ~116% CPU (~233% of the 1200% available on a 12-core machine)
+    with load average ~7/12 -- i.e. running more of them side by side does
+    not divide the work across the idle cores the way a CPU-bound job
+    would; it just makes each one wait longer for memory. Realistic
+    per-replicate wall-clock measured under that kind of contention:
+    40-46 minutes for ASR+scoring together, roughly 4x the naive
+    446 s x 1.6 estimate this script used previously. The two phases still
+    run sequentially within one task, so a task's peak memory need is the
+    larger of the two (~3.3 GB), not their sum -- memory footprint is not
+    expected to be as hardware-sensitive as wall-clock, which is why only
+    the walltime figure needed the large correction.
+  * Consequence for array sizing: because the bottleneck is shared memory
+    bandwidth rather than core count, packing many scoring tasks onto one
+    node will NOT deliver throughput proportional to how many are packed --
+    it will just make every task on that node slower and raise the risk of
+    a walltime kill (which wastes the whole task, not just the excess). See
+    the array-throttle discussion next to ARRAY_THROTTLE_DEFAULT below for
+    how this script responds to that (short version: a lower default
+    concurrency cap, not `--exclusive`, and not a guessed
+    `--ntasks-per-node`, since neither of the latter two is a value this
+    repo can derive without Euler's own node topology).
+  * Replicate count: a separate measurement established that positions are
+    statistically independent within a replicate
+    (Var_r(V_r)/sum_p Var_r(K_rp) = 1.013, mean pairwise correlation
+    +0.0021). That means the noisiest downstream quantity -- a
+    90th-percentile FDP estimated from only 40 replicates -- can be
+    tightened by block-bootstrapping positions rather than by buying more
+    replicates outright. More replicates still help (they improve
+    per-position tail estimation, currently ~20 null events per position),
+    but the array does not need to be enormous: a few hundred replicates,
+    not the low thousands, is the right order of magnitude to submit here.
+ALL of the above remain ESTIMATES until run on Euler itself, and they are
+an extrapolation from a different machine (an Apple Silicon laptop, NOT
+Euler's hardware): a 2-task pilot of the scoring array is REQUIRED before
+submitting the full array (see that script's own leading comment), checked
+with `seff <jobid>` or
+`sacct --format=MaxRSS,TotalCPU,Elapsed,ReqMem,ReqCPUS,NodeList`, and the
+resource block MUST be re-derived from that pilot's Euler-native numbers
+rather than trusted as final -- nothing in this module should be read as a
+claim that these numbers are correct for Euler, only that they are the best
+extrapolation available before that pilot runs.
 """
 
 from __future__ import annotations
@@ -77,6 +115,12 @@ DEFAULT_PROJECT_ROOT_REMOTE = "/cluster/project/beltrao/lucla/repos/badasp"
 # sbatch scripts traces back to one of these, rather than being retyped.
 SIMULATE_MEASURED_SECONDS = 197
 SIMULATE_MEASURED_MEM_GB = 4.5
+# Standalone (no contention) component breakdown -- retained only as
+# provenance for where the 446 s total comes from and to size memory (which
+# is not expected to be load-sensitive the way wall-clock is). NOT used to
+# size walltime below any more -- see SCORE_LOADED_MINUTES_HIGH, which
+# replaces the old "446 s x 1.6" estimate that this standalone figure led
+# to and which failed to survive contact with a loaded node.
 SCORE_ASR_MEASURED_SECONDS = 313
 SCORE_ASR_MEASURED_MEM_GB = 3.3
 SCORE_SCORING_MEASURED_SECONDS = 133
@@ -84,15 +128,61 @@ SCORE_SCORING_MEASURED_MEM_GB = 1.0  # "under 1 GB"
 SCORE_THREADS = 2  # matches the -T 2 the ASR measurement above was taken at,
                     # and score_null_replicate.py's own --threads default.
 
+# Per-replicate scoring wall-clock measured under REALISTIC contention (see
+# module docstring): this workload is memory-bandwidth-bound, so running it
+# alongside another instance of itself -- which is exactly what a scoring
+# array does -- slows each instance down far more than the standalone
+# component figures above predicted. 40-46 minutes was the measured range
+# for one replicate (ASR + scoring together) under that contention, on an
+# Apple Silicon laptop. The high end is used as the conservative base for
+# sizing, since a walltime kill wastes the entire task, not just the
+# overrun.
+SCORE_LOADED_MINUTES_LOW = 40
+SCORE_LOADED_MINUTES_HIGH = 46
+
 # Small, explicitly-flagged safety margins -- not "just in case" padding:
 # the simulate job's walltime margin is large because its scaling with
-# --num-alignments hasn't been measured (see docstring); the scoring
-# array's margins are modest because that phase's own peak has been
-# measured directly and only needs headroom for run-to-run variance.
+# --num-alignments hasn't been measured (see docstring). The scoring
+# array's margin is modest and serves a narrower purpose than it used to:
+# SCORE_LOADED_MINUTES_HIGH already reflects realistic contention (unlike
+# the superseded standalone-derived estimate), so this factor only needs to
+# cover ordinary run-to-run variance and the Apple-Silicon-to-Euler
+# hardware transfer -- both still unmeasured on Euler itself, hence why a
+# margin remains rather than using SCORE_LOADED_MINUTES_HIGH verbatim.
 SIMULATE_WALLTIME_SAFETY_FACTOR = 4.0
 SIMULATE_MEM_HEADROOM_GB = 0.5
-SCORE_WALLTIME_SAFETY_FACTOR = 1.6
+SCORE_WALLTIME_SAFETY_FACTOR = 1.3
 SCORE_MEM_HEADROOM_GB = 0.3
+
+# Default SLURM array throttle (the `%N` in `--array=0-K%N`), i.e. the max
+# number of scoring tasks allowed to run concurrently across the WHOLE
+# cluster allocation. Lowered from this script's previous default of 50:
+# with the corrected per-task walltime above (~5x the old ~12-minute
+# estimate) AND the task being memory-bandwidth- rather than core-bound,
+# high concurrency has less upside (no proportional throughput gain once
+# several tasks share a node's memory bus) and more downside (long-lived
+# tasks raise the odds that several land on, and jointly saturate, the same
+# node for an extended window). This value only bounds *cluster-wide*
+# concurrency, not *per-node* packing -- SLURM's own bin-packing still
+# decides which node each task lands on, and this script deliberately does
+# NOT try to control that more tightly:
+#   * `--exclusive` would guarantee no same-node contention, but reserves
+#     an entire node for a 2-thread task -- a large, unjustified resource
+#     request (the "never pad" rule cuts against this as the default).
+#   * A larger `--ntasks-per-node` isn't the right lever either: each array
+#     index here is an independent single-task job, and that flag governs
+#     task placement *within* one multi-task job, not cross-job packing
+#     across an array -- and picking a number would require Euler's node
+#     topology (cores per node, memory channels), which this repo has no
+#     way to measure without the pilot below.
+# So: rely on a lower cluster-wide cap here, and require the Euler pilot
+# (see run_score_null_calibration_array.sh's own leading comment) to check
+# `sacct ... NodeList` for same-node co-location before trusting this
+# default at scale -- escalate to `--exclusive` only if the pilot shows
+# harmful same-node stacking that a lower throttle doesn't fix. Like the
+# old default, this is a cluster-citizenship starting point, not a measured
+# optimum -- adjust to this project's actual Euler fair-share allocation.
+ARRAY_THROTTLE_DEFAULT = 10
 
 
 def _fmt_hms(total_seconds: float) -> str:
@@ -120,7 +210,7 @@ def package_null_calibration_for_euler(
     asr_model: Optional[str] = None,
     min_clade: int = 5,
     node_naming: str = "strict",
-    array_throttle: int = 50,
+    array_throttle: int = ARRAY_THROTTLE_DEFAULT,
     project_root_remote: str = DEFAULT_PROJECT_ROOT_REMOTE,
 ) -> Path:
     """Generate the Euler package (sbatch scripts + instructions + tarball).
@@ -209,9 +299,10 @@ def package_null_calibration_for_euler(
     simulate_script.chmod(0o755)
 
     # --- Scoring job (array, one task per replicate) -----------------------
-    score_walltime = _fmt_hms(
-        (SCORE_ASR_MEASURED_SECONDS + SCORE_SCORING_MEASURED_SECONDS) * SCORE_WALLTIME_SAFETY_FACTOR
-    )
+    # Walltime is sized from the LOADED (contention-realistic) measurement,
+    # not the standalone ASR+scoring sum -- see SCORE_LOADED_MINUTES_HIGH's
+    # own comment for why the standalone figure was wrong.
+    score_walltime = _fmt_hms(SCORE_LOADED_MINUTES_HIGH * 60 * SCORE_WALLTIME_SAFETY_FACTOR)
     score_mem_gb = SCORE_ASR_MEASURED_MEM_GB + SCORE_MEM_HEADROOM_GB
     score_mem_per_cpu_mb = round(score_mem_gb * 1024 / SCORE_THREADS)
     array_spec = f"0-{num_replicates - 1}%{array_throttle}"
@@ -226,20 +317,47 @@ def package_null_calibration_for_euler(
         f"#SBATCH --cpus-per-task={SCORE_THREADS}\n"
         f"#SBATCH --mem-per-cpu={score_mem_per_cpu_mb}M\n"
         "\n"
-        "# IMPORTANT: before submitting the full array above, submit a 2-task pilot\n"
-        "# first (e.g. `sbatch --array=0-1 run_score_null_calibration_array.sh`) and\n"
-        "# check its actual usage with `seff <jobid>` or\n"
-        "# `sacct --format=MaxRSS,TotalCPU,Elapsed,ReqMem,ReqCPUS -j <jobid>` before\n"
-        "# submitting the rest. Re-derive --time/--mem-per-cpu above from that pilot's\n"
-        "# real numbers -- the values here are sized from measurements taken outside\n"
-        "# Euler (see package_null_calibration_for_euler.py's module docstring) and\n"
-        "# should not be trusted as final for this cluster's hardware.\n"
+        "# IMPORTANT -- these numbers are an EXTRAPOLATION FROM DIFFERENT HARDWARE\n"
+        "# (an Apple Silicon laptop, NOT a Euler compute node) and MUST be re-derived\n"
+        "# on Euler itself before the full array above is trusted. Before submitting\n"
+        "# it, submit a 2-task pilot first (e.g. `sbatch --array=0-1\n"
+        "# run_score_null_calibration_array.sh`) and check its actual usage with\n"
+        "# `seff <jobid>` or\n"
+        "# `sacct --format=MaxRSS,TotalCPU,Elapsed,ReqMem,ReqCPUS,NodeList -j <jobid>`\n"
+        "# (NodeList lets you see whether the pilot's two tasks landed on the same\n"
+        "# node, which is the scenario the throttle below is trying to protect\n"
+        "# against). Re-derive --time/--mem-per-cpu above from that pilot's real,\n"
+        "# Euler-native numbers -- do not submit the full array on the values below\n"
+        "# alone; they are this script's best extrapolation, not a verified figure\n"
+        "# for this cluster's hardware (see package_null_calibration_for_euler.py's\n"
+        "# module docstring for the full reasoning and the laptop measurements this\n"
+        "# was extrapolated from).\n"
         "#\n"
         f"# Per-task sizing: {SCORE_THREADS} CPUs (matches score_null_replicate.py's own\n"
         f"# -T {SCORE_THREADS}); mem-per-cpu = ({SCORE_ASR_MEASURED_MEM_GB} GB measured ASR peak +\n"
         f"# {SCORE_MEM_HEADROOM_GB} GB headroom) / {SCORE_THREADS} CPUs. The ASR phase's peak, not the sum of\n"
         "# ASR + scoring, is used because the two phases run sequentially within one\n"
-        "# task (scoring runs after ASR has already released its memory).\n"
+        "# task (scoring runs after ASR has already released its memory). Walltime is\n"
+        f"# {SCORE_LOADED_MINUTES_HIGH} measured loaded minutes (see module docstring: this workload is\n"
+        "# memory-bandwidth-bound, so concurrent tasks slow each other down instead of\n"
+        f"# scaling with cores) x {SCORE_WALLTIME_SAFETY_FACTOR} for run-to-run variance and the hardware\n"
+        "# transfer above.\n"
+        "#\n"
+        "# Node-packing note: the array throttle below (the `%N` suffix) caps how many\n"
+        "# scoring tasks run concurrently CLUSTER-WIDE; it does not by itself stop\n"
+        "# several of them from landing on, and jointly saturating, the SAME node\n"
+        "# (SLURM's own bin-packing decides that, and this repo has no way to measure\n"
+        "# Euler's node topology to control it more precisely without the pilot\n"
+        "# above). Deliberately not using `--exclusive` here: it would guarantee no\n"
+        "# same-node contention but reserves an entire node for a 2-thread task,\n"
+        "# which is a large, unjustified resource request for the throughput gained.\n"
+        "# `--ntasks-per-node` is also not the right lever: each array index is an\n"
+        "# independent single-task job, and that flag governs placement within one\n"
+        "# multi-task job, not cross-job packing across an array. If the pilot's\n"
+        "# NodeList shows harmful same-node stacking, escalate by lowering the\n"
+        "# throttle further (or, as a last resort, switching to `--exclusive`) rather\n"
+        "# than assuming more parallelism will help -- it will not, for a\n"
+        "# bandwidth-bound workload like this one.\n"
         "\n"
         "module load stack/2025-06 gcc/12.2.0\n"
         "export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK\n"
@@ -340,10 +458,17 @@ def package_null_calibration_for_euler(
         "3. Extract this tarball's contents into the Euler project root and run:\n"
         "     bash submit_null_calibration.sh\n"
         "\n"
-        "4. IMPORTANT -- before trusting the full scoring array, submit a 2-task\n"
-        "   pilot first and check `seff <jobid>` / `sacct --format=MaxRSS,TotalCPU,\n"
-        "   Elapsed,ReqMem,ReqCPUS`; re-size --time/--mem-per-cpu in\n"
-        "   run_score_null_calibration_array.sh from that pilot's real numbers.\n"
+        "4. IMPORTANT -- the --time/--mem-per-cpu/array-throttle values shipped in\n"
+        "   run_score_null_calibration_array.sh are an EXTRAPOLATION FROM DIFFERENT\n"
+        "   HARDWARE (an Apple Silicon laptop, not a Euler compute node) and MUST be\n"
+        "   re-derived on Euler before trusting the full scoring array. Submit a\n"
+        "   2-task pilot first and check `seff <jobid>` / `sacct --format=MaxRSS,\n"
+        "   TotalCPU,Elapsed,ReqMem,ReqCPUS,NodeList` -- NodeList shows whether the\n"
+        "   pilot's two tasks landed on the same node, which is what the array\n"
+        "   throttle is trying to protect against for this memory-bandwidth-bound\n"
+        "   workload. Re-size --time/--mem-per-cpu/--array in\n"
+        "   run_score_null_calibration_array.sh from that pilot's real, Euler-native\n"
+        "   numbers before submitting the rest.\n"
         "\n"
         "5. Once the array completes, aggregate on Euler or after rsyncing "
         f"{remote_run_dir}/npz/ back:\n"
@@ -373,7 +498,14 @@ def main() -> None:
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--num-replicates", type=int, default=None,
-                        help="Default: config null_calibration.replicates.")
+                        help="Default: config null_calibration.replicates. Positions "
+                             "within a replicate were measured to be statistically "
+                             "independent (Var_r(V_r)/sum_p Var_r(K_rp) = 1.013), so "
+                             "the noisiest downstream quantity is better tightened by "
+                             "block-bootstrapping positions than by adding replicates -- "
+                             "a few hundred is the right order of magnitude to submit "
+                             "here, not the config default's low thousands; pass this "
+                             "flag explicitly to override it.")
     parser.add_argument("--seed", type=int, default=None,
                         help="Default: config null_calibration.seed.")
     parser.add_argument("--shrinkage", type=float, default=None,
@@ -382,11 +514,15 @@ def main() -> None:
                         help="Default: config null_calibration.asr_model.")
     parser.add_argument("--min-clade", type=int, default=5)
     parser.add_argument("--node-naming", choices=["legacy", "strict"], default="strict")
-    parser.add_argument("--array-throttle", type=int, default=50,
-                        help="Max concurrent array tasks (SLURM %% syntax). This "
-                             "is a cluster-citizenship/fair-share choice, not a "
-                             "measured value -- adjust to your project's Euler "
-                             "allocation.")
+    parser.add_argument("--array-throttle", type=int, default=ARRAY_THROTTLE_DEFAULT,
+                        help="Max concurrent array tasks cluster-wide (SLURM %% "
+                             "syntax). This workload is memory-bandwidth-bound, so "
+                             "high concurrency does not scale throughput and raises "
+                             "the odds of harmful same-node stacking -- see "
+                             "ARRAY_THROTTLE_DEFAULT's comment in this module for "
+                             "the full reasoning. Not a measured value -- adjust to "
+                             "your project's Euler allocation and to what the "
+                             "pilot's `sacct ... NodeList` shows.")
     parser.add_argument("--project-root-remote", default=DEFAULT_PROJECT_ROOT_REMOTE)
     args = parser.parse_args()
     package_null_calibration_for_euler(
