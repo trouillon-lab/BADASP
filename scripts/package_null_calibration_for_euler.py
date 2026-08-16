@@ -9,11 +9,15 @@ building a small package directory, then a tar.gz of it).
 
 Two jobs, matching how the work actually splits
 --------------------------------------------------
-* One (non-array) job runs simulate_null_persite.py once with
-  ``--num-alignments <num_replicates>``, producing every replicate's
-  simulated alignment in a single batched AliSim invocation (see that
-  script's own docstring on why batching amortizes its one-time setup cost;
-  this is the same reason run_null_calibration.py batches locally).
+* A SLURM array job, one task per CHUNK of alignments, runs
+  simulate_null_persite.py with ``--num-alignments <chunk size>`` and a
+  chunk-specific seed. Batching within a chunk amortizes the one-time
+  reference-frequency probe (see that script's own docstring), but a single
+  non-array job for the whole run is not viable on Euler: at ~897 s per
+  alignment, 300 alignments is ~75 h -- over the walltime limit, entirely
+  serial, and a single point of failure where one timeout loses everything.
+  Each chunk re-pays the ~5 s probe, which is a negligible price for the
+  parallelism and the smaller blast radius.
 * A SLURM array job, one task per replicate, runs score_null_replicate.py
   directly on that replicate's simulated alignment. This does NOT go
   through run_null_calibration.py's own batching/ThreadPoolExecutor
@@ -38,33 +42,37 @@ score_null_replicate.py reach Euler via `git pull` since they are tracked
 in git already. This script only generates the two sbatch scripts, a
 submission wrapper, and an instructions file.
 
-Resource sizing (see MEASURED_* constants below)
+Resource sizing (see the EULER_* constants below)
 ---------------------------------------------------
-Sized from the measured, task-provided per-invocation figures, not padding:
-  * simulate_null_persite.py, full scale: 197 s wall-clock, 4.5 GB peak RAM
-    for one invocation (the one-time 2M-site reference-frequency probe
-    dominates cost, which is why batching many replicates into one
-    --num-alignments call is cheap regardless of how many are requested).
-    Its dependence on --num-alignments count specifically has not been
-    measured, so the simulate job's walltime below is a flagged, generous
-    starting estimate, not a tight measured bound.
-  * score_null_replicate.py, one replicate: ASR 313 s at ~3.3 GB peak, then
-    scoring 133 s at under 1 GB, measured STANDALONE (no other job
-    competing for the machine). That standalone figure does NOT survive
-    contact with load: this workload is memory-bandwidth-bound, not
-    core-bound. Measured: one IQ-TREE ASR process holds ~116% CPU whether
-    run alone or with a second ASR running; two concurrent ASRs each still
-    sat at ~116% CPU (~233% of the 1200% available on a 12-core machine)
-    with load average ~7/12 -- i.e. running more of them side by side does
-    not divide the work across the idle cores the way a CPU-bound job
-    would; it just makes each one wait longer for memory. Realistic
-    per-replicate wall-clock measured under that kind of contention:
-    40-46 minutes for ASR+scoring together, roughly 4x the naive
-    446 s x 1.6 estimate this script used previously. The two phases still
-    run sequentially within one task, so a task's peak memory need is the
-    larger of the two (~3.3 GB), not their sum -- memory footprint is not
-    expected to be as hardware-sensitive as wall-clock, which is why only
-    the walltime figure needed the large correction.
+Every figure is now measured ON EULER. The laptop numbers this script used
+previously under-sized wall-clock by roughly 4x and are retained only as
+provenance constants:
+  * simulate_null_persite.py (job 10856979, COMPLETED): 4 alignments at 4
+    threads in 3587 s of AliSim => ~897 s per alignment; MaxRSS 5.64 GB.
+    The one-time reference-frequency probe is ~5 s. Memory scaling with
+    --num-alignments is still UNMEASURED (that MaxRSS is for 4 alignments
+    per invocation), which is a reason to keep chunks modest and to check
+    the first chunk's MaxRSS as it lands.
+  * score_null_replicate.py (job 10861338): ASR 8152.3 s + scoring 243.8 s
+    = 8396.1 s per replicate at 2 threads; MaxRSS 3.42 GB. That job exited
+    non-zero, but only at the post-scoring key check and only because it
+    was deliberately pointed at a quarantined alignment with the wrong
+    taxa; both compute stages ran to completion, so the timings and MaxRSS
+    are valid. The two phases run sequentially within one task, so peak
+    memory is the larger of the two, not their sum.
+  * The Euler/laptop ratio is 4.0x for scoring and 3.7x for simulation --
+    consistent, and an ordinary per-core speed difference rather than a
+    misconfiguration. An earlier note in this file described the scoring
+    slowdown as ~23x and "unexplained"; that came from comparing against a
+    313 s standalone ASR figure which the laptop does not reproduce (the
+    same work takes ~34 min there at concurrency 1). The 23x was an
+    artifact of the baseline, not a real effect.
+  * This workload is memory-bandwidth-bound, not core-bound: one IQ-TREE
+    ASR process holds ~116% CPU whether run alone or alongside a second
+    one, and two concurrent ASRs match one in throughput. That is why the
+    scoring array requests 2 CPUs and throttles concurrency rather than
+    packing tasks densely. AliSim, by contrast, does parallelise (~399%
+    CPU sustained), which is why the simulate job requests 4.
   * Consequence for array sizing: because the bottleneck is shared memory
     bandwidth rather than core count, packing many scoring tasks onto one
     node will NOT deliver throughput proportional to how many are packed --
@@ -85,16 +93,17 @@ Sized from the measured, task-provided per-invocation figures, not padding:
     per-position tail estimation, currently ~20 null events per position),
     but the array does not need to be enormous: a few hundred replicates,
     not the low thousands, is the right order of magnitude to submit here.
-ALL of the above remain ESTIMATES until run on Euler itself, and they are
-an extrapolation from a different machine (an Apple Silicon laptop, NOT
-Euler's hardware): a 2-task pilot of the scoring array is REQUIRED before
-submitting the full array (see that script's own leading comment), checked
-with `seff <jobid>` or
-`sacct --format=MaxRSS,TotalCPU,Elapsed,ReqMem,ReqCPUS,NodeList`, and the
-resource block MUST be re-derived from that pilot's Euler-native numbers
-rather than trusted as final -- nothing in this module should be read as a
-claim that these numbers are correct for Euler, only that they are the best
-extrapolation available before that pilot runs.
+Two things remain unverified and must be checked as the first tasks land
+rather than after the run completes:
+  * simulate memory at the configured chunk size (see above -- AliSim's
+    scaling with --num-alignments has not been measured);
+  * scoring behaviour when several tasks share one node's memory bus. The
+    per-replicate figure above is from a single task on a single node, so a
+    2-task pilot of the scoring array is still required, checked with
+    `seff <jobid>` or
+    `sacct --format=MaxRSS,TotalCPU,Elapsed,ReqMem,ReqCPUS,NodeList`.
+Neither of these is a claim about correctness of the shipped numbers; they
+are the two places where the shipped numbers could still be wrong.
 """
 
 from __future__ import annotations
@@ -113,46 +122,72 @@ DEFAULT_PROJECT_ROOT_REMOTE = "/cluster/project/beltrao/lucla/repos/badasp"
 # Measured, not guessed -- see the module docstring for where each figure
 # comes from. Kept as named constants so every number in the generated
 # sbatch scripts traces back to one of these, rather than being retyped.
-SIMULATE_MEASURED_SECONDS = 197
-SIMULATE_MEASURED_MEM_GB = 4.5
-# Standalone (no contention) component breakdown -- retained only as
-# provenance for where the 446 s total comes from and to size memory (which
-# is not expected to be load-sensitive the way wall-clock is). NOT used to
-# size walltime below any more -- see SCORE_LOADED_MINUTES_HIGH, which
-# replaces the old "446 s x 1.6" estimate that this standalone figure led
-# to and which failed to survive contact with a loaded node.
-SCORE_ASR_MEASURED_SECONDS = 313
-SCORE_ASR_MEASURED_MEM_GB = 3.3
-SCORE_SCORING_MEASURED_SECONDS = 133
-SCORE_SCORING_MEASURED_MEM_GB = 1.0  # "under 1 GB"
-SCORE_THREADS = 2  # matches the -T 2 the ASR measurement above was taken at,
+# --- Euler-native measurements ----------------------------------------
+# Every figure below was measured ON EULER, not extrapolated from the
+# laptop. The laptop numbers that used to size these scripts are retained
+# further down purely as provenance; they were wrong by ~4x and are no
+# longer used arithmetically.
+#
+# Simulation, job 10856979 (COMPLETED, 4 alignments at 4 threads):
+# AliSim 3587 s total => ~897 s per alignment; MaxRSS 5.64 GB. The
+# one-time reference-frequency probe at the start of each invocation is
+# ~5 s and is therefore re-paid per chunk without meaningful cost.
+SIMULATE_EULER_SECONDS_PER_ALIGNMENT = 897
+SIMULATE_EULER_PROBE_SECONDS = 5
+SIMULATE_EULER_MEM_GB = 5.64
+SIMULATE_THREADS = 4  # AliSim parallelises well (~399% CPU sustained). The
+                      # earlier pilot 10854059 TIMED OUT producing zero
+                      # alignments precisely because this was 1 while the
+                      # walltime came from a 4-thread measurement.
+
+# Scoring, job 10861338 (2 threads, Euler-native):
+# [asr] 8152.3 s + [score] 243.8 s = 8396.1 s per replicate; MaxRSS 3.42 GB.
+# That job FAILED, but only at the post-scoring key check, and only because
+# it was deliberately pointed at a quarantined alignment whose taxa were
+# wrong. Both stages ran to completion first, so the timings and MaxRSS are
+# valid measurements of the real work.
+SCORE_EULER_ASR_SECONDS = 8152.3
+SCORE_EULER_SCORING_SECONDS = 243.8
+SCORE_EULER_MEM_GB = 3.42
+SCORE_THREADS = 2  # matches the -T 2 the measurement above was taken at,
                     # and score_null_replicate.py's own --threads default.
 
-# Per-replicate scoring wall-clock measured under REALISTIC contention (see
-# module docstring): this workload is memory-bandwidth-bound, so running it
-# alongside another instance of itself -- which is exactly what a scoring
-# array does -- slows each instance down far more than the standalone
-# component figures above predicted. 40-46 minutes was the measured range
-# for one replicate (ASR + scoring together) under that contention, on an
-# Apple Silicon laptop. The high end is used as the conservative base for
-# sizing, since a walltime kill wastes the entire task, not just the
-# overrun.
-SCORE_LOADED_MINUTES_LOW = 40
-SCORE_LOADED_MINUTES_HIGH = 46
+# --- Superseded laptop measurements (provenance only) -----------------
+# Kept so the ~4x Euler/laptop ratio stays legible and so nobody
+# re-derives sizing from them by accident. NOT used in any arithmetic.
+# The 313 s standalone ASR figure in particular is not reproducible: the
+# same work takes ~34 min on the laptop at concurrency 1 (measured from
+# the batch2 replicate cadence), which is what makes Euler 4.0x slower
+# rather than the 23x that comparing against 313 s implied.
+SIMULATE_LAPTOP_MEASURED_SECONDS = 197
+SCORE_LAPTOP_ASR_STANDALONE_SECONDS = 313
+SCORE_LAPTOP_LOADED_MINUTES_HIGH = 46
 
-# Small, explicitly-flagged safety margins -- not "just in case" padding:
-# the simulate job's walltime margin is large because its scaling with
-# --num-alignments hasn't been measured (see docstring). The scoring
-# array's margin is modest and serves a narrower purpose than it used to:
-# SCORE_LOADED_MINUTES_HIGH already reflects realistic contention (unlike
-# the superseded standalone-derived estimate), so this factor only needs to
-# cover ordinary run-to-run variance and the Apple-Silicon-to-Euler
-# hardware transfer -- both still unmeasured on Euler itself, hence why a
-# margin remains rather than using SCORE_LOADED_MINUTES_HIGH verbatim.
-SIMULATE_WALLTIME_SAFETY_FACTOR = 4.0
-SIMULATE_MEM_HEADROOM_GB = 0.5
+# Small, explicitly-flagged safety margins -- not "just in case" padding.
+# Both walltime factors are modest now that the base figures are
+# Euler-native rather than cross-hardware extrapolations; they cover
+# ordinary run-to-run and node-to-node variance only. The simulate memory
+# headroom is the larger of the two because SIMULATE_EULER_MEM_GB was
+# measured at 4 alignments per invocation and AliSim's memory scaling with
+# --num-alignments has NOT been measured -- which is the main reason to
+# keep chunks modest rather than simulating everything in one task.
+SIMULATE_WALLTIME_SAFETY_FACTOR = 1.3
+SIMULATE_MEM_HEADROOM_GB = 1.0
 SCORE_WALLTIME_SAFETY_FACTOR = 1.3
-SCORE_MEM_HEADROOM_GB = 0.3
+SCORE_MEM_HEADROOM_GB = 0.6
+
+# Alignments produced per simulate array task. At ~897 s each this is
+# ~6.2 h per chunk, comfortably inside Euler's 24 h default partition
+# while keeping the blast radius of one timeout to 25 alignments rather
+# than the whole run. A single non-array simulate job for 300 alignments
+# would be ~75 h: over the limit, unparallelised, and a single point of
+# failure.
+SIMULATE_CHUNK_SIZE_DEFAULT = 25
+
+# Chunks must not share a random stream. Consecutive seeds would very
+# likely be fine, but a large prime stride costs nothing and removes the
+# question entirely.
+CHUNK_SEED_STRIDE = 100003
 
 # Default SLURM array throttle (the `%N` in `--array=0-K%N`), i.e. the max
 # number of scoring tasks allowed to run concurrently across the WHOLE
@@ -211,6 +246,7 @@ def package_null_calibration_for_euler(
     min_clade: int = 5,
     node_naming: str = "strict",
     array_throttle: int = ARRAY_THROTTLE_DEFAULT,
+    simulate_chunk_size: int = SIMULATE_CHUNK_SIZE_DEFAULT,
     project_root_remote: str = DEFAULT_PROJECT_ROOT_REMOTE,
 ) -> Path:
     """Generate the Euler package (sbatch scripts + instructions + tarball).
@@ -231,6 +267,8 @@ def package_null_calibration_for_euler(
         raise ValueError("array_throttle must be >= 1")
     if num_replicates < 1:
         raise ValueError("num_replicates must be >= 1")
+    if simulate_chunk_size < 1:
+        raise ValueError("simulate_chunk_size must be >= 1")
 
     width = _npz_width(num_replicates)
 
@@ -251,27 +289,46 @@ def package_null_calibration_for_euler(
     package_dir = root / "results" / "badasp_scoring" / "null_calibration" / "euler_package"
     package_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Simulate job (single job, not an array) --------------------------
-    simulate_walltime = _fmt_hms(SIMULATE_MEASURED_SECONDS * SIMULATE_WALLTIME_SAFETY_FACTOR)
-    simulate_mem_gb = SIMULATE_MEASURED_MEM_GB + SIMULATE_MEM_HEADROOM_GB
+    # --- Simulate job (array, one task per chunk of alignments) -----------
+    # Chunked rather than one long job for three reasons: 300 alignments in a
+    # single task is ~75 h (over Euler's limit), it wastes the parallelism
+    # AliSim cannot provide within one invocation, and a timeout would lose
+    # every alignment rather than one chunk's worth.
+    n_chunks = -(-num_replicates // simulate_chunk_size)  # ceil
+    simulate_walltime = _fmt_hms(
+        (SIMULATE_EULER_SECONDS_PER_ALIGNMENT * simulate_chunk_size
+         + SIMULATE_EULER_PROBE_SECONDS) * SIMULATE_WALLTIME_SAFETY_FACTOR
+    )
+    # SLURM rejects a decimal --mem-per-cpu ("5.0G"); it must be an integer
+    # plus a unit, so this is always emitted in whole MB.
+    simulate_mem_per_cpu_mb = round(
+        (SIMULATE_EULER_MEM_GB + SIMULATE_MEM_HEADROOM_GB) * 1024 / SIMULATE_THREADS
+    )
+    simulate_array_spec = f"0-{n_chunks - 1}%{array_throttle}"
     simulate_script = package_dir / "run_simulate_null_calibration.sh"
     simulate_script.write_text(
         "#!/bin/bash\n"
         "#SBATCH --job-name=null_calib_simulate\n"
-        f"#SBATCH --output={remote_logs_dir}/simulate_%j.out\n"
-        f"#SBATCH --error={remote_logs_dir}/simulate_%j.err\n"
+        f"#SBATCH --array={simulate_array_spec}\n"
+        f"#SBATCH --output={remote_logs_dir}/simulate_%A_%a.out\n"
+        f"#SBATCH --error={remote_logs_dir}/simulate_%A_%a.err\n"
         f"#SBATCH --time={simulate_walltime}\n"
-        "#SBATCH --cpus-per-task=1\n"
-        f"#SBATCH --mem-per-cpu={simulate_mem_gb:.1f}G\n"
+        f"#SBATCH --cpus-per-task={SIMULATE_THREADS}\n"
+        f"#SBATCH --mem-per-cpu={simulate_mem_per_cpu_mb}M\n"
         "\n"
-        "# One batched AliSim invocation producing every replicate's simulated\n"
-        f"# alignment ({num_replicates} of them). Sized from the measured full-scale\n"
-        f"# figures ({SIMULATE_MEASURED_SECONDS} s, {SIMULATE_MEASURED_MEM_GB} GB for one\n"
-        "# invocation; see package_null_calibration_for_euler.py's module docstring).\n"
-        "# The walltime carries a larger safety factor than the scoring array below\n"
-        "# because this invocation's scaling with --num-alignments has not itself been\n"
-        "# measured -- re-size after actually observing this job (seff/sacct), not\n"
-        "# from this default.\n"
+        f"# {n_chunks} array tasks x {simulate_chunk_size} alignments = "
+        f"{n_chunks * simulate_chunk_size} (>= {num_replicates} requested).\n"
+        f"# Sized from Euler job 10856979: {SIMULATE_EULER_SECONDS_PER_ALIGNMENT} s per\n"
+        f"# alignment at {SIMULATE_THREADS} threads, MaxRSS {SIMULATE_EULER_MEM_GB} GB.\n"
+        "#\n"
+        f"# --cpus-per-task is {SIMULATE_THREADS}, NOT 1: AliSim sustains ~399% CPU, and\n"
+        "# the walltime above is a 4-thread measurement. Pilot 10854059 requested 1 CPU\n"
+        "# against a 4-thread-derived walltime and TIMED OUT with zero alignments.\n"
+        "#\n"
+        "# CAVEAT: MaxRSS was measured at 4 alignments per invocation. AliSim's memory\n"
+        f"# scaling with --num-alignments is UNMEASURED, so a {simulate_chunk_size}-alignment\n"
+        "# chunk may need more. Check `sacct -j <id> --format=MaxRSS` on the first chunk\n"
+        "# to land and re-size before trusting the rest.\n"
         "\n"
         "module load stack/2025-06 gcc/12.2.0\n"
         "export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK\n"
@@ -279,31 +336,40 @@ def package_null_calibration_for_euler(
         f"PROJECT_ROOT={project_root_remote}\n"
         'export PYTHONPATH="$PROJECT_ROOT/src:$PROJECT_ROOT:$PYTHONPATH"\n'
         f"RUN_DIR={remote_run_dir}\n"
-        'mkdir -p "$RUN_DIR/sim" "' + remote_logs_dir + '"\n'
+        "CHUNK=$SLURM_ARRAY_TASK_ID\n"
+        # Each chunk writes into its own directory so the per-chunk AliSim
+        # outputs (always numbered sim_1..sim_N) cannot collide.
+        'CHUNK_DIR="$RUN_DIR/sim/chunk_${CHUNK}"\n'
+        'mkdir -p "$CHUNK_DIR" "' + remote_logs_dir + '"\n'
         "\n"
-        'echo "Starting null-calibration simulate job on $(hostname) at $(date)"\n'
+        # Distinct stream per chunk -- see CHUNK_SEED_STRIDE.
+        f"SEED=$(( {seed} + CHUNK * {CHUNK_SEED_STRIDE} ))\n"
+        "\n"
+        'echo "Starting simulate chunk $CHUNK (seed $SEED) on $(hostname) at $(date)"\n'
         "\n"
         '$PROJECT_ROOT/venv/bin/python "$PROJECT_ROOT/scripts/simulate_null_persite.py" \\\n'
         f'  --composition-alignment "{remote_alignment}" \\\n'
         f'  --sim-tree "{remote_sim_tree}" \\\n'
-        '  --out-prefix "$RUN_DIR/sim/sim" \\\n'
+        '  --out-prefix "$CHUNK_DIR/sim" \\\n'
         f"  --shrinkage {shrinkage} \\\n"
-        f"  --num-alignments {num_replicates} \\\n"
-        f"  --seed {seed} \\\n"
+        f"  --num-alignments {simulate_chunk_size} \\\n"
+        '  --seed $SEED \\\n'
         "  --threads $SLURM_CPUS_PER_TASK \\\n"
         "  --redo\n"
         "\n"
-        'echo "Simulate job finished at $(date)"\n',
+        'echo "Simulate chunk $CHUNK finished at $(date)"\n',
         encoding="utf-8",
     )
     simulate_script.chmod(0o755)
 
     # --- Scoring job (array, one task per replicate) -----------------------
-    # Walltime is sized from the LOADED (contention-realistic) measurement,
-    # not the standalone ASR+scoring sum -- see SCORE_LOADED_MINUTES_HIGH's
-    # own comment for why the standalone figure was wrong.
-    score_walltime = _fmt_hms(SCORE_LOADED_MINUTES_HIGH * 60 * SCORE_WALLTIME_SAFETY_FACTOR)
-    score_mem_gb = SCORE_ASR_MEASURED_MEM_GB + SCORE_MEM_HEADROOM_GB
+    # Walltime is sized from the Euler-native per-replicate measurement
+    # (job 10861338), superseding both the standalone laptop sum and the
+    # loaded-laptop figure that replaced it.
+    score_walltime = _fmt_hms(
+        (SCORE_EULER_ASR_SECONDS + SCORE_EULER_SCORING_SECONDS) * SCORE_WALLTIME_SAFETY_FACTOR
+    )
+    score_mem_gb = SCORE_EULER_MEM_GB + SCORE_MEM_HEADROOM_GB
     score_mem_per_cpu_mb = round(score_mem_gb * 1024 / SCORE_THREADS)
     array_spec = f"0-{num_replicates - 1}%{array_throttle}"
     score_script = package_dir / "run_score_null_calibration_array.sh"
@@ -317,31 +383,30 @@ def package_null_calibration_for_euler(
         f"#SBATCH --cpus-per-task={SCORE_THREADS}\n"
         f"#SBATCH --mem-per-cpu={score_mem_per_cpu_mb}M\n"
         "\n"
-        "# IMPORTANT -- these numbers are an EXTRAPOLATION FROM DIFFERENT HARDWARE\n"
-        "# (an Apple Silicon laptop, NOT a Euler compute node) and MUST be re-derived\n"
-        "# on Euler itself before the full array above is trusted. Before submitting\n"
-        "# it, submit a 2-task pilot first (e.g. `sbatch --array=0-1\n"
-        "# run_score_null_calibration_array.sh`) and check its actual usage with\n"
-        "# `seff <jobid>` or\n"
-        "# `sacct --format=MaxRSS,TotalCPU,Elapsed,ReqMem,ReqCPUS,NodeList -j <jobid>`\n"
-        "# (NodeList lets you see whether the pilot's two tasks landed on the same\n"
-        "# node, which is the scenario the throttle below is trying to protect\n"
-        "# against). Re-derive --time/--mem-per-cpu above from that pilot's real,\n"
-        "# Euler-native numbers -- do not submit the full array on the values below\n"
-        "# alone; they are this script's best extrapolation, not a verified figure\n"
-        "# for this cluster's hardware (see package_null_calibration_for_euler.py's\n"
-        "# module docstring for the full reasoning and the laptop measurements this\n"
-        "# was extrapolated from).\n"
+        "# These numbers are EULER-NATIVE, measured on a Euler compute node by job\n"
+        f"# 10861338: [asr] {SCORE_EULER_ASR_SECONDS} s + [score] {SCORE_EULER_SCORING_SECONDS} s\n"
+        f"# = {SCORE_EULER_ASR_SECONDS + SCORE_EULER_SCORING_SECONDS:.0f} s per replicate at "
+        f"{SCORE_THREADS} threads, MaxRSS {SCORE_EULER_MEM_GB} GB. They supersede the\n"
+        "# earlier laptop extrapolations, which under-estimated wall-clock by ~4x.\n"
+        "# For context, Euler is ~4.0x slower per replicate than the laptop at the same\n"
+        "# thread count -- the same ratio AliSim shows (3.7x), i.e. an ordinary\n"
+        "# per-core speed difference and not a misconfiguration.\n"
+        "#\n"
+        "# A 2-task pilot is still worth running before the full array, because these\n"
+        "# figures come from a SINGLE task on a SINGLE node and say nothing about what\n"
+        "# happens when several tasks share one node's memory bus -- and this is a\n"
+        "# memory-bandwidth-bound workload, so that is the contention that matters:\n"
+        "#   sbatch --array=0-1 run_score_null_calibration_array.sh\n"
+        "#   seff <jobid>\n"
+        "#   sacct --format=MaxRSS,TotalCPU,Elapsed,ReqMem,ReqCPUS,NodeList -j <jobid>\n"
+        "# (NodeList shows whether the two tasks co-located, which is the scenario the\n"
+        "# throttle below protects against; if they did and each ran much slower than\n"
+        f"# {SCORE_EULER_ASR_SECONDS + SCORE_EULER_SCORING_SECONDS:.0f} s, lower the throttle rather than raising the walltime.)\n"
         "#\n"
         f"# Per-task sizing: {SCORE_THREADS} CPUs (matches score_null_replicate.py's own\n"
-        f"# -T {SCORE_THREADS}); mem-per-cpu = ({SCORE_ASR_MEASURED_MEM_GB} GB measured ASR peak +\n"
-        f"# {SCORE_MEM_HEADROOM_GB} GB headroom) / {SCORE_THREADS} CPUs. The ASR phase's peak, not the sum of\n"
-        "# ASR + scoring, is used because the two phases run sequentially within one\n"
-        "# task (scoring runs after ASR has already released its memory). Walltime is\n"
-        f"# {SCORE_LOADED_MINUTES_HIGH} measured loaded minutes (see module docstring: this workload is\n"
-        "# memory-bandwidth-bound, so concurrent tasks slow each other down instead of\n"
-        f"# scaling with cores) x {SCORE_WALLTIME_SAFETY_FACTOR} for run-to-run variance and the hardware\n"
-        "# transfer above.\n"
+        f"# -T {SCORE_THREADS}); mem-per-cpu = ({SCORE_EULER_MEM_GB} GB measured peak +\n"
+        f"# {SCORE_MEM_HEADROOM_GB} GB headroom) / {SCORE_THREADS} CPUs. Walltime is the measured\n"
+        f"# per-replicate total x {SCORE_WALLTIME_SAFETY_FACTOR} for run-to-run and node-to-node variance.\n"
         "#\n"
         "# Node-packing note: the array throttle below (the `%N` suffix) caps how many\n"
         "# scoring tasks run concurrently CLUSTER-WIDE; it does not by itself stop\n"
@@ -368,7 +433,6 @@ def package_null_calibration_for_euler(
         'mkdir -p "$RUN_DIR/npz" "$RUN_DIR/scratch" "' + remote_logs_dir + '"\n'
         "\n"
         "IDX=$SLURM_ARRAY_TASK_ID\n"
-        "POS=$((IDX + 1))\n"
         f'REP_ID=$(printf "%0{width}d" "$IDX")\n'
         'NPZ="$RUN_DIR/npz/rep_${REP_ID}.npz"\n'
         "\n"
@@ -388,8 +452,19 @@ def package_null_calibration_for_euler(
         "  fi\n"
         "fi\n"
         "\n"
-        'SIM_FA="$RUN_DIR/sim/sim_${POS}.fa"\n'
+        # The simulate array writes chunk C's alignments to sim/chunk_C/ as
+        # sim_1..sim_<chunk_size>, so a global replicate index maps to a
+        # (chunk, position-within-chunk) pair.
+        f"CHUNK=$(( IDX / {simulate_chunk_size} ))\n"
+        f"CHUNK_POS=$(( IDX % {simulate_chunk_size} + 1 ))\n"
+        'SIM_FA="$RUN_DIR/sim/chunk_${CHUNK}/sim_${CHUNK_POS}.fa"\n'
         'WORK="$RUN_DIR/scratch/rep_${REP_ID}_work"\n'
+        "\n"
+        'if [ ! -f "$SIM_FA" ]; then\n'
+        '  echo "Missing simulated alignment $SIM_FA -- did simulate chunk $CHUNK '
+        'succeed? Check its log before resubmitting this index." >&2\n'
+        "  exit 1\n"
+        "fi\n"
         "\n"
         'echo "Starting replicate $IDX (alignment $SIM_FA) on $(hostname) at $(date)"\n'
         "\n"
@@ -426,11 +501,15 @@ def package_null_calibration_for_euler(
         "set -euo pipefail\n"
         "\n"
         "SIM_JOBID=$(sbatch --parsable run_simulate_null_calibration.sh)\n"
-        'echo "Submitted simulate job: $SIM_JOBID"\n'
+        f'echo "Submitted simulate array job: $SIM_JOBID ({n_chunks} chunks x '
+        f'{simulate_chunk_size} alignments)"\n'
         "\n"
+        # afterok on an array job id waits for EVERY task in the array to
+        # succeed, which is what we want: a scoring index whose chunk failed
+        # has no alignment to read.
         "SCORE_JOBID=$(sbatch --parsable --dependency=afterok:$SIM_JOBID run_score_null_calibration_array.sh)\n"
-        'echo "Submitted scoring array job: $SCORE_JOBID (depends on $SIM_JOBID)"\n'
-        'echo "Remember: run a 2-task pilot of the scoring array first (see its own leading comment) before trusting the full array at scale."\n',
+        'echo "Submitted scoring array job: $SCORE_JOBID (depends on all of $SIM_JOBID)"\n'
+        'echo "Remember: check the first simulate chunk\'s MaxRSS (its memory scaling with --num-alignments is unmeasured) and run a 2-task pilot of the scoring array before trusting either at scale."\n',
         encoding="utf-8",
     )
     submit_script.chmod(0o755)
@@ -458,17 +537,21 @@ def package_null_calibration_for_euler(
         "3. Extract this tarball's contents into the Euler project root and run:\n"
         "     bash submit_null_calibration.sh\n"
         "\n"
-        "4. IMPORTANT -- the --time/--mem-per-cpu/array-throttle values shipped in\n"
-        "   run_score_null_calibration_array.sh are an EXTRAPOLATION FROM DIFFERENT\n"
-        "   HARDWARE (an Apple Silicon laptop, not a Euler compute node) and MUST be\n"
-        "   re-derived on Euler before trusting the full scoring array. Submit a\n"
-        "   2-task pilot first and check `seff <jobid>` / `sacct --format=MaxRSS,\n"
-        "   TotalCPU,Elapsed,ReqMem,ReqCPUS,NodeList` -- NodeList shows whether the\n"
-        "   pilot's two tasks landed on the same node, which is what the array\n"
-        "   throttle is trying to protect against for this memory-bandwidth-bound\n"
-        "   workload. Re-size --time/--mem-per-cpu/--array in\n"
-        "   run_score_null_calibration_array.sh from that pilot's real, Euler-native\n"
-        "   numbers before submitting the rest.\n"
+        "4. Resource sizing. Both sbatch scripts now carry EULER-NATIVE numbers\n"
+        "   (simulate: job 10856979; score: job 10861338), not the earlier laptop\n"
+        "   extrapolations, which were wrong by ~4x. Two things are still unmeasured\n"
+        "   and should be checked as the first tasks land rather than after the run:\n"
+        f"     a. Simulate memory at {simulate_chunk_size} alignments per chunk. MaxRSS was measured\n"
+        "        at 4 alignments per invocation; AliSim's scaling with --num-alignments\n"
+        "        is unknown. Check the first chunk to finish:\n"
+        "          sacct -j <simjobid> --format=JobID%18,State,Elapsed,MaxRSS,ReqMem\n"
+        "     b. Scoring under same-node contention. The measurement is from a single\n"
+        "        task on a single node. Submit a 2-task pilot first and check\n"
+        "        `seff <jobid>` / `sacct --format=MaxRSS,TotalCPU,Elapsed,ReqMem,\n"
+        "        ReqCPUS,NodeList` -- NodeList shows whether the two tasks co-located,\n"
+        "        which is what the array throttle protects against for this\n"
+        "        memory-bandwidth-bound workload. If co-located tasks run much slower,\n"
+        "        lower the throttle rather than raising the walltime.\n"
         "\n"
         "5. Once the array completes, aggregate on Euler or after rsyncing "
         f"{remote_run_dir}/npz/ back:\n"
@@ -523,6 +606,11 @@ def main() -> None:
                              "the full reasoning. Not a measured value -- adjust to "
                              "your project's Euler allocation and to what the "
                              "pilot's `sacct ... NodeList` shows.")
+    parser.add_argument("--simulate-chunk-size", type=int, default=SIMULATE_CHUNK_SIZE_DEFAULT,
+                        help="Alignments produced per simulate array task. Trades "
+                             "per-chunk walltime (~897 s per alignment on Euler) "
+                             "against the number of alignments a single timeout "
+                             "would lose. See SIMULATE_CHUNK_SIZE_DEFAULT.")
     parser.add_argument("--project-root-remote", default=DEFAULT_PROJECT_ROOT_REMOTE)
     args = parser.parse_args()
     package_null_calibration_for_euler(
@@ -534,6 +622,7 @@ def main() -> None:
         min_clade=args.min_clade,
         node_naming=args.node_naming,
         array_throttle=args.array_throttle,
+        simulate_chunk_size=args.simulate_chunk_size,
         project_root_remote=args.project_root_remote,
     )
 
