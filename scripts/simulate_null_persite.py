@@ -93,6 +93,7 @@ has been met.
 from __future__ import annotations
 
 import argparse
+import re
 import shlex
 import subprocess
 import sys
@@ -333,6 +334,75 @@ def apply_gap_mask(sim_fasta_path: Path, mask_seqs: dict[str, str]) -> tuple[int
     return n_masked, n_skipped, n_gap_cells
 
 
+def read_newick_leaf_names(path: Path) -> list[str]:
+    """Return the leaf labels of a Newick tree, without a tree library.
+
+    A leaf label is a token appearing immediately after '(' or ',';
+    internal labels follow ')' and are therefore not matched. Square-bracket
+    comments are stripped first. Checked against ete3's own parser on
+    data/interim/iqtree_asr/IPR019888.treefile: both yield the same set of
+    21,218 names.
+    """
+    text = re.sub(r"\[[^\]]*\]", "", path.read_text())
+    return [m.group(1) for m in re.finditer(r"[(,]\s*([^(),:;\s]+)", text)]
+
+
+def check_taxon_sets(
+    composition_alignment: Path,
+    aln_names: set[str],
+    sim_tree: Path,
+    allow_mismatch: bool,
+) -> None:
+    """Fail loudly when the composition alignment and the simulation tree
+    describe different taxon sets.
+
+    This exists because the failure it catches is silent: a stale composition
+    alignment still produces per-column frequency vectors, AliSim still exits
+    0, and the SLURM job still reports COMPLETED -- but the frequencies were
+    computed over the wrong set of sequences and the gap mask cannot be
+    applied to the tips it failed to name-match. Euler job 10856979 ran to
+    completion exactly this way (21,641-sequence alignment against a
+    21,218-leaf tree) and its output had to be quarantined. An existence
+    check on the two paths does not catch it.
+    """
+    leaf_names = read_newick_leaf_names(sim_tree)
+    leaf_set = set(leaf_names)
+    if len(leaf_set) != len(leaf_names):
+        raise SystemExit(
+            f"Simulation tree {sim_tree} has {len(leaf_names)} leaf labels but only "
+            f"{len(leaf_set)} distinct ones; duplicate tip names make the gap mask "
+            f"ambiguous."
+        )
+
+    missing = leaf_set - aln_names          # tip that cannot be gap-masked at all
+    extra = aln_names - leaf_set            # sequence that skews the column frequencies
+
+    print(f"Taxon-set check: {len(leaf_set)} tree leaves vs {len(aln_names)} "
+          f"alignment sequences ({len(missing)} tree-only, {len(extra)} alignment-only)")
+    if not missing and not extra:
+        return
+
+    detail = (
+        f"Taxon-set mismatch between --composition-alignment {composition_alignment} "
+        f"({len(aln_names)} sequences) and --sim-tree {sim_tree} "
+        f"({len(leaf_set)} leaves): {len(missing)} tree leaves absent from the "
+        f"alignment, {len(extra)} alignment sequences absent from the tree.\n"
+        f"  example tree-only leaves: {sorted(missing)[:5]}\n"
+        f"  example alignment-only sequences: {sorted(extra)[:5]}"
+    )
+    if missing or not allow_mismatch:
+        # Tree-only leaves are always fatal: those tips get no gap mask.
+        # Alignment-only sequences are fatal by default because they bias
+        # every column's frequency vector, but --allow-taxon-mismatch permits
+        # them for deliberate pruned-subtree test runs.
+        raise SystemExit(
+            detail + "\nRefusing to simulate. Pass --allow-taxon-mismatch only for a "
+            "deliberate pruned-subset run in which the alignment is a superset of "
+            "the tree's tips."
+        )
+    print("WARNING: proceeding under --allow-taxon-mismatch.\n" + detail, file=sys.stderr)
+
+
 def main() -> None:
     # Pre-parse only --config, on a separate add_help=False parser, so that
     # --help exits early here (showing just --config) instead of on the real
@@ -394,6 +464,13 @@ def main() -> None:
         action="store_true",
         help="Skip gap masking; leave the simulated alignment fully ungapped "
              "(mutually exclusive with --gap-mask-source).",
+    )
+    parser.add_argument(
+        "--allow-taxon-mismatch",
+        action="store_true",
+        help="Permit --composition-alignment to contain sequences absent from "
+             "--sim-tree (intended only for deliberate pruned-subtree runs). "
+             "Tree leaves absent from the alignment remain fatal regardless.",
     )
     parser.add_argument(
         "--out-prefix",
@@ -521,6 +598,10 @@ def main() -> None:
     ncol = len(next(iter(seqs.values())))
     print(f"  {len(seqs)} sequences x {ncol} columns")
 
+    check_taxon_sets(
+        args.composition_alignment, set(seqs), args.sim_tree, args.allow_taxon_mismatch,
+    )
+
     counts = compute_column_counts(seqs)
 
     mc_seed = args.reference_mc_seed if args.reference_mc_seed is not None else args.seed
@@ -591,6 +672,17 @@ def main() -> None:
             n_masked, n_skipped, n_gap_cells = apply_gap_mask(f, mask_seqs)
             print(f"  {f.name}: masked {n_masked} sequences ({n_gap_cells} gap cells written), "
                   f"{n_skipped} sequences had no name/length match and were left ungapped")
+            if n_skipped:
+                # Backstop for check_taxon_sets(): that compares names, this also
+                # catches a length mismatch (right taxa, wrong number of columns).
+                # An ungapped tip is not a valid null draw -- it changes clade
+                # occupancy and therefore which nodes qualify for scoring.
+                raise SystemExit(
+                    f"{f.name}: {n_skipped} simulated sequences had no name/length "
+                    f"match in the gap-mask source {mask_source_path} and were left "
+                    f"ungapped. Refusing to emit an alignment whose gap pattern does "
+                    f"not match the real one."
+                )
 
     total_bytes = sum(f.stat().st_size for f in out_files)
     print(f"Output files ({len(out_files)}):")
