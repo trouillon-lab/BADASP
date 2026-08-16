@@ -247,6 +247,7 @@ def package_null_calibration_for_euler(
     node_naming: str = "strict",
     array_throttle: int = ARRAY_THROTTLE_DEFAULT,
     simulate_chunk_size: int = SIMULATE_CHUNK_SIZE_DEFAULT,
+    run_subdir: str = "run",
     project_root_remote: str = DEFAULT_PROJECT_ROOT_REMOTE,
 ) -> Path:
     """Generate the Euler package (sbatch scripts + instructions + tarball).
@@ -283,10 +284,15 @@ def package_null_calibration_for_euler(
     )
     remote_asr_tree = f"{project_root_remote}/data/interim/iqtree_asr/IPR019888_rooted.tree"
     remote_observed_scores = f"{project_root_remote}/results/badasp_scoring/raw_node_scores.csv"
-    remote_run_dir = f"{project_root_remote}/results/badasp_scoring/null_calibration/run"
+    remote_run_dir = f"{project_root_remote}/results/badasp_scoring/null_calibration/{run_subdir}"
     remote_logs_dir = f"{project_root_remote}/results/badasp_scoring/null_calibration/logs"
 
-    package_dir = root / "results" / "badasp_scoring" / "null_calibration" / "euler_package"
+    # A non-default run_subdir (e.g. a pilot) gets its own package directory
+    # and job names so it can coexist with the real run rather than
+    # overwriting its scripts or being indistinguishable in squeue.
+    suffix = "" if run_subdir == "run" else f"_{run_subdir}"
+    package_dir = (root / "results" / "badasp_scoring" / "null_calibration"
+                   / f"euler_package{suffix}")
     package_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Simulate job (array, one task per chunk of alignments) -----------
@@ -308,7 +314,7 @@ def package_null_calibration_for_euler(
     simulate_script = package_dir / "run_simulate_null_calibration.sh"
     simulate_script.write_text(
         "#!/bin/bash\n"
-        "#SBATCH --job-name=null_calib_simulate\n"
+        f"#SBATCH --job-name=null_calib_simulate{suffix}\n"
         f"#SBATCH --array={simulate_array_spec}\n"
         f"#SBATCH --output={remote_logs_dir}/simulate_%A_%a.out\n"
         f"#SBATCH --error={remote_logs_dir}/simulate_%A_%a.err\n"
@@ -375,7 +381,7 @@ def package_null_calibration_for_euler(
     score_script = package_dir / "run_score_null_calibration_array.sh"
     score_script.write_text(
         "#!/bin/bash\n"
-        "#SBATCH --job-name=null_calib_score\n"
+        f"#SBATCH --job-name=null_calib_score{suffix}\n"
         f"#SBATCH --array={array_spec}\n"
         f"#SBATCH --output={remote_logs_dir}/score_%A_%a.out\n"
         f"#SBATCH --error={remote_logs_dir}/score_%A_%a.err\n"
@@ -560,7 +566,8 @@ def package_null_calibration_for_euler(
         encoding="utf-8",
     )
 
-    tar_path = root / "results" / "badasp_scoring" / "null_calibration" / "null_calibration_euler_bundle.tar.gz"
+    tar_path = (root / "results" / "badasp_scoring" / "null_calibration"
+                / f"null_calibration_euler_bundle{suffix}.tar.gz")
     with tarfile.open(tar_path, "w:gz") as tar:
         for f in (simulate_script, score_script, submit_script, instructions_path):
             tar.add(f, arcname=f"null_calibration_euler/{f.name}")
@@ -611,6 +618,11 @@ def main() -> None:
                              "per-chunk walltime (~897 s per alignment on Euler) "
                              "against the number of alignments a single timeout "
                              "would lose. See SIMULATE_CHUNK_SIZE_DEFAULT.")
+    parser.add_argument("--run-subdir", default="run",
+                        help="Directory under results/badasp_scoring/null_calibration/ "
+                             "that the jobs read alignments from and write .npz to. "
+                             "Use a distinct name for a pilot so it cannot be "
+                             "confused with, or skipped as already-done by, the real run.")
     parser.add_argument("--project-root-remote", default=DEFAULT_PROJECT_ROOT_REMOTE)
     args = parser.parse_args()
     package_null_calibration_for_euler(
@@ -623,6 +635,7 @@ def main() -> None:
         node_naming=args.node_naming,
         array_throttle=args.array_throttle,
         simulate_chunk_size=args.simulate_chunk_size,
+        run_subdir=args.run_subdir,
         project_root_remote=args.project_root_remote,
     )
 
