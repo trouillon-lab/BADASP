@@ -440,8 +440,23 @@ def test_empirical_tail_fit_pooled_matches_exact_rank_at_grid_points():
     pooled = np.concatenate([null_left.ravel(), null_right.ravel()])
     pooled.sort()
     n_pooled = pooled.shape[0]
-    # Exact survival at a few actual pooled values.
+    # Exact survival at a few actual pooled values. The inequality is
+    # non-strict: this survival is used as a resampling p-value.
     for v in [pooled[10], pooled[n_pooled // 2], pooled[-5]]:
-        n_leq = np.searchsorted(pooled, v, side="right")
-        expected = (n_pooled - n_leq + 1.0) / (n_pooled + 1.0)
+        n_lt = np.searchsorted(pooled, v, side="left")
+        expected = (n_pooled - n_lt + 1.0) / (n_pooled + 1.0)
         assert tail.survival(v) == pytest.approx(expected, rel=1e-9)
+
+
+def test_empirical_tail_handles_an_atom_at_the_upper_bound():
+    """The BADASP score is bounded above at 2.0 and has a real atom there
+    (RC = 1 with p_AC = 1 at AC = -1). A strict `>` survival would call
+    every draw at the bound far more extreme than the null says it is."""
+    pooled = np.concatenate([np.linspace(0.0, 1.9, 900), np.full(100, 2.0)])
+    tail = fit_pooled_tail(pooled.reshape(1, -1), np.empty((1, 0)), n_grid=100000)
+    n = pooled.size
+    # 100 of 1000 draws sit at 2.0, so P(S >= 2.0) ~ 0.1, not ~1/(n+1).
+    assert tail.survival(2.0) == pytest.approx((100 + 1.0) / (n + 1.0), rel=1e-9)
+    assert tail.survival(2.0) > 0.09
+    # Survival stays monotone across the atom.
+    assert tail.survival(1.95) > tail.survival(2.0)

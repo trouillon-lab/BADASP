@@ -12,7 +12,7 @@ docstring notes in the caller; not re-derived here).
 
 This module fits a proportional-tails model instead of a single global rate:
 
-    P(S > s | x) = A(x) * G(s)      for s >= u0
+    P(S >= s | x) = A(x) * G(s)     for s >= u0
 
 `G` is the pooled empirical null tail (pooled across ~21.7M null branch
 draws, so its shape is treated as known essentially exactly). `A(x)` is a
@@ -32,7 +32,7 @@ UNCHANGED and UNMODIFIED. This module never touches `null_model.py`; it only
 transforms branch-level scores into a branch-level `z` before those two
 functions ever see the data:
 
-    z_branch = -log10(pi_branch),  pi_branch = P(S_null > s_branch | x_branch)
+    z_branch = -log10(pi_branch),  pi_branch = P(S_null >= s_branch | x_branch)
     z_split  = null_model._split_statistic(z_left, z_right)  # fmax, verbatim
 
 Because `z_branch` is a strictly monotone *decreasing* transform of
@@ -101,13 +101,17 @@ def default_alignment_path(config_path: Path = DEFAULT_CONFIG_PATH) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Pooled empirical null tail G(s) = P(S_null > s)
+# Pooled empirical null tail G(s) = P(S_null >= s)
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class EmpiricalTail:
-    """Pooled empirical survival function of the null, `G(s) = P(S_null > s)`.
+    """Pooled empirical survival function of the null, `G(s) = P(S_null >= s)`.
+
+    The inequality is NON-strict because this is used as a resampling
+    p-value; see `fit_pooled_tail._exact_survival` for why that matters at
+    the atom on this statistic's upper bound.
 
     Represented as a set of (score, survival) anchor points with `survival`
     computed by the add-one rule `(n_exceeding + 1) / (n_pooled + 1)` (the
@@ -149,7 +153,7 @@ class EmpiricalTail:
             raise ValueError("survival_grid must be strictly decreasing.")
 
     def survival(self, s) -> np.ndarray:
-        """`P(S_null > s)`, log-linearly interpolated between grid anchors.
+        """`P(S_null >= s)`, log-linearly interpolated between grid anchors.
 
         Queries below/above the grid's range are held flat at the nearest
         anchor's survival (equivalent to `numpy.interp`'s default flat
@@ -218,9 +222,19 @@ def fit_pooled_tail(null_left: np.ndarray, null_right: np.ndarray, n_grid: int =
     n = pooled.size
 
     def _exact_survival(values: np.ndarray) -> np.ndarray:
-        # count of pooled draws strictly greater than `values`, add-one corrected.
-        n_leq = np.searchsorted(pooled, values, side="right")
-        return (n - n_leq + 1.0) / (n + 1.0)
+        # Count of pooled draws >= `values`, add-one corrected. The
+        # inequality is NON-strict on purpose: this survival is used as a
+        # resampling p-value, whose standard form is
+        # (#{null >= observed} + 1) / (n + 1). A strict `>` is equivalent
+        # for continuous data but catastrophically wrong at an atom, and
+        # this statistic has one at its upper bound 2.0 (reached when
+        # RC = 1 and p_AC = 1 at AC = -1): 7.49e-5 of pooled null branch
+        # draws sit exactly there. Under `>` they would be assigned
+        # survival 4.6e-8 -- a 1,600x overstatement of how extreme they
+        # are -- which pushes the whole ceiling region to implausibly high
+        # z and inverts the observed/null comparison there.
+        n_lt = np.searchsorted(pooled, values, side="left")
+        return (n - n_lt + 1.0) / (n + 1.0)
 
     unique_vals = np.unique(pooled)
     if unique_vals.shape[0] <= n_grid:
