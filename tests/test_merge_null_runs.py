@@ -6,6 +6,7 @@ different observed tables misaligns every test without any error.
 """
 
 import json
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -15,12 +16,18 @@ from scripts import merge_null_runs as mnr
 from scripts.score_null_replicate import SCORE_COLUMNS
 
 
+def _stable_seed(name: str) -> int:
+    """Deterministic across processes, unlike hash(), which numpy would
+    otherwise turn into different fixture data on every run."""
+    return zlib.crc32(name.encode()) % 2**32
+
+
 def _make_run(root: Path, name: str, n_reps: int, n_tests: int,
               seed=1, shrinkage=0.15, observed="results/obs.csv") -> Path:
     run_dir = root / name
     npz_dir = run_dir / "npz"
     npz_dir.mkdir(parents=True)
-    rng = np.random.default_rng(abs(hash(name)) % 2**32)
+    rng = np.random.default_rng(_stable_seed(name))
     for i in range(n_reps):
         np.savez(
             npz_dir / f"rep_{i:04d}.npz",
@@ -139,14 +146,14 @@ def _make_run_with_tail(root: Path, name: str, n_reps: int, n_tests: int, scale:
     run_dir = root / name
     npz_dir = run_dir / "npz"
     npz_dir.mkdir(parents=True)
-    rng = np.random.default_rng(abs(hash(name)) % 2**32)
+    rng = np.random.default_rng(_stable_seed(name))
     for i in range(n_reps):
         arrays = {c: rng.normal(size=n_tests).astype(np.float32) for c in SCORE_COLUMNS}
         arrays["badasp_score_left"] = rng.exponential(scale, size=n_tests).astype(np.float32)
         arrays["badasp_score_right"] = rng.exponential(scale, size=n_tests).astype(np.float32)
         np.savez(npz_dir / f"rep_{i:04d}.npz", **arrays)
     (run_dir / "run_manifest.json").write_text(json.dumps({
-        "seed": abs(hash(name)) % 1000,
+        "seed": _stable_seed(name) % 1000,
         "shrinkage": 0.15,
         "inputs": {"observed_scores": {"path": "results/obs.csv"}},
     }))
