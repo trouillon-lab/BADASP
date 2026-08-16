@@ -113,6 +113,16 @@ DEFAULT_CONFIG = REPO_ROOT / "config" / "snakemake.yaml"
 AA_ORDER = list("ARNDCQEGHILKMFPSTWYV")
 GAP_CHARS = set("-.")
 
+# AliSim writes each alignment as it finishes, but the gap mask can only be
+# applied afterwards. A job killed in between (Euler 10868280 hit its
+# walltime exactly here) would otherwise leave fully UNGAPPED alignments
+# under the final names, which the scoring array would happily consume --
+# and an ungapped alignment changes clade occupancy, so it silently changes
+# which nodes qualify for scoring. Simulating under a staging prefix and
+# renaming only after masking makes a partial run leave nothing that
+# matches the name the scorer looks for.
+STAGING_SUFFIX = ".ungapped"
+
 
 def load_config(config_path: Path) -> dict:
     with open(config_path) as fh:
@@ -281,7 +291,8 @@ def build_alisim_command(args: argparse.Namespace, mdef_path: Path, part_path: P
     # equivalent to "copy the gap pattern" without the fitting side effect.
     cmd = [
         args.iqtree_bin,
-        "--alisim", str(args.out_prefix),
+        # Staging prefix, not the final one: see STAGING_SUFFIX.
+        "--alisim", str(args.out_prefix) + STAGING_SUFFIX,
         "-t", str(args.sim_tree),
         "--mdef", str(mdef_path),
         "-q", str(part_path),
@@ -660,8 +671,9 @@ def main() -> None:
               f"See log: {log_path}", file=sys.stderr)
         sys.exit(result.returncode)
 
-    out_files = sorted(args.out_prefix.parent.glob(args.out_prefix.name + "*.fa")) + \
-        sorted(args.out_prefix.parent.glob(args.out_prefix.name + "*.fasta"))
+    staging_name = args.out_prefix.name + STAGING_SUFFIX
+    out_files = sorted(args.out_prefix.parent.glob(staging_name + "*.fa")) + \
+        sorted(args.out_prefix.parent.glob(staging_name + "*.fasta"))
     print(f"AliSim completed in {elapsed:.2f}s ({elapsed / 60:.2f} min).")
 
     if not args.no_gap_mask:
@@ -684,9 +696,19 @@ def main() -> None:
                     f"not match the real one."
                 )
 
-    total_bytes = sum(f.stat().st_size for f in out_files)
-    print(f"Output files ({len(out_files)}):")
+    # Promote out of staging only now: everything above has succeeded, so a
+    # file under the final name is always a fully masked one. os.replace is
+    # atomic within a filesystem, so there is no window in which a partly
+    # written file carries the final name either.
+    final_files = []
     for f in out_files:
+        final = f.with_name(f.name.replace(STAGING_SUFFIX, "", 1))
+        f.replace(final)
+        final_files.append(final)
+
+    total_bytes = sum(f.stat().st_size for f in final_files)
+    print(f"Output files ({len(final_files)}):")
+    for f in final_files:
         print(f"  {f}  ({f.stat().st_size / 1e6:.2f} MB)")
     print(f"Total output size: {total_bytes / 1e6:.2f} MB")
 

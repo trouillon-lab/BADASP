@@ -128,11 +128,21 @@ DEFAULT_PROJECT_ROOT_REMOTE = "/cluster/project/beltrao/lucla/repos/badasp"
 # further down purely as provenance; they were wrong by ~4x and are no
 # longer used arithmetically.
 #
-# Simulation, job 10856979 (COMPLETED, 4 alignments at 4 threads):
-# AliSim 3587 s total => ~897 s per alignment; MaxRSS 5.64 GB. The
-# one-time reference-frequency probe at the start of each invocation is
-# ~5 s and is therefore re-paid per chunk without meaningful cost.
-SIMULATE_EULER_SECONDS_PER_ALIGNMENT = 897
+# Simulation. Two Euler measurements, and they disagree:
+#   * job 10856979 (COMPLETED, 4 alignments at 4 threads): AliSim 3587 s
+#     total => ~897 s per alignment; MaxRSS 5.64 GB.
+#   * job 10868280 (TIMEOUT at 39 min, 2 alignments at 4 threads, node
+#     eu-a2p-411): AliSim setup + the FIRST alignment alone took ~1350 s
+#     (job start 10:02:45, sim_1 written 10:25); the second was still
+#     running when the walltime killed it. MaxRSS 5.62 GB.
+# The 897 s average is therefore not safe to size from -- it either
+# amortised AliSim's one-time model/tree setup over 4 alignments or ran on
+# a faster node. Until a clean per-alignment cadence is measured (read the
+# sim_*.fa mtimes of the first chunk to complete), size from the 1350 s
+# figure and apply it to EVERY alignment in a chunk. That deliberately
+# over-counts setup once per alignment, and is the conservative direction:
+# a walltime kill wastes the whole chunk.
+SIMULATE_EULER_SECONDS_PER_ALIGNMENT = 1350
 SIMULATE_EULER_PROBE_SECONDS = 5
 SIMULATE_EULER_MEM_GB = 5.64
 SIMULATE_THREADS = 4  # AliSim parallelises well (~399% CPU sustained). The
@@ -176,13 +186,13 @@ SIMULATE_MEM_HEADROOM_GB = 1.0
 SCORE_WALLTIME_SAFETY_FACTOR = 1.3
 SCORE_MEM_HEADROOM_GB = 0.6
 
-# Alignments produced per simulate array task. At ~897 s each this is
-# ~6.2 h per chunk, comfortably inside Euler's 24 h default partition
-# while keeping the blast radius of one timeout to 25 alignments rather
-# than the whole run. A single non-array simulate job for 300 alignments
-# would be ~75 h: over the limit, unparallelised, and a single point of
-# failure.
-SIMULATE_CHUNK_SIZE_DEFAULT = 25
+# Alignments produced per simulate array task. At the conservative 1350 s
+# each this is ~4.9 h per chunk including the safety factor -- well inside
+# Euler's limits, more chunks running in parallel, and a timeout costs 10
+# alignments rather than the whole run. Lowered from 25 after job 10868280
+# showed the per-alignment cost was ~1.5x what the 4-alignment average
+# implied: with an uncertain rate, smaller chunks are the cheaper mistake.
+SIMULATE_CHUNK_SIZE_DEFAULT = 10
 
 # Chunks must not share a random stream. Consecutive seeds would very
 # likely be fine, but a large prime stride costs nothing and removes the

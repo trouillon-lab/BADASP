@@ -77,3 +77,20 @@ def test_gap_mask_skip_is_fatal(tmp_path, n_skipped):
     mask.update({f"S{i}": "AA" for i in range(1, n_skipped + 1)})
     n_masked, skipped, _ = snp.apply_gap_mask(sim, mask)
     assert (n_masked, skipped) == (1, n_skipped)
+
+
+def test_staging_suffix_keeps_partial_runs_from_looking_finished(tmp_path):
+    """A simulate job killed between AliSim and gap masking must not leave
+    anything under the name the scoring array globs for. Euler job 10868280
+    hit its walltime in exactly that window and left a fully ungapped
+    alignment behind."""
+    out_prefix = tmp_path / "sim"
+    # What AliSim writes mid-run, before masking has happened.
+    partial = tmp_path / f"sim{snp.STAGING_SUFFIX}_1.fa"
+    partial.write_text(">S0\nAAAA\n")
+    assert not list(tmp_path.glob(out_prefix.name + "_*.fa")), (
+        "a killed run must leave no file matching the final name pattern"
+    )
+    # And the promotion step maps staging -> final exactly once.
+    final = partial.with_name(partial.name.replace(snp.STAGING_SUFFIX, "", 1))
+    assert final.name == "sim_1.fa"
