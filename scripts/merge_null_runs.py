@@ -166,7 +166,15 @@ def main(argv=None) -> int:
                         help="Two or more run directories (or npz directories) "
                              "to merge, in the order their replicates should be "
                              "numbered.")
-    parser.add_argument("--out-dir", type=Path, required=True,
+    parser.add_argument("--check-only", action="store_true",
+                        help="Report the tail-comparability check and exit "
+                             "without writing anything. Use this to ask "
+                             "whether two replicate sets behave like the same "
+                             "null before committing to a merge.")
+    parser.add_argument("--report-json", type=Path, default=None,
+                        help="Write the comparability report to this path "
+                             "(works with --check-only).")
+    parser.add_argument("--out-dir", type=Path, default=None,
                         help="Destination run directory; replicates are written "
                              "to <out-dir>/npz/.")
     parser.add_argument("--copy", action="store_true",
@@ -191,6 +199,8 @@ def main(argv=None) -> int:
 
     if len(args.run_dir) < 2:
         parser.error("--run-dir needs at least two directories to merge.")
+    if args.out_dir is None and not args.check_only:
+        parser.error("--out-dir is required unless --check-only is given.")
 
     sources = []
     for run_dir in args.run_dir:
@@ -263,6 +273,14 @@ def main(argv=None) -> int:
     else:
         print(f"  ratio of run means: {tails['mean_ratio']}x"
               + ("  RANGES DO NOT OVERLAP" if tails["ranges_disjoint"] else ""))
+    if args.report_json is not None:
+        args.report_json.parent.mkdir(parents=True, exist_ok=True)
+        args.report_json.write_text(json.dumps(tails, indent=2) + "\n")
+        print(f"Wrote {args.report_json}")
+    if args.check_only:
+        # Exit status carries the verdict so a shell gate can branch on it:
+        # 0 comparable, 1 not comparable, 2 undetermined.
+        return {True: 0, False: 1, None: 2}[tails["comparable"]]
     if tails["comparable"] is False:
         message = (
             f"the runs' null tails differ by {tails['mean_ratio']}x"

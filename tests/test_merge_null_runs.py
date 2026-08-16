@@ -194,3 +194,33 @@ def test_tail_check_reports_undetermined_rather_than_guessing(tmp_path):
     tails = json.loads((out / "run_manifest.json").read_text())["tail_comparability"]
     assert tails["comparable"] is None
     assert "too few" in tails["undetermined_reason"]
+
+
+def test_check_only_reports_without_writing(tmp_path):
+    a = _make_run_with_tail(tmp_path, "chk_a", 6, 4000, scale=1.0)
+    b = _make_run_with_tail(tmp_path, "chk_b", 6, 4000, scale=1.0)
+    report = tmp_path / "report.json"
+    assert mnr.main([
+        "--run-dir", str(a), str(b), "--check-only", "--report-json", str(report),
+    ]) == 0
+    assert report.exists()
+    assert json.loads(report.read_text())["comparable"] is True
+
+
+def test_check_only_exit_code_carries_the_verdict(tmp_path):
+    """A shell gate branches on this, so the codes are part of the contract:
+    0 comparable, 1 not comparable, 2 undetermined."""
+    cold = _make_run_with_tail(tmp_path, "v_cold", 6, 4000, scale=1.0)
+    hot = _make_run_with_tail(tmp_path, "v_hot", 6, 4000, scale=2.0)
+    assert mnr.main(["--run-dir", str(cold), str(hot), "--check-only"]) == 1
+
+    tiny_a = _make_run(tmp_path, "v_tiny_a", 2, 50, seed=1)
+    tiny_b = _make_run(tmp_path, "v_tiny_b", 2, 50, seed=2)
+    assert mnr.main(["--run-dir", str(tiny_a), str(tiny_b), "--check-only"]) == 2
+
+
+def test_out_dir_required_unless_check_only(tmp_path):
+    a = _make_run(tmp_path, "req_a", 2, 50, seed=1)
+    b = _make_run(tmp_path, "req_b", 2, 50, seed=2)
+    with pytest.raises(SystemExit):
+        mnr.main(["--run-dir", str(a), str(b)])
