@@ -75,6 +75,7 @@ def test_package_creates_expected_files(package):
         "run_simulate_null_calibration.sh",
         "run_score_null_calibration_array.sh",
         "submit_null_calibration.sh",
+        "verify_euler_inputs.sh",
         "INSTRUCTIONS.txt",
     ):
         assert (package_dir / name).exists(), f"{name} missing"
@@ -98,6 +99,7 @@ def test_tarball_bundles_only_generated_scripts_not_data(package):
         "run_simulate_null_calibration.sh",
         "run_score_null_calibration_array.sh",
         "submit_null_calibration.sh",
+        "verify_euler_inputs.sh",
         "INSTRUCTIONS.txt",
     ])
 
@@ -352,3 +354,67 @@ def test_fmt_hms():
     assert _fmt_hms(0) == "00:00:00"
     assert _fmt_hms(65) == "00:01:05"
     assert _fmt_hms(3661) == "01:01:01"
+
+
+def test_samples_newick_is_in_the_rsync_list(package):
+    """The AleRax samples file is easy to miss because no script names it on
+    the command line -- score_tree_nodes derives it from --reconciled-tree's
+    directory. A stale copy raises no error: it just relabels nodes, and any
+    node not labelled Speciation/Duplication/Transfer is dropped from
+    scoring. On Euler that silently cut scored node pairs from 1,607 to 946."""
+    _, package_dir = package
+    instructions = (package_dir / "INSTRUCTIONS.txt").read_text()
+    assert "reconciliations/all/IPR019888_samples.newick" in instructions
+
+
+def test_input_verification_script_covers_every_input(package):
+    _, package_dir = package
+    script = package_dir / "verify_euler_inputs.sh"
+    assert script.exists()
+    content = script.read_text()
+    for required in (
+        "data/interim/IPR019888_trimmed.aln",
+        "data/interim/iqtree_asr/IPR019888.treefile",
+        "data/interim/iqtree_asr/IPR019888_rooted.tree",
+        "reconciliations/IPR019888.nwk",
+        "reconciliations/all/IPR019888_samples.newick",
+        "results/badasp_scoring/raw_node_scores.csv",
+    ):
+        assert required in content, f"{required} not checksummed"
+    # Must work on both machines: md5sum on Linux, md5 on macOS.
+    assert "md5sum" in content and "md5 -q" in content
+    assert _bash_syntax_ok(script)
+
+
+def test_input_verification_script_reports_real_checksums(package, tmp_path):
+    """Guards the regression where the script cd'd somewhere without the data
+    and reported every input MISSING."""
+    _, package_dir = package
+    root = tmp_path / "fakeroot"
+    (root / "data" / "interim").mkdir(parents=True)
+    target = root / "data" / "interim" / "IPR019888_trimmed.aln"
+    target.write_text(">a\nMKV\n")
+    result = subprocess.run(
+        ["bash", str(package_dir / "verify_euler_inputs.sh"), str(root)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0
+    line = next(l for l in result.stdout.splitlines() if "IPR019888_trimmed.aln" in l)
+    assert "MISSING" not in line, line
+    assert str(target.stat().st_size) in line
+
+
+def test_input_verification_script_rejects_a_bad_root(package):
+    _, package_dir = package
+    result = subprocess.run(
+        ["bash", str(package_dir / "verify_euler_inputs.sh"), "/definitely/not/here"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 2
+    assert "No such project root" in result.stderr
+
+
+def test_verification_script_is_bundled(package):
+    tar_path, _ = package
+    with tarfile.open(tar_path, "r:gz") as tar:
+        assert any(Path(n).name == "verify_euler_inputs.sh" for n in tar.getnames())

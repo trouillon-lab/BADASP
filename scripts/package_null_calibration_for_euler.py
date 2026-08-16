@@ -530,6 +530,53 @@ def package_null_calibration_for_euler(
     )
     submit_script.chmod(0o755)
 
+    # --- Input checksum script -------------------------------------------
+    # Every input the scoring array reads, in one place, so drift between the
+    # laptop and Euler is a 5-second check rather than a 1.2-hour failure.
+    verify_script = package_dir / "verify_euler_inputs.sh"
+    remote_samples = (
+        f"{project_root_remote}/results/reconciliation/alerax/IPR019888/"
+        "reconciliations/all/IPR019888_samples.newick"
+    )
+    verify_script.write_text(
+        "#!/bin/bash\n"
+        "# Print md5 + size for every input the null-calibration jobs read.\n"
+        "# Run on BOTH machines and diff the output. An input that differs\n"
+        "# silently changes results rather than raising an error -- the\n"
+        "# AleRax samples file in particular decides which nodes are scored\n"
+        "# at all, and a stale copy cut the scored node pairs to 59% without\n"
+        "# any error until the post-ASR key check.\n"
+        "#\n"
+        "# Usage: verify_euler_inputs.sh [project root]\n"
+        f"# Defaults to {project_root_remote} (Euler); pass your local repo\n"
+        "# root when running it on the laptop. md5sum and md5 are both handled.\n"
+        "set -u\n"
+        f'ROOT="${{1:-{project_root_remote}}}"\n'
+        'if [ ! -d "$ROOT" ]; then\n'
+        '  echo "No such project root: $ROOT" >&2\n'
+        '  echo "Usage: $0 [project root]" >&2\n'
+        "  exit 2\n"
+        "fi\n"
+        'cd "$ROOT" || exit 2\n'
+        'echo "# project root: $ROOT"\n'
+        "for f in \\\n"
+        f"  {paths.get('trimmed_fasta', 'data/interim/IPR019888_trimmed.aln')} \\\n"
+        f"  {nc.get('sim_tree', 'data/interim/iqtree_asr/IPR019888.treefile')} \\\n"
+        "  data/interim/iqtree_asr/IPR019888_rooted.tree \\\n"
+        "  results/reconciliation/alerax/IPR019888/reconciliations/IPR019888.nwk \\\n"
+        "  results/reconciliation/alerax/IPR019888/reconciliations/all/IPR019888_samples.newick \\\n"
+        "  results/badasp_scoring/raw_node_scores.csv \\\n"
+        "; do\n"
+        '  if [ -f "$f" ]; then\n'
+        '    printf "%-78s %s %s\\n" "$f" "$( (md5sum "$f" 2>/dev/null || md5 -q "$f") | cut -c1-32 )" "$(wc -c <"$f" | tr -d " ")"\n'
+        "  else\n"
+        '    printf "%-78s %s\\n" "$f" "MISSING"\n'
+        "  fi\n"
+        "done\n",
+        encoding="utf-8",
+    )
+    verify_script.chmod(0o755)
+
     instructions_path = package_dir / "INSTRUCTIONS.txt"
     instructions_path.write_text(
         "Null-calibration Euler package\n"
@@ -547,13 +594,29 @@ def package_null_calibration_for_euler(
         f"lucla@euler.ethz.ch:{project_root_remote}/\n"
         "     rsync -avz --relative results/reconciliation/alerax/IPR019888/reconciliations/IPR019888.nwk "
         f"lucla@euler.ethz.ch:{project_root_remote}/\n"
+        # This one is easy to miss because no script names it on the command
+        # line -- score_tree_nodes derives it from --reconciled-tree's own
+        # directory. Omitting it does NOT cause an error: a stale copy just
+        # relabels nodes, and every node whose label is not Speciation/
+        # Duplication/Transfer is silently dropped from scoring
+        # (src/badasp/scoring.py:412). On Euler a stale copy cut the scored
+        # node pairs from 1,607 to 946 (59%), which only surfaced ~1.2 h
+        # later at the post-ASR key check.
+        "     rsync -avz --relative results/reconciliation/alerax/IPR019888/reconciliations/all/IPR019888_samples.newick "
+        f"lucla@euler.ethz.ch:{project_root_remote}/\n"
         "     rsync -avz --relative results/badasp_scoring/raw_node_scores.csv "
         f"lucla@euler.ethz.ch:{project_root_remote}/\n"
         "\n"
-        "3. Extract this tarball's contents into the Euler project root and run:\n"
+        "3. Confirm both machines see identical inputs BEFORE submitting:\n"
+        "     bash verify_euler_inputs.sh          # on Euler\n"
+        "     bash verify_euler_inputs.sh          # and locally, then diff\n"
+        "   A differing input does not raise an error -- it silently changes\n"
+        "   which nodes are scored. Do not skip this.\n"
+        "\n"
+        "4. Extract this tarball's contents into the Euler project root and run:\n"
         "     bash submit_null_calibration.sh\n"
         "\n"
-        "4. Resource sizing. Both sbatch scripts now carry EULER-NATIVE numbers\n"
+        "5. Resource sizing. Both sbatch scripts now carry EULER-NATIVE numbers\n"
         "   (simulate: job 10856979; score: job 10861338), not the earlier laptop\n"
         "   extrapolations, which were wrong by ~4x. Two things are still unmeasured\n"
         "   and should be checked as the first tasks land rather than after the run:\n"
@@ -569,7 +632,7 @@ def package_null_calibration_for_euler(
         "        memory-bandwidth-bound workload. If co-located tasks run much slower,\n"
         "        lower the throttle rather than raising the walltime.\n"
         "\n"
-        "5. Once the array completes, aggregate on Euler or after rsyncing "
+        "6. Once the array completes, aggregate on Euler or after rsyncing "
         f"{remote_run_dir}/npz/ back:\n"
         "     python scripts/calibrate_switch_threshold.py --null-run-dir <run dir> "
         "--observed-scores <observed CSV>\n",
@@ -579,12 +642,13 @@ def package_null_calibration_for_euler(
     tar_path = (root / "results" / "badasp_scoring" / "null_calibration"
                 / f"null_calibration_euler_bundle{suffix}.tar.gz")
     with tarfile.open(tar_path, "w:gz") as tar:
-        for f in (simulate_script, score_script, submit_script, instructions_path):
+        for f in (simulate_script, score_script, submit_script, verify_script, instructions_path):
             tar.add(f, arcname=f"null_calibration_euler/{f.name}")
 
     print(f"Wrote {simulate_script}")
     print(f"Wrote {score_script}")
     print(f"Wrote {submit_script}")
+    print(f"Wrote {verify_script}")
     print(f"Wrote {instructions_path}")
     print(f"Created tarball {tar_path} ({tar_path.stat().st_size / 1024:.1f} KB)")
     return tar_path
