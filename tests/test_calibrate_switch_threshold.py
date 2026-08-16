@@ -167,9 +167,13 @@ def test_main_end_to_end_with_planted_signal(tmp_path):
     assert thresholds["inputs"]["observed_scores"]["exists"] is True
     assert len(thresholds["fwer_per_position_threshold"]) > 0
 
-    per_test = pd.read_csv(out_dir / "per_test_pvalues.csv")
+    per_test = pd.read_csv(out_dir / "per_test_calls.csv")
     assert len(per_test) == 600
-    assert {"p_value", "q_value", "split_statistic"}.issubset(per_test.columns)
+    assert {"p_value", "q_value", "split_statistic", "called"}.issubset(per_test.columns)
+    # Conditioning is the default, so each test carries its own raw-score bar.
+    assert {"z_left", "z_right", "position_group",
+            "threshold_raw_left", "threshold_raw_right"}.issubset(per_test.columns)
+    assert per_test["called"].sum() == thresholds["O_t"]
     # 1/(1+R) floor, R=30 -- tiny tolerance for to_csv's default float precision
     assert (per_test["p_value"] >= 1.0 / 31 - 1e-9).all()
 
@@ -195,7 +199,7 @@ def test_main_end_to_end_with_planted_signal(tmp_path):
 
     h2h = diagnostics["head_to_head_vs_percentile_rule"]
     assert "confusion_matrix" in h2h
-    assert h2h["calibrated_rule"]["threshold"] == thresholds["t"]
+    assert h2h["calibrated_rule"]["threshold_z"] == thresholds["t"]
 
     assert (out_dir / "plots" / "threshold_sweep.png").exists()
     assert (out_dir / "plots" / "exceedance_flatness.png").exists()
@@ -278,3 +282,90 @@ def test_site_rate_diagnostic_included_when_file_given(tmp_path):
     assert diagnostics["exceedance_flatness"]["site_rate_diagnostic"] == "computed"
     flat = pd.read_csv(out_dir / "exceedance_flatness.csv")
     assert "site_rate_quartile" in set(flat["covariate"].unique())
+
+
+# ---------------------------------------------------------------------------
+# Cell conditioning
+# ---------------------------------------------------------------------------
+
+
+def test_conditioning_none_reproduces_the_global_rule(tmp_path):
+    """--conditioning none must leave the primary threshold on the raw score
+    scale and identical to the reported baseline."""
+    obs_path, run_dir = _build_fixture(tmp_path, n=600, R=30, plant=True)
+    out_dir = tmp_path / "calib_none"
+    assert cst.main([
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--out-dir", str(out_dir), "--target-fdr", "0.2", "--fdp-quantile", "0.8",
+        "--conditioning", "none",
+    ]) == 0
+    thresholds = json.loads((out_dir / "thresholds.json").read_text())
+    assert thresholds["conditioning"]["mode"] == "none"
+    assert thresholds["t"] == thresholds["global_rule_baseline"]["t"]
+    assert thresholds["O_t"] == thresholds["global_rule_baseline"]["O_t"]
+    per_test = pd.read_csv(out_dir / "per_test_calls.csv")
+    assert "z_left" not in per_test.columns
+
+
+def test_conditioning_reports_the_global_rule_as_a_baseline(tmp_path):
+    """The comparison must always be available, so a conditioned run still
+    reports what the single global threshold would have given."""
+    obs_path, run_dir = _build_fixture(tmp_path, n=600, R=30, plant=True)
+    out_dir = tmp_path / "calib_cell"
+    assert cst.main([
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--out-dir", str(out_dir), "--target-fdr", "0.2", "--fdp-quantile", "0.8",
+    ]) == 0
+    thresholds = json.loads((out_dir / "thresholds.json").read_text())
+    assert thresholds["conditioning"]["mode"] == "cell"
+    baseline = thresholds["global_rule_baseline"]
+    assert baseline["criterion_met"] is True
+    # The conditioned threshold is on the z scale, the baseline on the raw
+    # score scale; they must not be conflated.
+    assert thresholds["t"] != baseline["t"]
+    assert "z scale" in thresholds["conditioning"]["units"]
+
+
+def test_conditioned_cross_validation_holds_out_replicates(tmp_path):
+    obs_path, run_dir = _build_fixture(tmp_path, n=600, R=30, plant=True)
+    out_dir = tmp_path / "calib_cv"
+    assert cst.main([
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--out-dir", str(out_dir), "--target-fdr", "0.2", "--fdp-quantile", "0.8",
+        "--cv-folds", "3",
+    ]) == 0
+    cv = json.loads((out_dir / "diagnostics.json").read_text())["conditioned_cross_validation"]
+    assert "skipped" not in cv
+    assert cv["n_folds"] == 3
+    assert len(cv["per_fold"]) == 3
+    for fold in cv["per_fold"]:
+        if fold.get("criterion_met"):
+            # Every replicate is used exactly once as held-out.
+            assert fold["n_in_fold"] + fold["n_held_out"] == 30
+
+
+def test_conditioned_cv_skips_when_replicates_are_too_few(tmp_path):
+    obs_path, run_dir = _build_fixture(tmp_path, n=600, R=4, plant=True)
+    out_dir = tmp_path / "calib_cv_few"
+    cst.main([
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--out-dir", str(out_dir), "--target-fdr", "0.2", "--fdp-quantile", "0.8",
+        "--cv-folds", "4",
+    ])
+    cv = json.loads((out_dir / "diagnostics.json").read_text())["conditioned_cross_validation"]
+    assert "skipped" in cv
+
+
+def test_legacy_bin_dict_is_emitted_and_flagged_lossy(tmp_path):
+    """Downstream consumers still need the {(event, bin): t} shape, but it
+    cannot express the position component and must say so."""
+    obs_path, run_dir = _build_fixture(tmp_path, n=600, R=30, plant=True)
+    out_dir = tmp_path / "calib_bins"
+    assert cst.main([
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--out-dir", str(out_dir), "--target-fdr", "0.2", "--fdp-quantile", "0.8",
+    ]) == 0
+    bins = json.loads((out_dir / "legacy_bin_thresholds.json").read_text())
+    assert bins["lossy_projection"] is True
+    assert bins["source_of_truth"] == "per_test_calls.csv"
+    assert len(bins["per_bin_threshold"]) > 1

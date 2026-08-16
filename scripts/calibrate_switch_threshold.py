@@ -48,7 +48,7 @@ import sys
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -82,6 +82,16 @@ from src.badasp.null_model import (  # noqa: E402
 # False, so a split with one real and one NaN branch is still tested on its
 # real branch, and a split with both NaN never contributes to any count.
 from src.badasp.null_model import _split_statistic  # noqa: E402
+from src.badasp.robust_conditioning import (  # noqa: E402
+    ANCHOR_ALPHA_DEFAULT,
+    N_CLADE_BINS_DEFAULT,
+    N_HOT_DEFAULT,
+    CellConditionalModel,
+    fit_cell_model,
+    t_from_z,
+    to_z,
+)
+from src.badasp.tail_model import EmpiricalTail, fit_pooled_tail  # noqa: E402
 
 from scripts.plot_decoupled_event_switches_clade_adjusted import (  # noqa: E402
     bin_clade_sizes,
@@ -284,6 +294,219 @@ def self_calibration_diagnostic(
     }
 
 
+# ---------------------------------------------------------------------------
+# Cell-conditional thresholds
+# ---------------------------------------------------------------------------
+
+
+def fit_conditioning(
+    null_left: np.ndarray,
+    null_right: np.ndarray,
+    keys: pd.DataFrame,
+    n_hot: int,
+    n_clade_bins: int,
+    anchor_alpha: float,
+    replicates: Optional[np.ndarray] = None,
+) -> Tuple[EmpiricalTail, CellConditionalModel]:
+    """Fit the pooled tail and the cell multipliers on null replicates only.
+
+    `replicates` restricts the fit to a subset (used by the CV diagnostic);
+    both the tail AND the cell model must be re-fit per fold, since the
+    choice of which positions are "hot" is itself estimated from the null.
+    """
+    sub = slice(None) if replicates is None else np.asarray(replicates)
+    nl, nr = null_left[sub], null_right[sub]
+    tail = fit_pooled_tail(nl, nr)
+    model = fit_cell_model(
+        nl, nr,
+        keys["position"].to_numpy(),
+        keys["clade_size_left"].to_numpy(float),
+        keys["clade_size_right"].to_numpy(float),
+        tail,
+        n_hot=n_hot,
+        n_clade_bins=n_clade_bins,
+        anchor_alpha=anchor_alpha,
+    )
+    return tail, model
+
+
+def apply_conditioning(
+    values_left: np.ndarray,
+    values_right: np.ndarray,
+    keys: pd.DataFrame,
+    tail: EmpiricalTail,
+    model: CellConditionalModel,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Branch-level scores -> branch-level z. Works for 1-D observed arrays
+    and 2-D (R, n_tests) null arrays alike."""
+    position = keys["position"].to_numpy()
+    return (
+        to_z(values_left, position, keys["clade_size_left"].to_numpy(float), model, tail),
+        to_z(values_right, position, keys["clade_size_right"].to_numpy(float), model, tail),
+    )
+
+
+def conditioned_cv_diagnostic(
+    obs_left: np.ndarray,
+    obs_right: np.ndarray,
+    null_left: np.ndarray,
+    null_right: np.ndarray,
+    keys: pd.DataFrame,
+    q: float,
+    fdp_quantile: float,
+    n_hot: int,
+    n_clade_bins: int,
+    anchor_alpha: float,
+    n_folds: int,
+) -> dict:
+    """Rotating replicate-level cross-validation of the conditioned rule.
+
+    Folds are at the REPLICATE level because that is the unit of dependence
+    -- every split at one position in one replicate shares a simulated
+    column and one ASR reconstruction.
+
+    Per fold, the tail, the cell model AND the threshold are all derived
+    from the in-fold replicates alone, and the held-out replicates are used
+    only to evaluate. Selecting the threshold on all replicates and only
+    then holding some out (which `self_calibration_diagnostic` does) is
+    tolerable for a one-parameter global rule but not for a model that
+    estimates which positions are hot.
+
+    `fdp_hat` here is the held-out expected false-discovery proportion, so
+    it should come in at or below `q`; it is NOT the null-on-null
+    `self_calibration_diagnostic` statistic, which targets 1.
+    """
+    R = null_left.shape[0]
+    if R < 2 * n_folds:
+        return {"skipped": f"{R} replicates is too few for {n_folds}-fold "
+                            f"replicate-level CV (need >= {2 * n_folds})."}
+
+    position = keys["position"].to_numpy()
+    unique_positions = np.unique(position)
+    position_index = np.searchsorted(unique_positions, position)
+
+    folds = np.array_split(np.arange(R), n_folds)
+    per_fold = []
+    for k, held in enumerate(folds):
+        in_fold = np.setdiff1d(np.arange(R), held)
+        tail, model = fit_conditioning(
+            null_left, null_right, keys, n_hot, n_clade_bins, anchor_alpha, in_fold
+        )
+        z_obs_l, z_obs_r = apply_conditioning(obs_left, obs_right, keys, tail, model)
+        z_in_l, z_in_r = apply_conditioning(
+            null_left[in_fold], null_right[in_fold], keys, tail, model
+        )
+        res = threshold_at_fdr(z_obs_l, z_obs_r, z_in_l, z_in_r, q=q, fdp_quantile=fdp_quantile)
+        if not res.criterion_met:
+            per_fold.append({"fold": k, "criterion_met": False})
+            continue
+
+        z_out_l, z_out_r = apply_conditioning(
+            null_left[held], null_right[held], keys, tail, model
+        )
+        held_stat = _split_statistic(z_out_l, z_out_r)
+        exceed = held_stat >= res.t
+        V = exceed.sum(axis=1)
+        O_t = int(np.sum(_split_statistic(z_obs_l, z_obs_r) >= res.t))
+        per_position = np.bincount(
+            position_index, weights=exceed.sum(axis=0), minlength=len(unique_positions)
+        )
+        total = per_position.sum()
+        per_fold.append({
+            "fold": k,
+            "criterion_met": True,
+            "n_in_fold": int(len(in_fold)),
+            "n_held_out": int(len(held)),
+            "t": round(float(res.t), 4),
+            "O_t": O_t,
+            "heldout_E_fp": round(float(V.mean()), 2),
+            "heldout_fdp_hat": round(float(V.mean() / max(O_t, 1)), 4),
+            "heldout_top10_position_share": round(
+                float(np.sort(per_position)[::-1][:10].sum() / max(total, 1)), 4
+            ),
+        })
+
+    ok = [f for f in per_fold if f.get("criterion_met")]
+    summary = {
+        "n_folds": n_folds,
+        "target_q": q,
+        "per_fold": per_fold,
+        "n_folds_criterion_met": len(ok),
+    }
+    if ok:
+        summary["mean_heldout_fdp_hat"] = round(
+            float(np.mean([f["heldout_fdp_hat"] for f in ok])), 4
+        )
+        summary["mean_heldout_top10_position_share"] = round(
+            float(np.mean([f["heldout_top10_position_share"] for f in ok])), 4
+        )
+    summary["interpretation"] = (
+        "heldout_fdp_hat is the realised false-discovery proportion on "
+        "replicates excluded from BOTH the fit and the threshold choice; it "
+        "should be <= target_q. heldout_top10_position_share is the share of "
+        "held-out null exceedances falling in the 10 noisiest positions "
+        "(5.9% would be flat)."
+    )
+    return summary
+
+
+def conditioned_bin_threshold_dict(
+    keys: pd.DataFrame,
+    z_threshold: float,
+    tail: EmpiricalTail,
+    model: CellConditionalModel,
+    event_types: Sequence[str],
+    num_bins: int,
+) -> Tuple[Dict, dict]:
+    """Project the conditioned rule onto the legacy
+    ``{(event_type, clade_bin): raw threshold}`` dict.
+
+    This is LOSSY and is provided only so the four downstream analysis
+    scripts keep running unmodified: the real rule also varies by position,
+    which this dict cannot express. `per_test_calls.csv` is the source of
+    truth. The projection reports, for each clade-size bin, the raw-score
+    threshold a position in the COLD group would have to clear -- the cold
+    group because it holds the large majority of positions, so this is the
+    threshold most tests in that bin actually face. Tests at hot positions
+    face a strictly higher bar than this dict shows, which makes the
+    projection ANTI-conservative for exactly those columns.
+    """
+    sizes = pd.Series(np.concatenate([
+        keys["clade_size_left"].to_numpy(float), keys["clade_size_right"].to_numpy(float)
+    ])).dropna()
+    # Same construction the downstream consumers use
+    # (calculate_bin_thresholds_999: qcut over the melted per-branch sizes).
+    bin_labels = pd.qcut(sizes, q=num_bins, duplicates="drop")
+    categories = bin_labels.cat.categories
+
+    cold_positions = np.setdiff1d(np.unique(keys["position"].to_numpy()), model.hot_positions)
+    if cold_positions.size == 0:  # degenerate: every position was called hot
+        cold_positions = np.unique(keys["position"].to_numpy())
+    representative_position = np.full(len(categories), cold_positions[0])
+
+    # Median observed size within each bin, so the representative clade size
+    # is one that actually occurs rather than an interval midpoint.
+    representative_size = sizes.groupby(bin_labels, observed=False).median().to_numpy()
+
+    raw = t_from_z(z_threshold, representative_position, representative_size, model, tail)
+    groups = list(dict.fromkeys(list(event_types) + ["overall"]))
+    mapping = {
+        (group, interval): float(value)
+        for group in groups
+        for interval, value in zip(categories, raw)
+    }
+    provenance = {
+        "lossy_projection": True,
+        "source_of_truth": "per_test_calls.csv",
+        "representative_position_group": "cold",
+        "per_bin_threshold": {
+            str(interval): round(float(value), 4)
+            for interval, value in zip(categories, raw)
+        },
+    }
+    return mapping, provenance
+
+
 def load_site_rates(path: Optional[Path]) -> Optional[pd.Series]:
     """Load a per-position site-rate covariate (e.g. IQ-TREE's --rate .rate
     file, or any whitespace/comma-separated file with a Site/Position column
@@ -455,8 +678,9 @@ def head_to_head_vs_percentile_rule(
     t: Optional[float],
     percentile: float,
     n_bins: int,
+    calibrated_calls: Optional[np.ndarray] = None,
 ) -> dict:
-    """Compares the calibrated global threshold t against this repo's
+    """Compares the calibrated rule against this repo's
     existing per-(event, clade-size-decile) percentile rule (reusing
     scripts/plot_decoupled_event_switches_clade_adjusted.py's own
     bin_clade_sizes / calculate_bin_thresholds / identify_switches, not a
@@ -498,19 +722,29 @@ def head_to_head_vs_percentile_rule(
     df["bin_right"] = df["clade_size_right"].apply(_map_to_bin)
 
     percentile_thresholds = calculate_bin_thresholds(melted, "score", "clade_bin", percentile=percentile)
-    new_thresholds = as_bin_threshold_dict(t, df["event_type"].unique(), bin_categories)
-
     is_switch_percentile = identify_switches(df, percentile_thresholds, event_specific=False)
-    is_switch_new = identify_switches(df, new_thresholds, event_specific=False)
+
+    if calibrated_calls is not None:
+        # Under conditioning `t` lives on the z scale, so it cannot be fed
+        # to identify_switches, which compares RAW scores. The call set is
+        # passed in already evaluated instead.
+        is_switch_new = np.asarray(calibrated_calls, dtype=bool)
+        calibrated_desc = {"threshold_z": t, "n_switches": int(is_switch_new.sum()),
+                           "scale": "z = -log10(A * G(s))"}
+    else:
+        new_thresholds = as_bin_threshold_dict(t, df["event_type"].unique(), bin_categories)
+        is_switch_new = identify_switches(df, new_thresholds, event_specific=False)
+        calibrated_desc = {"threshold": t, "n_switches": int(is_switch_new.sum()),
+                           "scale": "raw BADASP score"}
 
     confusion = pd.crosstab(
         pd.Series(is_switch_percentile, name=f"percentile_{percentile}_rule"),
-        pd.Series(is_switch_new, name="calibrated_global_threshold"),
+        pd.Series(is_switch_new, name="calibrated_rule"),
     )
     return {
         "percentile_rule": {"percentile": percentile, "num_bins": n_bins,
                              "n_switches": int(is_switch_percentile.sum())},
-        "calibrated_rule": {"threshold": t, "n_switches": int(is_switch_new.sum())},
+        "calibrated_rule": calibrated_desc,
         "n_comparisons": int(len(df)),
         "confusion_matrix": confusion.to_dict(),
     }
@@ -630,6 +864,26 @@ def parse_args(argv=None) -> argparse.Namespace:
                              "the existing per-(event, clade-size-decile) rule.")
     parser.add_argument("--num-bins-decile", type=int, default=10)
     parser.add_argument("--num-bins-quartile", type=int, default=4)
+    parser.add_argument(
+        "--conditioning", choices=["none", "cell"], default="cell",
+        help="'cell' standardises each branch score against its own "
+             "(position group x clade-size bin) null rate before "
+             "thresholding; 'none' reproduces the single global threshold. "
+             "Both are always reported; this selects which one is primary.",
+    )
+    parser.add_argument("--n-hot", type=int, default=N_HOT_DEFAULT,
+                        help="Positions assigned to the noisy group.")
+    parser.add_argument("--n-clade-bins", type=int, default=N_CLADE_BINS_DEFAULT,
+                        help="Clade-size bins per position group. Bins whose "
+                             "quantile edges collapse onto the minimum clade "
+                             "size are dropped, so the achieved count can be "
+                             "lower than this.")
+    parser.add_argument("--anchor-alpha", type=float, default=ANCHOR_ALPHA_DEFAULT,
+                        help="Pooled tail probability defining the anchor u0 "
+                             "at which cell rates are estimated.")
+    parser.add_argument("--cv-folds", type=int, default=4,
+                        help="Replicate-level folds for the conditioned rule's "
+                             "cross-validation.")
     return parser.parse_args(argv)
 
 
@@ -677,11 +931,61 @@ def main(argv=None) -> int:
     flavour = (manifest or {}).get("flavour") or load_config(args.config).get("null_calibration", {}).get("flavour")
     shrinkage = (manifest or {}).get("shrinkage")
 
+    # --- Conditioning (fitted on the null only) ----------------------------
+    # Both rules are always computed so the comparison is always available;
+    # --conditioning only decides which one is primary.
+    tail = model = None
+    stat_left, stat_right = obs_left, obs_right
+    null_stat_left, null_stat_right = null_left, null_right
+    conditioning_info: Dict[str, object] = {"mode": args.conditioning}
+
+    if args.conditioning == "cell":
+        print(f"Fitting cell conditioning (n_hot={args.n_hot}, "
+              f"n_clade_bins={args.n_clade_bins}, anchor_alpha={args.anchor_alpha})...")
+        tail, model = fit_conditioning(
+            null_left, null_right, keys, args.n_hot, args.n_clade_bins, args.anchor_alpha
+        )
+        stat_left, stat_right = apply_conditioning(obs_left, obs_right, keys, tail, model)
+        null_stat_left, null_stat_right = apply_conditioning(
+            null_left, null_right, keys, tail, model
+        )
+        conditioning_info.update({
+            "anchor_alpha": model.anchor_alpha,
+            "anchor_score": round(float(model.anchor_score), 4),
+            "n_hot_positions": int(len(model.hot_positions)),
+            "hot_positions": model.hot_positions.tolist(),
+            "n_clade_bins_achieved": int(model.n_clade_bins),
+            "multiplier_min": round(float(model.multiplier.min()), 4),
+            "multiplier_max": round(float(model.multiplier.max()), 4),
+            "min_cell_events": int(model.cell_events.min()),
+            "median_cell_events": float(np.median(model.cell_events)),
+            "n_empty_cells": int(model.n_empty_cells),
+            "max_multiplier_log_se": round(float(np.nanmax(model.multiplier_log_se)), 4),
+            "units": "thresholds below are on the z scale, -log10(A * G(s)), "
+                     "not raw BADASP scores; per_test_calls.csv carries each "
+                     "test's own raw-score threshold.",
+        })
+        print(f"  anchor u0={model.anchor_score:.4f}  "
+              f"A in [{model.multiplier.min():.2f}, {model.multiplier.max():.2f}]  "
+              f"min cell events={int(model.cell_events.min())}")
+
     # --- Primary calibration ---------------------------------------------
     result: ThresholdResult = threshold_at_fdr(
-        obs_left, obs_right, null_left, null_right, q=args.target_fdr, fdp_quantile=args.fdp_quantile
+        stat_left, stat_right, null_stat_left, null_stat_right,
+        q=args.target_fdr, fdp_quantile=args.fdp_quantile,
     )
-    fwer = maxT_fwer_thresholds(null_left, null_right, keys["position"].to_numpy(), alpha=args.fwer_alpha)
+    fwer = maxT_fwer_thresholds(
+        null_stat_left, null_stat_right, keys["position"].to_numpy(), alpha=args.fwer_alpha
+    )
+
+    # The unconditioned rule, always reported as the comparison baseline.
+    global_result = (
+        result if args.conditioning == "none"
+        else threshold_at_fdr(
+            obs_left, obs_right, null_left, null_right,
+            q=args.target_fdr, fdp_quantile=args.fdp_quantile,
+        )
+    )
 
     thresholds_json = {
         "flavour": flavour,
@@ -701,6 +1005,17 @@ def main(argv=None) -> int:
         "note": result.note,
         "fwer_per_position_threshold": {str(k): v for k, v in fwer["per_position"].items()},
         "fwer_global_threshold": fwer["global"],
+        "conditioning": conditioning_info,
+        "global_rule_baseline": {
+            "t": global_result.t,
+            "O_t": global_result.O_t,
+            "E_fp": global_result.E_fp,
+            "E_fp_over_O": global_result.E_fp_over_O,
+            "fdp_quantile_achieved": global_result.fdp_quantile_achieved,
+            "criterion_met": global_result.criterion_met,
+            "note": "single global threshold on the raw score, reported for "
+                    "comparison regardless of --conditioning.",
+        },
         "git_sha": git_sha(REPO_ROOT),
         "generated": datetime.now(timezone.utc).isoformat(),
         "inputs": {
@@ -720,9 +1035,13 @@ def main(argv=None) -> int:
         result.sweep.to_csv(args.out_dir / "threshold_sweep.csv", index=False)
         plot_threshold_sweep(result.sweep, result.t, plots_dir / "threshold_sweep.png")
 
-    # --- Per-test table -----------------------------------------------------
-    obs_stat = _split_statistic(obs_left, obs_right)
-    null_stat = _split_statistic(null_left, null_right)
+    # --- Per-test call table (the source of truth) --------------------------
+    # Position-conditional thresholds do not fit the legacy
+    # {(event_type, clade_bin): t} dict, so this table -- not that dict --
+    # is what a reader should cite. It ships each test's own raw-score
+    # threshold so it is visible which positions were held to a higher bar.
+    obs_stat = _split_statistic(stat_left, stat_right)
+    null_stat = _split_statistic(null_stat_left, null_stat_right)
     p_values, q_values = per_test_pvalues(obs_stat, null_stat)
     per_test = keys.copy()
     per_test["badasp_score_left"] = obs_left
@@ -730,15 +1049,47 @@ def main(argv=None) -> int:
     per_test["split_statistic"] = obs_stat
     per_test["p_value"] = p_values
     per_test["q_value"] = q_values
-    per_test.to_csv(args.out_dir / "per_test_pvalues.csv", index=False)
-    print(f"Wrote {args.out_dir / 'per_test_pvalues.csv'} ({len(per_test):,} rows)")
+    if model is not None:
+        per_test["z_left"] = stat_left
+        per_test["z_right"] = stat_right
+        per_test["cell_multiplier_left"] = model.multipliers_for(
+            keys["position"].to_numpy(), keys["clade_size_left"].to_numpy(float)
+        )
+        per_test["cell_multiplier_right"] = model.multipliers_for(
+            keys["position"].to_numpy(), keys["clade_size_right"].to_numpy(float)
+        )
+        per_test["position_group"] = np.where(
+            np.isin(keys["position"].to_numpy(), model.hot_positions), "hot", "cold"
+        )
+        if result.t is not None:
+            per_test["threshold_raw_left"] = t_from_z(
+                result.t, keys["position"].to_numpy(),
+                keys["clade_size_left"].to_numpy(float), model, tail,
+            )
+            per_test["threshold_raw_right"] = t_from_z(
+                result.t, keys["position"].to_numpy(),
+                keys["clade_size_right"].to_numpy(float), model, tail,
+            )
+    if result.t is not None:
+        per_test["called"] = obs_stat >= result.t
+    per_test.to_csv(args.out_dir / "per_test_calls.csv", index=False)
+    print(f"Wrote {args.out_dir / 'per_test_calls.csv'} ({len(per_test):,} rows"
+          + (f", {int(per_test['called'].sum()):,} called)" if result.t is not None else ")"))
 
     # --- Diagnostics ----------------------------------------------------------
     diagnostics: Dict[str, object] = {}
 
     diagnostics["self_calibration"] = self_calibration_diagnostic(
-        null_left, null_right, result.t, args.holdout_fraction, seed
+        null_stat_left, null_stat_right, result.t, args.holdout_fraction, seed
     )
+
+    if args.conditioning == "cell":
+        diagnostics["conditioned_cross_validation"] = conditioned_cv_diagnostic(
+            obs_left, obs_right, null_left, null_right, keys,
+            q=args.target_fdr, fdp_quantile=args.fdp_quantile,
+            n_hot=args.n_hot, n_clade_bins=args.n_clade_bins,
+            anchor_alpha=args.anchor_alpha, n_folds=args.cv_folds,
+        )
 
     site_rates = load_site_rates(args.site_rate_file)
     flatness_df, flatness_note = compute_flatness_diagnostics(
@@ -758,8 +1109,26 @@ def main(argv=None) -> int:
     diagnostics["p_ac_minus1"] = p_ac_minus1_comparison(keys["ac"].to_numpy(), null_ac)
 
     diagnostics["head_to_head_vs_percentile_rule"] = head_to_head_vs_percentile_rule(
-        keys, obs_left, obs_right, result.t, args.percentile_comparison, args.num_bins_decile
+        keys, obs_left, obs_right, result.t, args.percentile_comparison,
+        args.num_bins_decile,
+        calibrated_calls=(obs_stat >= result.t) if (model is not None and result.t is not None) else None,
     )
+
+    # --- Legacy bin-threshold dict (compatibility shim) ---------------------
+    # The four downstream analysis scripts consume
+    # {(event_type, clade_bin): raw threshold}. Keep emitting it so they run
+    # unmodified, but it cannot express the position component -- see
+    # conditioned_bin_threshold_dict's docstring.
+    if model is not None and result.t is not None:
+        _, bin_provenance = conditioned_bin_threshold_dict(
+            keys, result.t, tail, model,
+            keys["event_type"].unique(), args.num_bins_decile,
+        )
+        (args.out_dir / "legacy_bin_thresholds.json").write_text(
+            json.dumps(bin_provenance, indent=2, default=_json_default) + "\n"
+        )
+        print(f"Wrote {args.out_dir / 'legacy_bin_thresholds.json'} "
+              "(lossy projection; per_test_calls.csv is the source of truth)")
 
     (args.out_dir / "diagnostics.json").write_text(
         json.dumps(diagnostics, indent=2, default=_json_default) + "\n"
