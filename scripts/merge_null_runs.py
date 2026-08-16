@@ -59,6 +59,13 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# --check-only verdict exit codes. Deliberately NOT 1 or 2: argparse uses 2
+# and SystemExit("No rep_*.npz found ...") uses 1, so reusing them let an
+# empty run directory be reported by a shell gate as "not comparable" -- a
+# real verdict -- when the script had simply errored. That happened.
+EXIT_NOT_COMPARABLE = 3
+EXIT_UNDETERMINED = 4
+
 
 def npz_dir_of(run_dir: Path) -> Path:
     """Accept either a run directory or the npz directory itself."""
@@ -170,7 +177,12 @@ def main(argv=None) -> int:
                         help="Report the tail-comparability check and exit "
                              "without writing anything. Use this to ask "
                              "whether two replicate sets behave like the same "
-                             "null before committing to a merge.")
+                             "null before committing to a merge. Exit status "
+                             "carries the verdict: 0 comparable, "
+                             f"{EXIT_NOT_COMPARABLE} not comparable, "
+                             f"{EXIT_UNDETERMINED} undetermined. Those are "
+                             "deliberately not 1 or 2, so an ordinary error "
+                             "exit cannot be mistaken for a verdict.")
     parser.add_argument("--report-json", type=Path, default=None,
                         help="Write the comparability report to this path "
                              "(works with --check-only).")
@@ -280,7 +292,9 @@ def main(argv=None) -> int:
     if args.check_only:
         # Exit status carries the verdict so a shell gate can branch on it:
         # 0 comparable, 1 not comparable, 2 undetermined.
-        return {True: 0, False: 1, None: 2}[tails["comparable"]]
+        return {True: 0,
+                False: EXIT_NOT_COMPARABLE,
+                None: EXIT_UNDETERMINED}[tails["comparable"]]
     if tails["comparable"] is False:
         message = (
             f"the runs' null tails differ by {tails['mean_ratio']}x"

@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 from scripts import merge_null_runs as mnr
+from scripts.merge_null_runs import EXIT_NOT_COMPARABLE, EXIT_UNDETERMINED
 from scripts.score_null_replicate import SCORE_COLUMNS
 
 
@@ -215,15 +216,17 @@ def test_check_only_reports_without_writing(tmp_path):
 
 
 def test_check_only_exit_code_carries_the_verdict(tmp_path):
-    """A shell gate branches on this, so the codes are part of the contract:
-    0 comparable, 1 not comparable, 2 undetermined."""
+    """A shell gate branches on this, so the codes are part of the contract.
+    They must not collide with argparse's 2 or the plain SystemExit 1 an
+    empty run directory raises -- an unattended gate reported that error as
+    a 'not comparable' verdict once already."""
     cold = _make_run_with_tail(tmp_path, "v_cold", 6, 4000, scale=1.0)
     hot = _make_run_with_tail(tmp_path, "v_hot", 6, 4000, scale=2.0)
-    assert mnr.main(["--run-dir", str(cold), str(hot), "--check-only"]) == 1
+    assert mnr.main(["--run-dir", str(cold), str(hot), "--check-only"]) == EXIT_NOT_COMPARABLE
 
     tiny_a = _make_run(tmp_path, "v_tiny_a", 2, 50, seed=1)
     tiny_b = _make_run(tmp_path, "v_tiny_b", 2, 50, seed=2)
-    assert mnr.main(["--run-dir", str(tiny_a), str(tiny_b), "--check-only"]) == 2
+    assert mnr.main(["--run-dir", str(tiny_a), str(tiny_b), "--check-only"]) == EXIT_UNDETERMINED
 
 
 def test_out_dir_required_unless_check_only(tmp_path):
@@ -231,3 +234,14 @@ def test_out_dir_required_unless_check_only(tmp_path):
     b = _make_run(tmp_path, "req_b", 2, 50, seed=2)
     with pytest.raises(SystemExit):
         mnr.main(["--run-dir", str(a), str(b)])
+
+
+def test_verdict_codes_do_not_collide_with_error_exits(tmp_path):
+    """An empty run directory must not look like a verdict to a shell gate."""
+    a = _make_run(tmp_path, "err_a", 2, 50, seed=1)
+    empty = tmp_path / "err_b" / "npz"
+    empty.mkdir(parents=True)
+    with pytest.raises(SystemExit) as excinfo:
+        mnr.main(["--run-dir", str(a), str(empty.parent), "--check-only"])
+    code = excinfo.value.code
+    assert code not in (0, EXIT_NOT_COMPARABLE, EXIT_UNDETERMINED), code
