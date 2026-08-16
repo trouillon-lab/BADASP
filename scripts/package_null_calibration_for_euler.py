@@ -183,7 +183,15 @@ SCORE_LAPTOP_LOADED_MINUTES_HIGH = 46
 # keep chunks modest rather than simulating everything in one task.
 SIMULATE_WALLTIME_SAFETY_FACTOR = 1.3
 SIMULATE_MEM_HEADROOM_GB = 1.0
-SCORE_WALLTIME_SAFETY_FACTOR = 1.3
+# Raised from 1.3 after observing the limit, per the "only raise once you
+# have hit it" rule. Three Euler ASR measurements now span 2x on identical
+# work: 4,185 s (job 10885858_1), 8,152 s (10861338), and >8,580 s
+# (10889672, still running at 2:22 against a 3:02 limit). The variation is
+# node-to-node, not workload, so the request has to cover the slow end: a
+# timeout wastes the entire task including the ASR already done, whereas an
+# over-request only costs queue priority. 1.9 x 8,396 s = 4:25:52, which
+# covers a node ~1.9x slower than the mean measurement.
+SCORE_WALLTIME_SAFETY_FACTOR = 1.9
 SCORE_MEM_HEADROOM_GB = 0.6
 
 # Alignments produced per simulate array task. At the conservative 1350 s
