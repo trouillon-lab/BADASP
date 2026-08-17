@@ -139,6 +139,22 @@ def fig_distribution(obs, cols, n_ac, out_path):
             "ratio_by_rc": list(zip(rc_mid, ratio))}
 
 
+def _label_alpha_axis(ax, alphas):
+    """Label the tail-probability axis as 'top X% of null scores'.
+
+    `alpha` is the fraction of simulated-null scores above the threshold, so
+    alpha = 0.01 means 'the bar that only the top 1% of null comparisons
+    clear'. Spelling that out avoids the reader having to translate a bare
+    probability, and 'tail' into plain language.
+    """
+    ax.set_xscale("log")
+    ax.invert_xaxis()
+    ax.set_xticks(alphas)
+    ax.set_xticklabels([("top %g%%" % (a * 100)) for a in alphas], fontsize=8)
+    ax.minorticks_off()
+    ax.set_xlabel("how high a score we demand\n(kept: the top % of simulated-null comparisons)")
+
+
 def _oe(o_stat, n_stat, alpha, n_rep):
     o_stat = o_stat[np.isfinite(o_stat)]
     n_stat = n_stat[np.isfinite(n_stat)]
@@ -160,17 +176,16 @@ def fig_sign_flip(obs, cols, n_ac, n_rep, out_path):
         results[label] = ys
         ax.plot(alphas, ys, style, lw=2, label=label)
     ax.axhline(1.0, ls="--", color="grey", lw=1)
-    ax.set_xscale("log"); ax.set_yscale("log")
-    ax.invert_xaxis()
-    ax.set_xlabel("tail probability (moving right = further into the tail)")
-    ax.set_ylabel("observed / expected-null exceedances")
+    ax.set_yscale("log")
+    _label_alpha_axis(ax, alphas)
+    ax.set_ylabel("real switches found / number the null\nproduces by chance  (1.0 = calibrated)")
     ax.set_title("One defect, two opposite symptoms\n"
                  "$p_{AC}$ enters the score as $RC - AC \\cdot p_{AC}$, so its sign flips",
                  fontsize=9)
     ax.legend(fontsize=8, frameon=False, loc="lower left")
-    ax.text(0.97, 0.93, "null too COLD:\nlooks like signal\nwhere none can exist",
+    ax.text(0.97, 0.95, "above 1: null too COLD --\nmanufactures apparent signal\nwhere none can exist",
             transform=ax.transAxes, fontsize=7, ha="right", va="top", color="#1f5fa8")
-    ax.text(0.97, 0.08, "null too HOT:\nreal switches buried",
+    ax.text(0.97, 0.06, "below 1: null too HOT --\nburies real switches",
             transform=ax.transAxes, fontsize=7, ha="right", va="bottom", color="#d2691e")
     fig.tight_layout()
     fig.savefig(out_path, dpi=DPI, bbox_inches="tight")
@@ -200,20 +215,28 @@ def fig_correction(obs, cols, n_ac, n_rep, out_path, fit_bins=(0, 1, 2), held=(3
         out[label] = [float(v) for v in ys]
         ax.plot(alphas, ys, style, lw=2, color=colour, label=label)
     ax.axhline(1.0, ls="--", color="grey", lw=1)
-    ax.text(3e-2, 1.05, "correctly calibrated", fontsize=7, color="grey")
-    ax.set_xscale("log"); ax.invert_xaxis()
-    ax.set_xlabel("tail probability (moving right = further into the tail)")
-    ax.set_ylabel("observed / expected-null exceedances")
+    ax.axhline(1.0, ls="--", color="grey", lw=1)
+    _label_alpha_axis(ax, alphas)
+    ax.set_ylabel("real switches found / number the null\nproduces by chance  (1.0 = calibrated)")
     ax.set_title(
         f"Correction validated on held-out signal-free data\n"
         f"(fitted on RC bins {list(fit_bins)}, evaluated on bins {list(held)} only)",
         fontsize=9, pad=10)
-    ax.set_ylim(-0.05, 1.45)
+    ax.set_ylim(-0.05, 1.55)
     ax.legend(fontsize=8, frameon=False, loc="center left")
-    ax.text(0.30, 0.80, "calibrated over this range", transform=ax.transAxes,
+    # Both curves sit BELOW 1.0, i.e. the null produces more high scores than
+    # reality does. That is the null running hot, which hides real switches --
+    # the conservative direction. Spelled out because "below 1" is easy to
+    # misread as the harmless case.
+    ax.text(0.02, 0.94, "1.0 = null behaves like the real data.\n"
+                        "Below 1.0 the null runs HOT: it invents high scores,\n"
+                        "so real switches get buried. Errs on the safe side.",
+            transform=ax.transAxes, fontsize=7, color="#7b241c", va="top")
+    ax.text(0.36, 0.60, "calibrated across this range", transform=ax.transAxes,
             fontsize=7, color=FIXED_COLOUR, ha="center")
-    ax.annotate("overshoots -- unresolved,\nand thresholds sit here",
-                xy=(1.05e-3, 0.44), xytext=(4e-3, 0.16), fontsize=7, color="black",
+    ax.annotate("still short here: the null is\nstill too hot at the very top,\n"
+                "so this end stays conservative\n(unresolved)",
+                xy=(1.05e-3, 0.44), xytext=(8e-3, 0.10), fontsize=7, color="black",
                 arrowprops=dict(arrowstyle="->", color="black", lw=1))
     fig.tight_layout()
     fig.savefig(out_path, dpi=DPI, bbox_inches="tight")
