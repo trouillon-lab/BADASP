@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""
+plot_pac_misspecification.py
+
+Three figures describing why the simulated null's ancestral-state posterior
+(`p_AC`) is mis-specified, what that does to the switch calibration, and how
+much of it the correction in src/badasp/posterior_correction.py removes.
+
+Intended for discussion, not as a claim that any of it is resolved -- the
+third panel shows the part that is not.
+
+  1. p_ac_distribution.png   the defect itself: the null's `p_AC = 1.0` atom
+                             is ~3x oversized, and how that varies with RC
+  2. pac_sign_flip.png       why one defect produces two opposite symptoms,
+                             since `AC` flips the sign of `p_AC`
+  3. pac_correction.png      held-out calibration before and after the
+                             correction, across tail probabilities
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import sys
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from src.badasp.posterior_correction import (  # noqa: E402
+    assign_bins,
+    fit_posterior_correction,
+    rc_bin_edges,
+)
+
+DPI = 150
+OBS_COLOUR = "#2c3e50"
+NULL_COLOUR = "#c0392b"
+FIXED_COLOUR = "#1e8449"
+
+
+def load(null_run_dir: Path, observed_scores: Path):
+    obs = pd.read_csv(observed_scores)
+    files = sorted((null_run_dir / "npz").glob("rep_*.npz")) or sorted(
+        null_run_dir.glob("rep_*.npz")
+    )
+    if not files:
+        raise SystemExit(f"No rep_*.npz found under {null_run_dir}")
+    n_ac = np.stack([np.load(f)["ac"] for f in files]).astype(float)
+    cols = {}
+    for name in ("rc_left", "rc_right", "p_ac_left", "p_ac_right",
+                 "badasp_score_left", "badasp_score_right"):
+        cols[name] = np.stack([np.load(f)[name] for f in files]).astype(float)
+    return obs, cols, n_ac, len(files)
+
+
+def branch_arrays(obs, cols, n_ac, want_ac):
+    """Observed and null (rc, p_ac) for one AC stratum, both branches pooled."""
+    o_ac = obs["ac"].to_numpy(float)
+    mo, mn = o_ac == want_ac, n_ac == want_ac
+    o_rc = np.concatenate([obs[f"rc_{s}"].to_numpy(float)[mo] for s in ("left", "right")])
+    o_p = np.concatenate([obs[f"p_ac_{s}"].to_numpy(float)[mo] for s in ("left", "right")])
+    n_rc = np.concatenate([cols[f"rc_{s}"][mn] for s in ("left", "right")])
+    n_p = np.concatenate([cols[f"p_ac_{s}"][mn] for s in ("left", "right")])
+    return o_rc, o_p, n_rc, n_p
+
+
+def fig_distribution(obs, cols, n_ac, out_path):
+    o_rc, o_p, n_rc, n_p = branch_arrays(obs, cols, n_ac, -1.0)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+
+    ax = axes[0]
+    bins = np.linspace(0.90, 1.0, 41)
+    ax.hist(o_p[o_p < 1.0], bins=bins, density=True, histtype="step",
+            lw=2, color=OBS_COLOUR, label="observed")
+    ax.hist(n_p[n_p < 1.0], bins=bins, density=True, histtype="step",
+            lw=2, color=NULL_COLOUR, label="simulated null")
+    o_atom, n_atom = float((o_p == 1.0).mean()), float((n_p == 1.0).mean())
+    ax.set_xlabel("posterior probability of the ancestral call, $p_{AC}$")
+    ax.set_ylabel("density (values below 1.0)")
+    ax.set_title("Where ancestors differ (AC = $-$1)\n"
+                 f"atom at exactly 1.0: observed {o_atom:.1%}, null {n_atom:.1%} "
+                 f"({n_atom / o_atom:.1f}x)", fontsize=9)
+    ax.legend(fontsize=8, frameon=False)
+
+    ax = axes[1]
+    edges = rc_bin_edges(o_rc, 10)
+    ob, nb = assign_bins(o_rc, edges), assign_bins(n_rc, edges)
+    xs, ratio, rc_mid = [], [], []
+    for b in range(len(edges) + 1):
+        m_o, m_n = ob == b, nb == b
+        if m_o.sum() < 200 or m_n.sum() < 200:
+            continue
+        a = float((o_p[m_o] == 1.0).mean())
+        c = float((n_p[m_n] == 1.0).mean())
+        if a > 0:
+            xs.append(b); ratio.append(c / a); rc_mid.append(float(np.median(o_rc[m_o])))
+    ax.plot(rc_mid, ratio, "o-", color=NULL_COLOUR, lw=2)
+    ax.axhline(1.0, ls="--", color="grey", lw=1)
+    ax.text(rc_mid[0], 1.06, "no mis-specification", fontsize=7, color="grey")
+    ax.set_xlabel("within-clade conservation, RC (bin median)")
+    ax.set_ylabel("null / observed atom size")
+    ax.set_title("The defect is not constant: the null's over-confidence\n"
+                 "shrinks as clades get more conserved", fontsize=9)
+    ax.set_ylim(0, max(ratio) * 1.15)
+
+    fig.suptitle("The simulated null's ancestral reconstruction is over-confident",
+                 fontsize=11, y=1.02)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+    return {"observed_atom": o_atom, "null_atom": n_atom,
+            "ratio_by_rc": list(zip(rc_mid, ratio))}
+
+
+def _oe(o_stat, n_stat, alpha, n_rep):
+    o_stat = o_stat[np.isfinite(o_stat)]
+    n_stat = n_stat[np.isfinite(n_stat)]
+    t = np.quantile(n_stat, 1 - alpha)
+    e = (n_stat >= t).sum() / n_rep
+    o = int((o_stat >= t).sum())
+    return (o / e) if e > 0 else np.nan
+
+
+def fig_sign_flip(obs, cols, n_ac, n_rep, out_path):
+    alphas = np.array([3e-2, 1e-2, 3e-3, 1e-3, 3e-4])
+    fig, ax = plt.subplots(figsize=(6.4, 4.4))
+    results = {}
+    for want, label, style in ((1.0, "AC = +1  (cannot be a switch)", "s--"),
+                               (-1.0, "AC = $-$1  (where switches are)", "o-")):
+        o_rc, o_p, n_rc, n_p = branch_arrays(obs, cols, n_ac, want)
+        o_stat, n_stat = o_rc - want * o_p, n_rc - want * n_p
+        ys = [_oe(o_stat, n_stat, a, n_rep) for a in alphas]
+        results[label] = ys
+        ax.plot(alphas, ys, style, lw=2, label=label)
+    ax.axhline(1.0, ls="--", color="grey", lw=1)
+    ax.set_xscale("log"); ax.set_yscale("log")
+    ax.invert_xaxis()
+    ax.set_xlabel("tail probability (moving right = further into the tail)")
+    ax.set_ylabel("observed / expected-null exceedances")
+    ax.set_title("One defect, two opposite symptoms\n"
+                 "$p_{AC}$ enters the score as $RC - AC \\cdot p_{AC}$, so its sign flips",
+                 fontsize=9)
+    ax.legend(fontsize=8, frameon=False, loc="lower left")
+    ax.text(0.97, 0.93, "null too COLD:\nlooks like signal\nwhere none can exist",
+            transform=ax.transAxes, fontsize=7, ha="right", va="top", color="#1f5fa8")
+    ax.text(0.97, 0.08, "null too HOT:\nreal switches buried",
+            transform=ax.transAxes, fontsize=7, ha="right", va="bottom", color="#d2691e")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+    return {k: [float(v) for v in vs] for k, vs in results.items()}
+
+
+def fig_correction(obs, cols, n_ac, n_rep, out_path, fit_bins=(0, 1, 2), held=(3, 4)):
+    """Held-out calibration: the correction never sees bins `held`."""
+    o_rc, o_p, n_rc, n_p = branch_arrays(obs, cols, n_ac, -1.0)
+    edges = rc_bin_edges(o_rc, 10)
+    ob, nb = assign_bins(o_rc, edges), assign_bins(n_rc, edges)
+    correction = fit_posterior_correction(n_rc, n_p, o_rc, o_p, fit_bins=list(fit_bins))
+    fixed_p = correction.apply(n_rc, n_p, seed=20260816)
+
+    m_o, m_n = np.isin(ob, held), np.isin(nb, held)
+    o_stat = o_rc[m_o] + o_p[m_o]
+    alphas = np.array([3e-2, 1e-2, 3e-3, 1e-3])
+    series = {
+        "simulated null, uncorrected": (n_rc[m_n] + n_p[m_n], NULL_COLOUR, "o-"),
+        "after correcting $p_{AC}$": (n_rc[m_n] + fixed_p[m_n], FIXED_COLOUR, "s-"),
+    }
+    fig, ax = plt.subplots(figsize=(6.4, 4.4))
+    out = {}
+    for label, (n_stat, colour, style) in series.items():
+        ys = [_oe(o_stat, n_stat, a, n_rep) for a in alphas]
+        out[label] = [float(v) for v in ys]
+        ax.plot(alphas, ys, style, lw=2, color=colour, label=label)
+    ax.axhline(1.0, ls="--", color="grey", lw=1)
+    ax.text(3e-2, 1.05, "correctly calibrated", fontsize=7, color="grey")
+    ax.set_xscale("log"); ax.invert_xaxis()
+    ax.set_xlabel("tail probability (moving right = further into the tail)")
+    ax.set_ylabel("observed / expected-null exceedances")
+    ax.set_title(
+        f"Correction validated on held-out signal-free data\n"
+        f"(fitted on RC bins {list(fit_bins)}, evaluated on bins {list(held)} only)",
+        fontsize=9, pad=10)
+    ax.set_ylim(-0.05, 1.45)
+    ax.legend(fontsize=8, frameon=False, loc="center left")
+    ax.text(0.30, 0.80, "calibrated over this range", transform=ax.transAxes,
+            fontsize=7, color=FIXED_COLOUR, ha="center")
+    ax.annotate("overshoots -- unresolved,\nand thresholds sit here",
+                xy=(1.05e-3, 0.44), xytext=(4e-3, 0.16), fontsize=7, color="black",
+                arrowprops=dict(arrowstyle="->", color="black", lw=1))
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+    return out
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(description=__doc__,
+                               formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--null-run-dir", type=Path, required=True)
+    p.add_argument("--observed-scores", type=Path,
+                   default=REPO_ROOT / "results/badasp_scoring/raw_node_scores.csv")
+    p.add_argument("--out-dir", type=Path,
+                   default=REPO_ROOT / "results/badasp_scoring/null_calibration/figures")
+    args = p.parse_args(argv)
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    obs, cols, n_ac, n_rep = load(args.null_run_dir, args.observed_scores)
+    print(f"{n_rep} null replicates, {len(obs):,} observed tests")
+
+    for name, fn in (
+        ("p_ac_distribution.png", lambda pth: fig_distribution(obs, cols, n_ac, pth)),
+        ("pac_sign_flip.png", lambda pth: fig_sign_flip(obs, cols, n_ac, n_rep, pth)),
+        ("pac_correction.png", lambda pth: fig_correction(obs, cols, n_ac, n_rep, pth)),
+    ):
+        path = args.out_dir / name
+        summary = fn(path)
+        print(f"Wrote {path}")
+        print(f"   {summary}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
