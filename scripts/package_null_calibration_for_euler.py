@@ -214,34 +214,25 @@ SIMULATE_CHUNK_SIZE_DEFAULT = 10
 CHUNK_SEED_STRIDE = 100003
 
 # Default SLURM array throttle (the `%N` in `--array=0-K%N`), i.e. the max
-# number of scoring tasks allowed to run concurrently across the WHOLE
-# cluster allocation. Lowered from this script's previous default of 50:
-# with the corrected per-task walltime above (~5x the old ~12-minute
-# estimate) AND the task being memory-bandwidth- rather than core-bound,
-# high concurrency has less upside (no proportional throughput gain once
-# several tasks share a node's memory bus) and more downside (long-lived
-# tasks raise the odds that several land on, and jointly saturate, the same
-# node for an extended window). This value only bounds *cluster-wide*
-# concurrency, not *per-node* packing -- SLURM's own bin-packing still
-# decides which node each task lands on, and this script deliberately does
-# NOT try to control that more tightly:
-#   * `--exclusive` would guarantee no same-node contention, but reserves
-#     an entire node for a 2-thread task -- a large, unjustified resource
-#     request (the "never pad" rule cuts against this as the default).
-#   * A larger `--ntasks-per-node` isn't the right lever either: each array
-#     index here is an independent single-task job, and that flag governs
-#     task placement *within* one multi-task job, not cross-job packing
-#     across an array -- and picking a number would require Euler's node
-#     topology (cores per node, memory channels), which this repo has no
-#     way to measure without the pilot below.
-# So: rely on a lower cluster-wide cap here, and require the Euler pilot
-# (see run_score_null_calibration_array.sh's own leading comment) to check
-# `sacct ... NodeList` for same-node co-location before trusting this
-# default at scale -- escalate to `--exclusive` only if the pilot shows
-# harmful same-node stacking that a lower throttle doesn't fix. Like the
-# old default, this is a cluster-citizenship starting point, not a measured
-# optimum -- adjust to this project's actual Euler fair-share allocation.
-ARRAY_THROTTLE_DEFAULT = 10
+# number of scoring tasks allowed to run concurrently.
+#
+# This was previously 10 (and submissions used 5) on the grounds that the
+# workload is memory-bandwidth-bound, so packing tasks would not scale
+# throughput. That measurement was taken on a LAPTOP -- one machine, one
+# memory bus, where two concurrent ASRs really do match one in throughput.
+# It does not transfer to a cluster: SLURM spreads array tasks across
+# independent nodes (observed: eu-a2p-279, 344, 409, 417, 430 for five
+# tasks), and separate nodes have separate memory buses, so the contention
+# the low cap was protecting against mostly does not arise.
+#
+# Co-location still happens and may still cost something -- two tasks on
+# eu-a2p-409 were slower than one alone on eu-a2p-279 (2:40+ vs 1:41) --
+# but node-to-node speed varies by 2x on identical work anyway, so that
+# comparison cannot separate the two effects, and throttling the whole
+# array to guard against it wastes most of the cluster. Raise this further
+# to suit the project's fair-share allocation; it is a citizenship choice,
+# not a throughput optimum.
+ARRAY_THROTTLE_DEFAULT = 20
 
 
 def _fmt_hms(total_seconds: float) -> str:
