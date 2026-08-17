@@ -181,7 +181,13 @@ SCORE_LAPTOP_LOADED_MINUTES_HIGH = 46
 # measured at 4 alignments per invocation and AliSim's memory scaling with
 # --num-alignments has NOT been measured -- which is the main reason to
 # keep chunks modest rather than simulating everything in one task.
-SIMULATE_WALLTIME_SAFETY_FACTOR = 1.3
+# Raised from 1.3 after observing the limit: of 30 chunks at 04:52:30, task
+# 22 timed out at 04:53:24 while the other 29 completed. Same node-to-node
+# variability the scoring array shows. 1.6 x (10 x 1350 s + probe) = 6:00:08.
+# A timed-out chunk is recoverable (the staging rename means it promotes no
+# alignment at all, so nothing invalid is left behind and it can simply be
+# resubmitted), which is why this factor stays below the scoring array's.
+SIMULATE_WALLTIME_SAFETY_FACTOR = 1.6
 SIMULATE_MEM_HEADROOM_GB = 1.0
 # Raised from 1.3 after observing the limit, per the "only raise once you
 # have hit it" rule. Three Euler ASR measurements now span 2x on identical
