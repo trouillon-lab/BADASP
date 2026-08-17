@@ -77,18 +77,37 @@ def fig_distribution(obs, cols, n_ac, out_path):
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
 
     ax = axes[0]
-    bins = np.linspace(0.90, 1.0, 41)
-    ax.hist(o_p[o_p < 1.0], bins=bins, density=True, histtype="step",
-            lw=2, color=OBS_COLOUR, label="observed")
-    ax.hist(n_p[n_p < 1.0], bins=bins, density=True, histtype="step",
-            lw=2, color=NULL_COLOUR, label="simulated null")
+    # Full 0-1 range, not a zoom on the tail: a third of the observed values
+    # lie below 0.90, and cropping there makes p_AC look far more
+    # concentrated near 1 than it is. Values at exactly 1.0 are drawn as a
+    # separate pair of bars, because a point mass has no density.
+    # Cumulative rather than a histogram: it reads off directly how much mass
+    # sits below any value, and the point mass at exactly 1.0 shows up as the
+    # vertical jump at the right edge instead of being invisible.
     o_atom, n_atom = float((o_p == 1.0).mean()), float((n_p == 1.0).mean())
+    grid = np.linspace(0.0, 1.0, 501)
+    for values, colour, label in ((o_p, OBS_COLOUR, "observed"),
+                                  (n_p, NULL_COLOUR, "simulated null")):
+        v = np.sort(values[np.isfinite(values)])
+        # P(p_AC < x), so the jump to 1.0 at the right edge IS the point mass.
+        ax.step(grid, np.searchsorted(v, grid, side="left") / len(v),
+                where="post", lw=2, color=colour, label=label)
+    for frac, colour in ((1 - o_atom, OBS_COLOUR), (1 - n_atom, NULL_COLOUR)):
+        ax.plot([1.0, 1.0], [frac, 1.0], lw=3, color=colour, alpha=0.9)
+    ax.axvline(0.90, ls=":", color="grey", lw=1)
+    ax.text(0.87, 0.50,
+            f"below 0.90:\nobserved {np.mean(o_p < 0.90):.0%}\nnull {np.mean(n_p < 0.90):.0%}",
+            fontsize=7, ha="right", va="center")
+    ax.annotate(
+        f"vertical jump at exactly 1.0\n= the 'atom' (a point mass):\n"
+        f"observed {o_atom:.1%}, null {n_atom:.1%}  ({n_atom / o_atom:.1f}x)",
+        xy=(1.0, 1 - n_atom * 0.6), xytext=(0.44, 0.13), fontsize=7,
+        arrowprops=dict(arrowstyle="->", lw=1, color="black"))
+    ax.set_xlim(0.0, 1.06); ax.set_ylim(0, 1.04)
     ax.set_xlabel("posterior probability of the ancestral call, $p_{AC}$")
-    ax.set_ylabel("density (values below 1.0)")
-    ax.set_title("Where ancestors differ (AC = $-$1)\n"
-                 f"atom at exactly 1.0: observed {o_atom:.1%}, null {n_atom:.1%} "
-                 f"({n_atom / o_atom:.1f}x)", fontsize=9)
-    ax.legend(fontsize=8, frameon=False)
+    ax.set_ylabel("cumulative fraction of branches")
+    ax.set_title("Where ancestors differ (AC = $-$1)", fontsize=9)
+    ax.legend(fontsize=8, frameon=False, loc="upper left")
 
     ax = axes[1]
     edges = rc_bin_edges(o_rc, 10)
