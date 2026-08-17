@@ -181,6 +181,7 @@ SCORE_LAPTOP_LOADED_MINUTES_HIGH = 46
 # measured at 4 alignments per invocation and AliSim's memory scaling with
 # --num-alignments has NOT been measured -- which is the main reason to
 # keep chunks modest rather than simulating everything in one task.
+
 # Raised from 1.3 after observing the limit: of 30 chunks at 04:52:30, task
 # 22 timed out at 04:53:24 while the other 29 completed. Same node-to-node
 # variability the scoring array shows. 1.6 x (10 x 1350 s + probe) = 6:00:08.
@@ -189,15 +190,29 @@ SCORE_LAPTOP_LOADED_MINUTES_HIGH = 46
 # resubmitted), which is why this factor stays below the scoring array's.
 SIMULATE_WALLTIME_SAFETY_FACTOR = 1.6
 SIMULATE_MEM_HEADROOM_GB = 1.0
-# Raised from 1.3 after observing the limit, per the "only raise once you
-# have hit it" rule. Three Euler ASR measurements now span 2x on identical
-# work: 4,185 s (job 10885858_1), 8,152 s (10861338), and >8,580 s
-# (10889672, still running at 2:22 against a 3:02 limit). The variation is
-# node-to-node, not workload, so the request has to cover the slow end: a
-# timeout wastes the entire task including the ASR already done, whereas an
-# over-request only costs queue priority. 1.9 x 8,396 s = 4:25:52, which
-# covers a node ~1.9x slower than the mean measurement.
-SCORE_WALLTIME_SAFETY_FACTOR = 1.9
+
+# Sized for CO-LOCATED tasks, which is the case that actually fails.
+#
+# Measured on job 10920406, and the pattern is exact: every task that ran
+# alone on a node COMPLETED (2:06:38 on eu-a2p-417, 1:56:53 on 344, 1:50:12
+# on 485), and every task that shared a node with a sibling TIMED OUT
+# (tasks 2+3 on eu-a2p-409, tasks 5+6 on eu-a2p-430, all four still
+# unfinished at 4:26). Two ASR processes on one node more than double each
+# other's wall-clock -- the workload is memory-bandwidth-bound, and a node's
+# memory bus is shared even though its cores are not.
+#
+# An earlier revision of this comment claimed the bandwidth effect was a
+# laptop artifact that "does not transfer to a cluster" because SLURM
+# spreads tasks across nodes. That was wrong: SLURM spreads them, but it
+# also PACKS two onto one node whenever that fits, which is exactly the
+# harmful case.
+#
+# --exclusive would prevent it outright but reserves ~128 cores to run a
+# 2-thread task: 25-60x the allocation of simply tolerating the contention.
+# So the request stays at 2 CPUs and the walltime covers the slow case
+# instead: 2.7 x 8,396 s = 6:17:49, i.e. ~3x the solo time and comfortably
+# past the 4:26 at which co-located tasks were still running.
+SCORE_WALLTIME_SAFETY_FACTOR = 2.7
 SCORE_MEM_HEADROOM_GB = 0.6
 
 # Alignments produced per simulate array task. At the conservative 1350 s
