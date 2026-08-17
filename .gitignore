@@ -79,3 +79,8 @@ ncbi_taxonomy_map.csv
 # Compiled tools and submodules
 tools/
 
+
+# Local agent/editor configuration - not needed to reproduce anything,
+# and not needed on Euler (Euler only runs the Python scripts).
+.claude/
+.continue/
