@@ -112,6 +112,8 @@ class PosteriorCorrection:
     fitted_bins: np.ndarray           # bin indices estimated from data
     n_fitted_source: np.ndarray       # draws behind each fitted bin
     n_fitted_target: np.ndarray
+    bin_rc: np.ndarray                # median null RC per bin, the trend's x
+    extrapolation: str = "constant"
 
     @property
     def n_bins(self) -> int:
@@ -164,6 +166,8 @@ class PosteriorCorrection:
             "fitted_bins": self.fitted_bins.tolist(),
             "n_fitted_source": self.n_fitted_source.tolist(),
             "n_fitted_target": self.n_fitted_target.tolist(),
+            "bin_rc": self.bin_rc.tolist(),
+            "extrapolation": self.extrapolation,
         }
 
     @classmethod
@@ -179,6 +183,8 @@ class PosteriorCorrection:
             fitted_bins=np.asarray(d["fitted_bins"], dtype=int),
             n_fitted_source=np.asarray(d["n_fitted_source"], dtype=int),
             n_fitted_target=np.asarray(d["n_fitted_target"], dtype=int),
+            bin_rc=np.asarray(d["bin_rc"], dtype=np.float64),
+            extrapolation=d.get("extrapolation", "constant"),
         )
 
 
@@ -219,6 +225,7 @@ def fit_posterior_correction(
     fit_bins: Optional[Sequence[int]] = None,
     n_quantile_grid: int = N_QUANTILE_GRID_DEFAULT,
     min_per_bin: int = 200,
+    extrapolation: str = "constant",
 ) -> PosteriorCorrection:
     """Fit the `p_AC` correction on signal-free rows only.
 
@@ -287,12 +294,55 @@ def fit_posterior_correction(
     # shifts with RC, and a value at its own bin's median can sit at the
     # pooled distribution's 95th percentile. Instead each bin keeps its own
     # source quantiles and borrows only the quantile-wise shift
-    # `target - source` averaged over the fitted bins, which is exactly what
-    # "the gap is constant in RC" means operationally.
-    delta = np.mean([target_q[b] - source_q[b] for b in fitted], axis=0)
+    # `target - source` from the fitted bins.
+    #
+    # How that shift is carried across RC matters. A constant shift assumes
+    # the discrepancy does not vary with RC; measured on the real data it
+    # does -- the `p_AC = 1.0` atom is 4.1x oversized at the least conserved
+    # fitted bin and 3.1x at the most conserved one. Extrapolating the
+    # constant therefore over-spreads the atom in conserved bins, stripping
+    # out exactly the draws a score needs to reach the extreme tail
+    # (`RC + p_AC` near 2) and leaving the null too cold where thresholds
+    # sit -- held-out O/E runs 0.58 at alpha 1e-3 where 1.0 is correct.
+    #
+    # `extrapolation="linear"` fits that trend per quantile instead, and was
+    # MEASURED TO BE WORSE in every configuration tried. Held-out O/E at
+    # alpha 1e-2 / 1e-3 / 3e-4:
+    #     constant, bins 0-2 -> 3,4        1.12  0.58  0.59
+    #     linear,   bins 0-2 -> 3,4        0.35  0.10  0.00
+    #     linear,   bins 1-2 -> 3,4        0.76  0.43  0.37   (bin 0 excluded)
+    #     constant, bins 0-3 -> 4          0.96  0.25  0.00
+    #     linear,   bins 1-3 -> 4          0.28  0.00  0.00
+    # A per-quantile straight line over 2-4 bins spanning a narrow RC range
+    # has too much slope variance to extrapolate, and bin 0's anomalously
+    # small gap (0.0145 against 0.039-0.049) tilts the slope positive --
+    # predicting LARGER shifts at high RC, the opposite of what the atom
+    # ratio implies. The option is kept only so this is not re-attempted;
+    # `constant` is the default and the better of the two.
+    bin_rc = np.array([
+        float(np.nanmedian(null_rc[null_bins == b])) if (null_bins == b).any() else np.nan
+        for b in range(n_bins)
+    ])
+    deltas = np.stack([target_q[b] - source_q[b] for b in fitted])   # [n_fit, n_grid]
+    if extrapolation == "constant" or len(fitted) < 3:
+        predict = lambda rc: deltas.mean(axis=0)  # noqa: E731
+    elif extrapolation == "linear":
+        x = bin_rc[fitted]
+        ok = np.isfinite(x)
+        # One straight line per quantile position, across the fitted bins.
+        slope, intercept = np.polyfit(x[ok], deltas[ok], deg=1)
+        predict = lambda rc: intercept + slope * rc  # noqa: E731
+    else:
+        raise ValueError(
+            f"extrapolation must be 'linear' or 'constant', got {extrapolation!r}."
+        )
+
     for b in range(n_bins):
         if b not in fitted:
-            target_q[b] = np.maximum.accumulate(np.clip(source_q[b] + delta, 0.0, 1.0))
+            rc_b = bin_rc[b] if np.isfinite(bin_rc[b]) else float(np.nanmedian(bin_rc[fitted]))
+            target_q[b] = np.maximum.accumulate(
+                np.clip(source_q[b] + predict(rc_b), 0.0, 1.0)
+            )
 
     pooled_source = np.mean([source_q[b] for b in fitted], axis=0)
     pooled_target = np.mean([target_q[b] for b in fitted], axis=0)
@@ -307,6 +357,8 @@ def fit_posterior_correction(
         fitted_bins=np.asarray(fitted, dtype=int),
         n_fitted_source=np.asarray(n_src, dtype=int),
         n_fitted_target=np.asarray(n_tgt, dtype=int),
+        bin_rc=bin_rc,
+        extrapolation=extrapolation,
     )
 
 

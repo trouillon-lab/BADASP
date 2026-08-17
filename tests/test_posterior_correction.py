@@ -215,3 +215,19 @@ def test_refuses_when_no_bin_has_enough_data(synthetic):
     with pytest.raises(ValueError, match="cannot fit a correction"):
         fit_posterior_correction(null_rc[:10], null_p[:10], obs_rc[:10], obs_p[:10],
                                  min_per_bin=200)
+
+
+def test_constant_extrapolation_is_the_default(synthetic):
+    """`linear` was measured worse in every configuration on the real data
+    (see fit_posterior_correction's comment), so the default must not drift
+    back to it."""
+    obs_rc, obs_p, null_rc, null_p = synthetic
+    c = fit_posterior_correction(null_rc, null_p, obs_rc, obs_p)
+    assert c.extrapolation == "constant"
+
+
+def test_unknown_extrapolation_is_rejected(synthetic):
+    obs_rc, obs_p, null_rc, null_p = synthetic
+    with pytest.raises(ValueError, match="extrapolation must be"):
+        fit_posterior_correction(null_rc, null_p, obs_rc, obs_p,
+                                 fit_bins=[0, 1, 2, 3], extrapolation="quadratic")
