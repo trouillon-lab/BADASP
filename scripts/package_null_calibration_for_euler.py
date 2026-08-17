@@ -191,28 +191,30 @@ SCORE_LAPTOP_LOADED_MINUTES_HIGH = 46
 SIMULATE_WALLTIME_SAFETY_FACTOR = 1.6
 SIMULATE_MEM_HEADROOM_GB = 1.0
 
-# Sized for CO-LOCATED tasks, which is the case that actually fails.
+# Sized for a SHARED node, because that is what determines whether a task
+# finishes, and it is outside our control.
 #
-# Measured on job 10920406, and the pattern is exact: every task that ran
-# alone on a node COMPLETED (2:06:38 on eu-a2p-417, 1:56:53 on 344, 1:50:12
-# on 485), and every task that shared a node with a sibling TIMED OUT
-# (tasks 2+3 on eu-a2p-409, tasks 5+6 on eu-a2p-430, all four still
-# unfinished at 4:26). Two ASR processes on one node more than double each
-# other's wall-clock -- the workload is memory-bandwidth-bound, and a node's
-# memory bus is shared even though its cores are not.
+# Evidence, job 10920406 then 10961546:
+#   * tasks alone on a node completed in 1:50-2:07; tasks sharing a node
+#     with a sibling were still unfinished at 4:26 and were killed.
+#   * eu-a2p-279, running 10 of our tasks, showed a load average of 90.8 on
+#     128 cores. Our 10 tasks account for ~12 of that. The rest is other
+#     users' work, so per-task wall-clock is set mostly by how busy the node
+#     happens to be -- which also means the clean "solo completed,
+#     co-located timed out" split above is partly confounded: a node with
+#     room for two of our tasks was simply a different, busier node.
 #
-# An earlier revision of this comment claimed the bandwidth effect was a
-# laptop artifact that "does not transfer to a cluster" because SLURM
-# spreads tasks across nodes. That was wrong: SLURM spreads them, but it
-# also PACKS two onto one node whenever that fits, which is exactly the
-# harmful case.
+# Two rejected alternatives. --exclusive removes all contention but reserves
+# ~128 cores to run a 2-thread task, 25-60x the allocation of tolerating it.
+# Requesting extra cpus-per-task does not help either: cgroup CPU limits do
+# not reserve memory bandwidth, which is the actual contended resource.
 #
-# --exclusive would prevent it outright but reserves ~128 cores to run a
-# 2-thread task: 25-60x the allocation of simply tolerating the contention.
-# So the request stays at 2 CPUs and the walltime covers the slow case
-# instead: 2.7 x 8,396 s = 6:17:49, i.e. ~3x the solo time and comfortably
-# past the 4:26 at which co-located tasks were still running.
-SCORE_WALLTIME_SAFETY_FACTOR = 2.7
+# So: keep the honest 2-CPU request and let the walltime absorb the
+# variance. This holds only 2 cores per task, so an over-request costs queue
+# priority and nothing else, whereas a timeout discards the whole task
+# including ASR already completed -- which has now happened twice.
+# 5.0 x 8,396 s = 11:39:40, about 6x the solo time.
+SCORE_WALLTIME_SAFETY_FACTOR = 5.0
 SCORE_MEM_HEADROOM_GB = 0.6
 
 # Alignments produced per simulate array task. At the conservative 1350 s
