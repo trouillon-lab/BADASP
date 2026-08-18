@@ -72,41 +72,45 @@ def branch_arrays(obs, cols, n_ac, want_ac):
     return o_rc, o_p, n_rc, n_p
 
 
-def fig_distribution(obs, cols, n_ac, out_path):
+def fig_distribution(obs, cols, n_ac, out_path, panel1="histogram"):
     o_rc, o_p, n_rc, n_p = branch_arrays(obs, cols, n_ac, -1.0)
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
 
     ax = axes[0]
-    # Full 0-1 range, not a zoom on the tail: a third of the observed values
-    # lie below 0.90, and cropping there makes p_AC look far more
-    # concentrated near 1 than it is. Values at exactly 1.0 are drawn as a
-    # separate pair of bars, because a point mass has no density.
-    # Cumulative rather than a histogram: it reads off directly how much mass
-    # sits below any value, and the point mass at exactly 1.0 shows up as the
-    # vertical jump at the right edge instead of being invisible.
     o_atom, n_atom = float((o_p == 1.0).mean()), float((n_p == 1.0).mean())
-    grid = np.linspace(0.0, 1.0, 501)
-    for values, colour, label in ((o_p, OBS_COLOUR, "observed"),
-                                  (n_p, NULL_COLOUR, "simulated null")):
-        v = np.sort(values[np.isfinite(values)])
-        # P(p_AC < x), so the jump to 1.0 at the right edge IS the point mass.
-        ax.step(grid, np.searchsorted(v, grid, side="left") / len(v),
-                where="post", lw=2, color=colour, label=label)
-    for frac, colour in ((1 - o_atom, OBS_COLOUR), (1 - n_atom, NULL_COLOUR)):
-        ax.plot([1.0, 1.0], [frac, 1.0], lw=3, color=colour, alpha=0.9)
-    ax.axvline(0.90, ls=":", color="grey", lw=1)
-    ax.text(0.87, 0.50,
-            f"below 0.90:\nobserved {np.mean(o_p < 0.90):.0%}\nnull {np.mean(n_p < 0.90):.0%}",
-            fontsize=7, ha="right", va="center")
-    ax.annotate(
-        f"vertical jump at exactly 1.0\n= the 'atom' (a point mass):\n"
-        f"observed {o_atom:.1%}, null {n_atom:.1%}  ({n_atom / o_atom:.1f}x)",
-        xy=(1.0, 1 - n_atom * 0.6), xytext=(0.44, 0.13), fontsize=7,
-        arrowprops=dict(arrowstyle="->", lw=1, color="black"))
-    ax.set_xlim(0.0, 1.06); ax.set_ylim(0, 1.04)
-    ax.set_xlabel("posterior probability of the ancestral call, $p_{AC}$")
-    ax.set_ylabel("cumulative fraction of branches")
-    ax.set_title("Where ancestors differ (AC = $-$1)", fontsize=9)
+    below = 0.90
+    if panel1 == "histogram":
+        # Zoomed on [0.90, 1.0] because that is where the two distributions
+        # visibly separate. The crop hides about a third of the observed
+        # values, so the fraction below the window is stated on the panel
+        # rather than left for a reader to assume it is negligible.
+        bins = np.linspace(below, 1.0, 41)
+        ax.hist(o_p[o_p < 1.0], bins=bins, density=True, histtype="step",
+                lw=2, color=OBS_COLOUR, label="observed")
+        ax.hist(n_p[n_p < 1.0], bins=bins, density=True, histtype="step",
+                lw=2, color=NULL_COLOUR, label="simulated null")
+        ax.set_xlabel("posterior probability of the ancestral call, $p_{AC}$")
+        ax.set_ylabel("density of values below 1.0")
+        ax.set_title(
+            "Where ancestors differ (AC = $-$1)\n"
+            f"point mass at exactly 1.0: observed {o_atom:.1%}, "
+            f"null {n_atom:.1%}  ({n_atom / o_atom:.1f}x)\n"
+            f"view cropped at {below}; below it lie {np.mean(o_p < below):.0%} "
+            f"of observed and {np.mean(n_p < below):.0%} of null values",
+            fontsize=8)
+    else:
+        grid = np.linspace(0.0, 1.0, 501)
+        for values, colour, label in ((o_p, OBS_COLOUR, "observed"),
+                                      (n_p, NULL_COLOUR, "simulated null")):
+            v = np.sort(values[np.isfinite(values)])
+            ax.step(grid, np.searchsorted(v, grid, side="left") / len(v),
+                    where="post", lw=2, color=colour, label=label)
+        for frac, colour in ((1 - o_atom, OBS_COLOUR), (1 - n_atom, NULL_COLOUR)):
+            ax.plot([1.0, 1.0], [frac, 1.0], lw=3, color=colour, alpha=0.9)
+        ax.set_xlim(0.0, 1.06); ax.set_ylim(0, 1.04)
+        ax.set_xlabel("posterior probability of the ancestral call, $p_{AC}$")
+        ax.set_ylabel("cumulative fraction of branches")
+        ax.set_title("Where ancestors differ (AC = $-$1)", fontsize=9)
     ax.legend(fontsize=8, frameon=False, loc="upper left")
 
     ax = axes[1]
@@ -250,6 +254,11 @@ def main(argv=None) -> int:
     p.add_argument("--null-run-dir", type=Path, required=True)
     p.add_argument("--observed-scores", type=Path,
                    default=REPO_ROOT / "results/badasp_scoring/raw_node_scores.csv")
+    p.add_argument("--panel1", choices=["histogram", "cumulative"], default="histogram",
+                   help="Panel 1 style. 'histogram' zooms on [0.90, 1.0] where the "
+                        "distributions separate, stating on the panel what the crop "
+                        "hides. 'cumulative' shows the whole range with the point "
+                        "mass as a vertical jump.")
     p.add_argument("--out-dir", type=Path,
                    default=REPO_ROOT / "results/badasp_scoring/null_calibration/figures")
     args = p.parse_args(argv)
@@ -259,7 +268,7 @@ def main(argv=None) -> int:
     print(f"{n_rep} null replicates, {len(obs):,} observed tests")
 
     for name, fn in (
-        ("p_ac_distribution.png", lambda pth: fig_distribution(obs, cols, n_ac, pth)),
+        ("p_ac_distribution.png", lambda pth: fig_distribution(obs, cols, n_ac, pth, panel1=args.panel1)),
         ("pac_sign_flip.png", lambda pth: fig_sign_flip(obs, cols, n_ac, n_rep, pth)),
         ("pac_correction.png", lambda pth: fig_correction(obs, cols, n_ac, n_rep, pth)),
     ):
