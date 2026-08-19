@@ -58,7 +58,10 @@ RESERVED_INDEX=$(( 101 + SLURM_ARRAY_TASK_ID ))
 SEED=$(( 20260731 + RESERVED_INDEX * 100003 ))
 DIR=$OUT/inv_${RESERVED_INDEX}
 mkdir -p "$DIR"
+# simulate_null_persite.py names its output "sim_1.fa" when --num-alignments > 1
+# but plain "sim.fa" when it is 1, so accept either.
 SIM_FA=$DIR/sim_1.fa
+[ -s "$SIM_FA" ] || SIM_FA=$DIR/sim.fa
 NPZ=$OUT/gamma_inv${RESERVED_INDEX}.npz
 WORK=$DIR/work
 
@@ -78,6 +81,7 @@ if [ ! -s "$SIM_FA" ]; then
     --threads $SLURM_CPUS_PER_TASK \
     --redo
   SIMSTATUS=$?
+  [ -s "$SIM_FA" ] || SIM_FA=$DIR/sim.fa
   if [ $SIMSTATUS -ne 0 ] || [ ! -s "$SIM_FA" ]; then
     echo "simulate failed (status $SIMSTATUS) or produced no $SIM_FA" >&2; exit 1
   fi
