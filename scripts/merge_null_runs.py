@@ -291,7 +291,9 @@ def main(argv=None) -> int:
         print(f"Wrote {args.report_json}")
     if args.check_only:
         # Exit status carries the verdict so a shell gate can branch on it:
-        # 0 comparable, 1 not comparable, 2 undetermined.
+        # 0 comparable, EXIT_NOT_COMPARABLE not comparable, EXIT_UNDETERMINED
+        # undetermined. Those are 3 and 4, deliberately not 1 or 2 so they cannot
+        # be confused with argparse's exit 2 or a plain SystemExit's exit 1.
         return {True: 0,
                 False: EXIT_NOT_COMPARABLE,
                 None: EXIT_UNDETERMINED}[tails["comparable"]]

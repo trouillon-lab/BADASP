@@ -722,9 +722,17 @@ def conditioned_bin_threshold_dict(
     """Project the conditioned rule onto the legacy
     ``{(event_type, clade_bin): raw threshold}`` dict.
 
-    This is LOSSY and is provided only so the four downstream analysis
-    scripts keep running unmodified: the real rule also varies by position,
-    which this dict cannot express. `per_test_calls.csv` is the source of
+    This is LOSSY: the real rule also varies by position, which this dict
+    cannot express.
+
+    NOTE on who consumes it: nothing does. Every one of the seven downstream
+    analysis scripts recomputes its own thresholds via
+    `calculate_bin_thresholds` (e.g. analyze_clade_enrichments.py) rather than
+    reading `legacy_bin_thresholds.json`, so emitting this file does not make
+    them honour the calibration. The consequence is that the downstream
+    analyses currently apply the percentile rule no matter what this script
+    decides. `per_test_calls.csv` is the source of truth and is what a
+    downstream consumer would have to read. `per_test_calls.csv` is the source of
     truth. The projection reports, for each clade-size bin, the raw-score
     threshold a position in the COLD group would have to clear -- the cold
     group because it holds the large majority of positions, so this is the
@@ -1879,10 +1887,10 @@ def main(argv=None) -> int:
         diagnostics["head_to_head_vs_percentile_rule"]["threshold_source"] = diag_threshold_source
 
     # --- Legacy bin-threshold dict (compatibility shim) ---------------------
-    # The four downstream analysis scripts consume
-    # {(event_type, clade_bin): raw threshold}. Keep emitting it so they run
-    # unmodified, but it cannot express the position component -- see
-    # conditioned_bin_threshold_dict's docstring.
+    # Emitted for any consumer that wants the legacy
+    # {(event_type, clade_bin): raw threshold} shape. No script in this repo
+    # actually reads it -- see conditioned_bin_threshold_dict's docstring for
+    # what that implies -- and it cannot express the position component.
     if model is not None and result.t is not None:
         _, bin_provenance = conditioned_bin_threshold_dict(
             keys, result.t, tail, model,
