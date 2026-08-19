@@ -829,3 +829,130 @@ def test_describe_threshold_raises_on_mismatched_shapes() -> None:
     null_right2 = np.zeros((R, n + 1))  # mismatched null shape
     with pytest.raises(ValueError):
         describe_threshold(0.0, obs_left, obs_right2, null_left, null_right2)
+
+
+# ---------------------------------------------------------------------------
+# describe_threshold: nonparametric bootstrap interval
+# ---------------------------------------------------------------------------
+#
+# Added after a measurement on the pooled 41-replicate null (see
+# results/badasp_scoring/null_calibration/pooled_41/) showed the two-state
+# mixture model does not hold there (its own falsifier fires) and that
+# negative binomial / gamma / lognormal fits to V are all rejected by a
+# one-sample KS test and undershoot the empirical 90th percentile. The
+# mixture code is unchanged -- it is expected to keep self-reporting via its
+# falsifiers -- but the primary interval is now this bootstrap instead.
+
+
+def _bootstrap_fixture(rng_seed: int = RNG_SEED + 200, n: int = 400, R: int = 25):
+    rng = np.random.default_rng(rng_seed)
+    obs_left = rng.normal(0, 1, size=n)
+    obs_right = rng.normal(0, 1, size=n)
+    null_left = rng.normal(0, 1, size=(R, n))
+    null_right = rng.normal(0, 1, size=(R, n))
+    return obs_left, obs_right, null_left, null_right
+
+
+def test_bootstrap_requires_seed_when_requested() -> None:
+    obs_left, obs_right, null_left, null_right = _bootstrap_fixture()
+    with pytest.raises(ValueError):
+        describe_threshold(0.5, obs_left, obs_right, null_left, null_right, n_bootstrap=100)
+
+
+def test_bootstrap_same_seed_reproducible_different_seed_differs() -> None:
+    obs_left, obs_right, null_left, null_right = _bootstrap_fixture()
+    d1 = describe_threshold(0.5, obs_left, obs_right, null_left, null_right, n_bootstrap=500, bootstrap_seed=7)
+    d2 = describe_threshold(0.5, obs_left, obs_right, null_left, null_right, n_bootstrap=500, bootstrap_seed=7)
+    d3 = describe_threshold(0.5, obs_left, obs_right, null_left, null_right, n_bootstrap=500, bootstrap_seed=8)
+
+    assert d1.bootstrap == d2.bootstrap
+    assert d1.bootstrap != d3.bootstrap
+
+
+def test_bootstrap_interval_brackets_point_estimate() -> None:
+    obs_left, obs_right, null_left, null_right = _bootstrap_fixture(n=2000, R=60)
+    desc = describe_threshold(
+        0.5, obs_left, obs_right, null_left, null_right, fdp_quantile=0.90, n_bootstrap=5000, bootstrap_seed=99
+    )
+    boot = desc.bootstrap
+    assert boot["mean_fdp_ci_low"] <= desc.fdp_mean <= boot["mean_fdp_ci_high"]
+    assert boot["fdp_quantile_ci_low"] <= desc.fdp_quantile_achieved <= boot["fdp_quantile_ci_high"]
+
+
+def test_bootstrap_unit_group_without_groups_raises() -> None:
+    obs_left, obs_right, null_left, null_right = _bootstrap_fixture()
+    with pytest.raises(ValueError):
+        describe_threshold(
+            0.5, obs_left, obs_right, null_left, null_right,
+            n_bootstrap=100, bootstrap_seed=1, bootstrap_unit="group",
+        )
+
+
+def test_bootstrap_unit_invalid_raises() -> None:
+    obs_left, obs_right, null_left, null_right = _bootstrap_fixture()
+    groups = np.arange(len(null_left))
+    with pytest.raises(ValueError):
+        describe_threshold(
+            0.5, obs_left, obs_right, null_left, null_right,
+            n_bootstrap=100, bootstrap_seed=1, bootstrap_unit="bogus", groups=groups,
+        )
+
+
+def test_bootstrap_group_matches_replicate_when_groups_are_singletons() -> None:
+    """With every group of size 1, drawing groups with replacement is the
+    same resampling scheme as drawing replicates with replacement, so for a
+    fixed seed the two intervals must agree exactly."""
+    obs_left, obs_right, null_left, null_right = _bootstrap_fixture(n=500, R=20)
+    R = null_left.shape[0]
+    singleton_groups = np.arange(R)  # one replicate per group
+
+    d_replicate = describe_threshold(
+        0.5, obs_left, obs_right, null_left, null_right, n_bootstrap=1000, bootstrap_seed=2026,
+    )
+    d_group = describe_threshold(
+        0.5, obs_left, obs_right, null_left, null_right,
+        n_bootstrap=1000, bootstrap_seed=2026, bootstrap_unit="group", groups=singleton_groups,
+    )
+
+    assert d_group.bootstrap["resample_unit"] == "group"
+    assert d_replicate.bootstrap["mean_fdp_ci_low"] == pytest.approx(d_group.bootstrap["mean_fdp_ci_low"])
+    assert d_replicate.bootstrap["mean_fdp_ci_high"] == pytest.approx(d_group.bootstrap["mean_fdp_ci_high"])
+    assert d_replicate.bootstrap["fdp_quantile_ci_low"] == pytest.approx(d_group.bootstrap["fdp_quantile_ci_low"])
+    assert d_replicate.bootstrap["fdp_quantile_ci_high"] == pytest.approx(d_group.bootstrap["fdp_quantile_ci_high"])
+
+
+def test_bootstrap_to_dict_round_trips_through_json() -> None:
+    obs_left, obs_right, null_left, null_right = _bootstrap_fixture()
+    desc = describe_threshold(0.5, obs_left, obs_right, null_left, null_right, n_bootstrap=200, bootstrap_seed=3)
+    payload = json.dumps(desc.to_dict())
+    round_tripped = json.loads(payload)
+    assert round_tripped["bootstrap"]["n_bootstrap"] == 200
+    assert round_tripped["bootstrap"]["seed"] == 3
+    assert round_tripped["bootstrap"]["resample_unit"] == "replicate"
+    assert set(round_tripped["bootstrap"]) == {
+        "n_bootstrap", "seed", "ci_level", "resample_unit",
+        "mean_fdp_ci_low", "mean_fdp_ci_high", "fdp_quantile_ci_low", "fdp_quantile_ci_high",
+    }
+
+
+def test_bootstrap_off_by_default_leaves_other_fields_unchanged() -> None:
+    """n_bootstrap=0 (the default) must produce bootstrap=None and every
+    other field identical to calling describe_threshold without any of the
+    new keyword arguments at all."""
+    obs_left, obs_right, null_left, null_right = _bootstrap_fixture()
+
+    baseline = describe_threshold(0.5, obs_left, obs_right, null_left, null_right)
+    explicit_off = describe_threshold(
+        0.5, obs_left, obs_right, null_left, null_right,
+        n_bootstrap=0, bootstrap_seed=None, bootstrap_unit="replicate",
+    )
+
+    assert baseline.bootstrap is None
+    assert explicit_off.bootstrap is None
+    for field in (
+        "t", "O", "R", "E_fp", "E_fp_over_O", "O_over_E_fp", "fdp_mean", "fdp_median",
+        "fdp_min", "fdp_max", "fdp_quantile", "fdp_quantile_achieved", "mc_pvalue",
+        "n_ge_observed", "labels", "label_summary", "mixture", "group_composition", "notes",
+    ):
+        assert getattr(baseline, field) == getattr(explicit_off, field)
+    assert np.array_equal(baseline.V, explicit_off.V)

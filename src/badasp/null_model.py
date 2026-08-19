@@ -534,6 +534,13 @@ class ThresholdDescription:
         supplied to `describe_threshold`.
     notes : free-text caveats attached during computation (e.g. when the
         null produces more calls than were observed).
+    bootstrap : optional nonparametric bootstrap interval on the mean and
+        `fdp_quantile`-th percentile of `V / max(O, 1)`, present only when
+        `n_bootstrap > 0` was passed to `describe_threshold`. This is
+        deliberately separate from `mixture`: the two-state mixture interval
+        is a *model* of the between-replicate spread that can fail (see its
+        falsifiers), while this bootstrap interval assumes nothing about the
+        shape of that spread.
     """
 
     t: float
@@ -556,6 +563,7 @@ class ThresholdDescription:
     mixture: Optional[dict]
     group_composition: Optional[dict]
     notes: List[str]
+    bootstrap: Optional[dict] = None
 
     def to_dict(self) -> dict:
         """JSON-serialisable dict (numpy arrays -> lists, numpy scalars -> Python)."""
@@ -580,6 +588,7 @@ class ThresholdDescription:
             "mixture": None if self.mixture is None else _jsonable(self.mixture),
             "group_composition": None if self.group_composition is None else _jsonable(self.group_composition),
             "notes": list(self.notes),
+            "bootstrap": None if self.bootstrap is None else _jsonable(self.bootstrap),
         }
 
 
@@ -594,6 +603,9 @@ def describe_threshold(
     groups: Optional[np.ndarray] = None,
     fdp_quantile: float = 0.90,
     ci_level: float = 0.95,
+    n_bootstrap: int = 0,
+    bootstrap_seed: Optional[int] = None,
+    bootstrap_unit: str = "replicate",
 ) -> ThresholdDescription:
     """Describe the error rate of a threshold `t` chosen outside this module.
 
@@ -673,6 +685,40 @@ def describe_threshold(
     replicates came from it and how many of those are high-state — purely
     descriptive counts, no ICC or test statistic is computed here.
 
+    Nonparametric bootstrap interval (optional, off by default)
+    -------------------------------------------------------------
+    The `mixture` interval above is a two-state *model* of the spread of
+    `V_r`, and it self-reports via `mixture["falsifiers"]` when that model
+    does not hold on a given dataset. When `n_bootstrap > 0`, a second,
+    model-free interval is computed instead by resampling the R
+    per-replicate `V` values with replacement `n_bootstrap` times and taking
+    the `ci_level` percentile interval of the resampled mean and of the
+    resampled `fdp_quantile`-th percentile (both expressed as `fdp`, i.e.
+    divided by `max(O, 1)`). This assumes nothing about the shape of the
+    between-replicate distribution, at the cost of not being usable to
+    describe a labelled two-state split the way `mixture` is.
+
+    `bootstrap_seed` is required (not `None`) whenever `n_bootstrap > 0`, so
+    that a reported interval is always reproducible from the stored seed
+    rather than depending on unlogged global RNG state.
+
+    `bootstrap_unit` controls the resampling unit:
+
+    * `"replicate"` (default): resample individual replicates' `V` values.
+    * `"group"`: requires `groups`; resample whole groups (as named by
+      `groups`) with replacement and concatenate the `V` values of the drawn
+      groups, so the resampled sample size varies naturally with how many
+      replicates the drawn groups happen to contain. Use this to check
+      whether within-group correlation (e.g. multiple replicates from the
+      same simulate invocation) makes the replicate-level interval too
+      narrow — this is an open empirical question, not assumed either way.
+
+    The result is stored in the `bootstrap` field as a dict with keys
+    `n_bootstrap`, `seed`, `ci_level`, `resample_unit`, `mean_fdp_ci_low`,
+    `mean_fdp_ci_high`, `fdp_quantile_ci_low`, `fdp_quantile_ci_high`.
+    `bootstrap` is `None` when `n_bootstrap == 0` (the default), leaving
+    every other field exactly as it was before this option existed.
+
     Parameters
     ----------
     t : float
@@ -686,9 +732,18 @@ def describe_threshold(
     groups : Optional[np.ndarray], shape (R,)
         Which simulate invocation each replicate came from.
     fdp_quantile : float
-        Quantile level of `V / max(O, 1)` to report as `fdp_quantile_achieved`.
+        Quantile level of `V / max(O, 1)` to report as `fdp_quantile_achieved`
+        (and, when bootstrapping, as `fdp_quantile_ci_low`/`_ci_high`).
     ci_level : float
-        Confidence level for the Clopper-Pearson interval on `pi_hat`.
+        Confidence level for the Clopper-Pearson interval on `pi_hat`, and
+        (when `n_bootstrap > 0`) for the bootstrap percentile interval.
+    n_bootstrap : int
+        Number of bootstrap resamples. `0` (default) skips the bootstrap
+        entirely.
+    bootstrap_seed : Optional[int]
+        Seed for `np.random.default_rng`. Required whenever `n_bootstrap > 0`.
+    bootstrap_unit : str
+        `"replicate"` (default) or `"group"`. See above.
 
     Returns
     -------
@@ -851,8 +906,61 @@ def describe_threshold(
                     "n": int(mask.sum()),
                     "n_high": int(np.sum(labels_arr[mask])),
                 }
-    elif groups is not None:
+    elif groups is not None and not (n_bootstrap > 0 and bootstrap_unit == "group"):
         notes.append("groups was provided without labels; group_composition requires both and was not computed.")
+
+    bootstrap: Optional[dict] = None
+    if n_bootstrap < 0:
+        raise ValueError("n_bootstrap must be >= 0.")
+    if n_bootstrap > 0:
+        if bootstrap_seed is None:
+            raise ValueError(
+                "bootstrap_seed must be given (not None) whenever n_bootstrap > 0, "
+                "so a reported bootstrap interval is always reproducible."
+            )
+        if bootstrap_unit not in ("replicate", "group"):
+            raise ValueError(f"bootstrap_unit must be 'replicate' or 'group', got {bootstrap_unit!r}.")
+        if bootstrap_unit == "group" and groups is None:
+            raise ValueError("bootstrap_unit='group' requires groups to be given.")
+
+        boot_rng = np.random.default_rng(bootstrap_seed)
+        boot_means = np.empty(n_bootstrap, dtype=np.float64)
+        boot_quantiles = np.empty(n_bootstrap, dtype=np.float64)
+
+        if bootstrap_unit == "replicate":
+            for b in range(n_bootstrap):
+                resample = boot_rng.choice(V, size=R, replace=True)
+                boot_means[b] = resample.mean()
+                boot_quantiles[b] = np.quantile(resample, fdp_quantile)
+            resample_unit = "replicate"
+        else:  # "group"
+            groups_arr_b = np.asarray(groups)
+            if groups_arr_b.shape[0] != R:
+                raise ValueError("groups must have length R (one entry per null replicate).")
+            unique_groups_b = np.unique(groups_arr_b)
+            group_to_V = {g: V[groups_arr_b == g] for g in unique_groups_b}
+            for b in range(n_bootstrap):
+                drawn = boot_rng.choice(unique_groups_b, size=unique_groups_b.shape[0], replace=True)
+                resample = np.concatenate([group_to_V[g] for g in drawn])
+                boot_means[b] = resample.mean()
+                boot_quantiles[b] = np.quantile(resample, fdp_quantile)
+            resample_unit = "group"
+
+        boot_mean_fdp = boot_means / O_safe
+        boot_quantile_fdp = boot_quantiles / O_safe
+        alpha_b = 1.0 - ci_level
+        lo_pct = 100.0 * alpha_b / 2.0
+        hi_pct = 100.0 * (1.0 - alpha_b / 2.0)
+        bootstrap = {
+            "n_bootstrap": int(n_bootstrap),
+            "seed": int(bootstrap_seed),
+            "ci_level": float(ci_level),
+            "resample_unit": resample_unit,
+            "mean_fdp_ci_low": float(np.percentile(boot_mean_fdp, lo_pct)),
+            "mean_fdp_ci_high": float(np.percentile(boot_mean_fdp, hi_pct)),
+            "fdp_quantile_ci_low": float(np.percentile(boot_quantile_fdp, lo_pct)),
+            "fdp_quantile_ci_high": float(np.percentile(boot_quantile_fdp, hi_pct)),
+        }
 
     return ThresholdDescription(
         t=t,
@@ -875,6 +983,7 @@ def describe_threshold(
         mixture=mixture,
         group_composition=group_composition,
         notes=notes,
+        bootstrap=bootstrap,
     )
 
 
