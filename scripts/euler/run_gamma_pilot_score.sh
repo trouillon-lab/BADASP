@@ -24,7 +24,7 @@ module load stack/2025-06 gcc/12.2.0
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
 ROOT=/cluster/project/beltrao/lucla/repos/badasp
-export PYTHONPATH="$ROOT/src:$ROOT:$PYTHONPATH"
+export PYTHONPATH="$ROOT/src:$ROOT:${PYTHONPATH:-}"
 OUT=$ROOT/results/badasp_scoring/null_calibration/gamma_pilot
 
 IDX=$SLURM_ARRAY_TASK_ID
