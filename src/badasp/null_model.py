@@ -80,6 +80,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from scipy.stats import beta
 
 # Arrays required in every rep_*.npz null-replicate file. See
 # `write_null_replicate` / `load_null_scores` docstrings for the exact format.
@@ -469,6 +470,495 @@ def threshold_at_fdr(
         sweep=sweep,
         note="",
     )
+
+
+# ---------------------------------------------------------------------------
+# Threshold description: report an error rate for an externally chosen t
+# ---------------------------------------------------------------------------
+#
+# `threshold_at_fdr` above SELECTS a threshold: it sweeps a grid and returns
+# `t=None` whenever no candidate meets the criterion, which silently drops
+# the case entirely. The functions below never select anything. They take a
+# threshold `t` that the caller already picked by some external rule (e.g. a
+# fixed number of calls the downstream analysis wants to make) and describe
+# what that specific choice costs against the same simulation-based null,
+# so a number is always reported even when it is an unflattering one.
+
+
+def _jsonable(obj: object) -> object:
+    """Recursively convert numpy containers to plain Python for `json.dumps`.
+
+    Arrays become lists, numpy scalars (including `np.bool_`) become the
+    corresponding Python `float`/`int`/`bool`, and dict keys that are numpy
+    scalars are converted the same way. Everything else passes through
+    unchanged.
+    """
+    if isinstance(obj, np.ndarray):
+        return [_jsonable(v) for v in obj.tolist()]
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, dict):
+        return {(k.item() if isinstance(k, np.generic) else k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    return obj
+
+
+@dataclass
+class ThresholdDescription:
+    """Error-rate description of a single, externally chosen threshold `t`.
+
+    Unlike `ThresholdResult`, `t` here is never `None` and is never selected
+    by this module — it is an input, describing whatever threshold the
+    caller's own rule (e.g. "call the top N") already settled on. Every
+    field is a *description* of that choice against the simulation-based
+    null, not a pass/fail verdict.
+
+    Fields
+    ------
+    t, O, R : the threshold itself, the observed exceedance count at it, and
+        the number of null replicates it was evaluated against.
+    V : shape (R,) int64, the per-replicate null exceedance count `V_r(t)`.
+    E_fp, E_fp_over_O, O_over_E_fp : mean of `V` and the two ways of ratioing
+        it against `O` (see `describe_threshold` for why both directions are
+        reported). `O_over_E_fp` is `None` when `E_fp == 0` (undefined ratio).
+    fdp_mean, fdp_median, fdp_min, fdp_max : summary of `V / max(O, 1)` across
+        replicates.
+    fdp_quantile, fdp_quantile_achieved : the requested quantile level
+        (echoed back) and the value of `V / max(O, 1)` actually achieved at
+        that level.
+    mc_pvalue, n_ge_observed : the Monte-Carlo p-value described in
+        `describe_threshold` and the raw count behind it.
+    labels, label_summary, mixture, group_composition : optional two-state
+        replicate bookkeeping, present only when `labels` (and `groups`) were
+        supplied to `describe_threshold`.
+    notes : free-text caveats attached during computation (e.g. when the
+        null produces more calls than were observed).
+    """
+
+    t: float
+    O: int
+    R: int
+    V: np.ndarray
+    E_fp: float
+    E_fp_over_O: float
+    O_over_E_fp: Optional[float]
+    fdp_mean: float
+    fdp_median: float
+    fdp_min: float
+    fdp_max: float
+    fdp_quantile: float
+    fdp_quantile_achieved: float
+    mc_pvalue: float
+    n_ge_observed: int
+    labels: Optional[np.ndarray]
+    label_summary: Optional[dict]
+    mixture: Optional[dict]
+    group_composition: Optional[dict]
+    notes: List[str]
+
+    def to_dict(self) -> dict:
+        """JSON-serialisable dict (numpy arrays -> lists, numpy scalars -> Python)."""
+        return {
+            "t": float(self.t),
+            "O": int(self.O),
+            "R": int(self.R),
+            "V": _jsonable(self.V),
+            "E_fp": float(self.E_fp),
+            "E_fp_over_O": float(self.E_fp_over_O),
+            "O_over_E_fp": None if self.O_over_E_fp is None else float(self.O_over_E_fp),
+            "fdp_mean": float(self.fdp_mean),
+            "fdp_median": float(self.fdp_median),
+            "fdp_min": float(self.fdp_min),
+            "fdp_max": float(self.fdp_max),
+            "fdp_quantile": float(self.fdp_quantile),
+            "fdp_quantile_achieved": float(self.fdp_quantile_achieved),
+            "mc_pvalue": float(self.mc_pvalue),
+            "n_ge_observed": int(self.n_ge_observed),
+            "labels": None if self.labels is None else _jsonable(self.labels),
+            "label_summary": None if self.label_summary is None else _jsonable(self.label_summary),
+            "mixture": None if self.mixture is None else _jsonable(self.mixture),
+            "group_composition": None if self.group_composition is None else _jsonable(self.group_composition),
+            "notes": list(self.notes),
+        }
+
+
+def describe_threshold(
+    t: float,
+    obs_left: np.ndarray,
+    obs_right: np.ndarray,
+    null_left: np.ndarray,
+    null_right: np.ndarray,
+    *,
+    labels: Optional[np.ndarray] = None,
+    groups: Optional[np.ndarray] = None,
+    fdp_quantile: float = 0.90,
+    ci_level: float = 0.95,
+) -> ThresholdDescription:
+    """Describe the error rate of a threshold `t` chosen outside this module.
+
+    This function never searches a grid and never returns `t=None`: `t` is
+    a required, fixed input, validated only for being finite. Its purpose is
+    the complement of `threshold_at_fdr` — instead of picking the smallest
+    threshold that clears a bar, it reports what a threshold someone already
+    committed to (e.g. "call the top N splits") actually costs against the
+    null.
+
+    Exceedance counting reuses the module's either-branch-exceeds rule via
+    `_split_statistic`: `O` is the number of observed splits with
+    `_split_statistic(obs_left, obs_right) >= t`, and `V[r]` is the identical
+    count for null replicate r, both ignoring NaN (a split with both
+    branches NaN never counts, same policy as `threshold_at_fdr`). Both
+    counts are obtained by sorting once and using `searchsorted` rather than
+    a per-element Python comparison loop, mirroring `threshold_at_fdr`'s
+    approach.
+
+    Monte-Carlo p-value
+    --------------------
+    ``mc_pvalue = (1 + #{r : V_r >= O}) / (1 + R)`` tests whether the
+    observed number of calls at this threshold is distinguishable from the
+    number of calls this same null produces on its own, i.e. whether `O` is
+    an outlier relative to the `V_r` distribution. Like `per_test_pvalues`,
+    the +1 in numerator and denominator means the smallest attainable value
+    is `1 / (1 + R)` — with R replicates you cannot report a smaller
+    Monte-Carlo p-value than that, no matter how extreme `O` is.
+
+    E_fp_over_O vs. O_over_E_fp
+    ----------------------------
+    `E_fp_over_O = mean(V) / max(O, 1)` is the usual false-discovery-style
+    ratio. `O_over_E_fp` is its reciprocal (`None` when `E_fp == 0`, since
+    the ratio is undefined). Both are reported, unclipped, because
+    `E_fp_over_O` can legitimately exceed 1: that happens when the null
+    alone produces more calls than the observed data contains, at which
+    point the quantity is no longer interpretable as a false-discovery
+    proportion (a proportion cannot exceed 1) but rather as evidence that
+    the null overshoots the observed data at this threshold. When that
+    happens a note is appended to `notes` rather than the value being
+    truncated to 1.
+
+    Two-state replicate labels (optional)
+    ---------------------------------------
+    Background: the between-replicate spread of `V_r` at a fixed threshold
+    has been observed to look like a two-state mixture (most replicates
+    cluster tightly, a minority sit several times higher) rather than a
+    smooth, normal-theory spread. If the caller supplies a boolean `labels`
+    array (length R, True = "high-state" replicate) reflecting that split,
+    this function reports:
+
+    * `label_summary`: per-group mean/sd of `V` (`sd` uses ddof=1, `None`
+      when a group has fewer than 2 members).
+    * `mixture`: `pi_hat = n_high / R`, a Clopper-Pearson exact binomial
+      interval on that proportion at `ci_level` (via
+      `scipy.stats.beta.ppf`), and the implied `fdp` at `pi_hat` and at each
+      interval endpoint, computed as
+      ``((1 - pi) * mean_V_low + pi * mean_V_high) / max(O, 1)``. The
+      interval is built from the *proportion of high-state replicates*
+      rather than a normal-theory standard error on `V_r` directly, because
+      the two-state pattern means the ordinary CLT-based SE is the wrong
+      description of the uncertainty here.
+    * `mixture["falsifiers"]`: three sanity checks on the label itself, not
+      on the mixture math — each is a `{"value": bool, "explanation": str}`
+      pair describing what a `True` value would mean:
+        - `"low_state_exceeds_high_minimum"`: a low-labelled replicate has
+          `V` at or above the minimum `V` among high-labelled replicates.
+        - `"n_high_below_2"`: fewer than 2 replicates are labelled
+          high-state, so the binomial interval is essentially uninformative.
+        - `"labels_not_separating"`: the `V` ranges of the two groups
+          overlap at all.
+      None of these being True is not proof the label is correct; any of
+      them being True is evidence the two-state label does not hold here.
+
+    If `groups` (length R, one invocation id per replicate) is supplied
+    together with `labels`, `group_composition` reports, per group, how many
+    replicates came from it and how many of those are high-state — purely
+    descriptive counts, no ICC or test statistic is computed here.
+
+    Parameters
+    ----------
+    t : float
+        The threshold to describe. Must be finite.
+    obs_left, obs_right : np.ndarray, shape (n,)
+        Observed branch scores.
+    null_left, null_right : np.ndarray, shape (R, n)
+        Null branch scores.
+    labels : Optional[np.ndarray], shape (R,), bool
+        True marks a "high-state" null replicate.
+    groups : Optional[np.ndarray], shape (R,)
+        Which simulate invocation each replicate came from.
+    fdp_quantile : float
+        Quantile level of `V / max(O, 1)` to report as `fdp_quantile_achieved`.
+    ci_level : float
+        Confidence level for the Clopper-Pearson interval on `pi_hat`.
+
+    Returns
+    -------
+    ThresholdDescription
+    """
+    if not np.isfinite(t):
+        raise ValueError(
+            "t must be finite: describe_threshold does not select a threshold, "
+            "it only describes one already chosen by the caller."
+        )
+
+    obs_left = np.asarray(obs_left, dtype=np.float64)
+    obs_right = np.asarray(obs_right, dtype=np.float64)
+    null_left = np.asarray(null_left, dtype=np.float64)
+    null_right = np.asarray(null_right, dtype=np.float64)
+
+    n = obs_left.shape[0]
+    if obs_right.shape[0] != n:
+        raise ValueError("obs_left and obs_right must have the same length.")
+    if null_left.shape != null_right.shape:
+        raise ValueError("null_left and null_right must have identical shape.")
+    if null_left.shape[1] != n:
+        raise ValueError(f"null arrays have {null_left.shape[1]} tests but observed arrays have {n}.")
+
+    R = null_left.shape[0]
+    t = float(t)
+
+    obs_stat = _split_statistic(obs_left, obs_right)
+    finite_obs = obs_stat[np.isfinite(obs_stat)]
+    sorted_valid_obs = np.sort(finite_obs)
+    O = int(finite_obs.size - np.searchsorted(sorted_valid_obs, t, side="left"))
+
+    null_stat = _split_statistic(null_left, null_right)  # (R, n)
+    sorted_null = np.sort(null_stat, axis=1)  # NaNs sort to the end of each row
+    valid_counts = np.sum(~np.isnan(null_stat), axis=1)  # (R,)
+    V = np.empty(R, dtype=np.int64)
+    for r in range(R):
+        vc = int(valid_counts[r])
+        row_valid = sorted_null[r, :vc]
+        idx = np.searchsorted(row_valid, t, side="left")
+        V[r] = vc - idx
+
+    notes: List[str] = []
+    E_fp = float(V.mean()) if R > 0 else float("nan")
+    O_safe = max(O, 1)
+    E_fp_over_O = E_fp / O_safe
+    O_over_E_fp = None if E_fp == 0 else O_safe / E_fp
+    if E_fp_over_O > 1:
+        notes.append(
+            f"E_fp_over_O = {E_fp_over_O:.4g} > 1: at this threshold the null produces "
+            "more calls than the observed data contains, so this ratio is not "
+            "interpretable as a false-discovery proportion."
+        )
+
+    fdp = V / O_safe
+    fdp_mean = float(fdp.mean())
+    fdp_median = float(np.median(fdp))
+    fdp_min = float(fdp.min())
+    fdp_max = float(fdp.max())
+    fdp_quantile_achieved = float(np.quantile(fdp, fdp_quantile))
+
+    n_ge_observed = int(np.sum(V >= O))
+    mc_pvalue = (1.0 + n_ge_observed) / (1.0 + R)
+
+    labels_arr: Optional[np.ndarray] = None
+    label_summary: Optional[dict] = None
+    mixture: Optional[dict] = None
+    group_composition: Optional[dict] = None
+
+    if labels is not None:
+        labels_arr = np.asarray(labels, dtype=bool)
+        if labels_arr.shape[0] != R:
+            raise ValueError("labels must have length R (one entry per null replicate).")
+
+        n_high = int(labels_arr.sum())
+        n_low = int(R - n_high)
+        V_high = V[labels_arr]
+        V_low = V[~labels_arr]
+
+        mean_V_high = float(V_high.mean()) if n_high > 0 else float("nan")
+        sd_V_high = float(V_high.std(ddof=1)) if n_high >= 2 else None
+        mean_V_low = float(V_low.mean()) if n_low > 0 else float("nan")
+        sd_V_low = float(V_low.std(ddof=1)) if n_low >= 2 else None
+
+        label_summary = {
+            "n_high": n_high,
+            "n_low": n_low,
+            "mean_V_high": mean_V_high,
+            "sd_V_high": sd_V_high,
+            "mean_V_low": mean_V_low,
+            "sd_V_low": sd_V_low,
+        }
+
+        alpha = 1.0 - ci_level
+        k = n_high
+        pi_hat = k / R
+        pi_low = 0.0 if k == 0 else float(beta.ppf(alpha / 2.0, k, R - k + 1))
+        pi_high = 1.0 if k == R else float(beta.ppf(1.0 - alpha / 2.0, k + 1, R - k))
+
+        def _fdp_at(pi: float) -> float:
+            return ((1.0 - pi) * mean_V_low + pi * mean_V_high) / O_safe
+
+        if n_high > 0 and n_low > 0:
+            high_min = float(V_high.min())
+            low_max = float(V_low.max())
+            high_max = float(V_high.max())
+            low_min = float(V_low.min())
+            low_state_exceeds_high_minimum = bool(np.any(V_low >= high_min))
+            labels_not_separating = not (low_max < high_min or high_max < low_min)
+        else:
+            low_state_exceeds_high_minimum = False
+            labels_not_separating = False
+
+        falsifiers = {
+            "low_state_exceeds_high_minimum": {
+                "value": bool(low_state_exceeds_high_minimum),
+                "explanation": (
+                    "If True, at least one low-labelled replicate has V at or above "
+                    "the minimum V among high-labelled replicates, meaning the "
+                    "two-state label does not cleanly separate replicates by V."
+                ),
+            },
+            "n_high_below_2": {
+                "value": bool(n_high < 2),
+                "explanation": (
+                    "If True, fewer than 2 replicates are labelled high-state, so "
+                    "the Clopper-Pearson interval on pi_hat is built from too few "
+                    "successes to be informative."
+                ),
+            },
+            "labels_not_separating": {
+                "value": bool(labels_not_separating),
+                "explanation": (
+                    "If True, the V ranges of the low- and high-labelled replicates "
+                    "overlap, so the two-state label is not a clean partition of the "
+                    "observed spread of V."
+                ),
+            },
+        }
+
+        mixture = {
+            "pi_hat": pi_hat,
+            "pi_low": pi_low,
+            "pi_high": pi_high,
+            "fdp_at_pi_hat": _fdp_at(pi_hat),
+            "fdp_at_pi_low": _fdp_at(pi_low),
+            "fdp_at_pi_high": _fdp_at(pi_high),
+            "falsifiers": falsifiers,
+        }
+
+        if groups is not None:
+            groups_arr = np.asarray(groups)
+            if groups_arr.shape[0] != R:
+                raise ValueError("groups must have length R (one entry per null replicate).")
+            group_composition = {}
+            for g in np.unique(groups_arr):
+                mask = groups_arr == g
+                key = g.item() if isinstance(g, np.generic) else g
+                group_composition[key] = {
+                    "n": int(mask.sum()),
+                    "n_high": int(np.sum(labels_arr[mask])),
+                }
+    elif groups is not None:
+        notes.append("groups was provided without labels; group_composition requires both and was not computed.")
+
+    return ThresholdDescription(
+        t=t,
+        O=O,
+        R=R,
+        V=V,
+        E_fp=E_fp,
+        E_fp_over_O=E_fp_over_O,
+        O_over_E_fp=O_over_E_fp,
+        fdp_mean=fdp_mean,
+        fdp_median=fdp_median,
+        fdp_min=fdp_min,
+        fdp_max=fdp_max,
+        fdp_quantile=float(fdp_quantile),
+        fdp_quantile_achieved=fdp_quantile_achieved,
+        mc_pvalue=mc_pvalue,
+        n_ge_observed=n_ge_observed,
+        labels=labels_arr,
+        label_summary=label_summary,
+        mixture=mixture,
+        group_composition=group_composition,
+        notes=notes,
+    )
+
+
+def describe_threshold_curve(
+    obs_left: np.ndarray,
+    obs_right: np.ndarray,
+    null_left: np.ndarray,
+    null_right: np.ndarray,
+    *,
+    call_counts: Iterable[int],
+    **kwargs: object,
+) -> pd.DataFrame:
+    """`describe_threshold` evaluated at a curve of externally chosen call counts.
+
+    For each `target` in `call_counts`, a threshold is derived purely from
+    the *observed* split statistic as
+    ``t = np.quantile(finite_obs, 1 - target / finite_obs.size)`` and passed
+    to `describe_threshold` unchanged (`target` never touches the null).
+    Because the observed statistic has ties and atoms, the resulting `O` at
+    that `t` is not guaranteed to equal `target` exactly — it is documented
+    here as an approximate correspondence, not an exact one.
+
+    All keyword arguments accepted by `describe_threshold`
+    (`labels`, `groups`, `fdp_quantile`, `ci_level`) may be passed through
+    via `**kwargs` and are applied identically to every row.
+
+    Parameters
+    ----------
+    obs_left, obs_right : np.ndarray, shape (n,)
+    null_left, null_right : np.ndarray, shape (R, n)
+    call_counts : Iterable[int]
+        Target observed-call counts to evaluate a threshold at.
+    **kwargs
+        Forwarded to `describe_threshold` (see its docstring).
+
+    Returns
+    -------
+    pd.DataFrame, one row per target in `call_counts`, sorted ascending by
+    `target_calls`, with columns:
+    ``target_calls, t, O, E_fp, E_fp_over_O, O_over_E_fp, fdp_median,
+    fdp_q<level>, fdp_min, fdp_max, mc_pvalue, n_ge_observed``, plus
+    ``pi_hat, fdp_at_pi_hat, fdp_at_pi_low, fdp_at_pi_high`` when `labels`
+    is among `kwargs`.
+    """
+    obs_left = np.asarray(obs_left, dtype=np.float64)
+    obs_right = np.asarray(obs_right, dtype=np.float64)
+    obs_stat = _split_statistic(obs_left, obs_right)
+    finite_obs = obs_stat[np.isfinite(obs_stat)]
+
+    fdp_quantile = float(kwargs.get("fdp_quantile", 0.90))
+    has_labels = kwargs.get("labels", None) is not None
+    fdp_col = f"fdp_q{fdp_quantile:g}"
+
+    rows = []
+    for target in call_counts:
+        target = int(target)
+        if finite_obs.size == 0:
+            raise ValueError("All observed split statistics are NaN; cannot derive a threshold from call_counts.")
+        frac = target / finite_obs.size
+        t = float(np.quantile(finite_obs, 1.0 - frac))
+        desc = describe_threshold(t, obs_left, obs_right, null_left, null_right, **kwargs)
+
+        row = {
+            "target_calls": target,
+            "t": desc.t,
+            "O": desc.O,
+            "E_fp": desc.E_fp,
+            "E_fp_over_O": desc.E_fp_over_O,
+            "O_over_E_fp": desc.O_over_E_fp,
+            "fdp_median": desc.fdp_median,
+            fdp_col: desc.fdp_quantile_achieved,
+            "fdp_min": desc.fdp_min,
+            "fdp_max": desc.fdp_max,
+            "mc_pvalue": desc.mc_pvalue,
+            "n_ge_observed": desc.n_ge_observed,
+        }
+        if has_labels:
+            row["pi_hat"] = desc.mixture["pi_hat"]
+            row["fdp_at_pi_hat"] = desc.mixture["fdp_at_pi_hat"]
+            row["fdp_at_pi_low"] = desc.mixture["fdp_at_pi_low"]
+            row["fdp_at_pi_high"] = desc.mixture["fdp_at_pi_high"]
+        rows.append(row)
+
+    return pd.DataFrame(rows).sort_values("target_calls", ascending=True).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------

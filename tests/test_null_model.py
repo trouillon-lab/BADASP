@@ -1,12 +1,17 @@
+import json
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
+from scipy.stats import beta
 
 from src.badasp.null_model import (
+    ThresholdDescription,
     ThresholdResult,
     as_bin_threshold_dict,
+    describe_threshold,
+    describe_threshold_curve,
     exceedance_flatness,
     load_null_scores,
     maxT_fwer_thresholds,
@@ -534,3 +539,293 @@ def test_per_test_pvalues_all_nan_column() -> None:
     p, q = per_test_pvalues(obs, null)
     assert np.all(np.isnan(p))
     assert np.all(np.isnan(q))
+
+
+# ---------------------------------------------------------------------------
+# describe_threshold / describe_threshold_curve
+# ---------------------------------------------------------------------------
+
+
+def _null_with_exact_V(V_values, n_cols: int, t: float = 1.0):
+    """Build (null_left, null_right) of shape (R, n_cols) with row r having
+    exactly V_values[r] entries whose split statistic is >= t, and the rest
+    strictly below t. Lets falsifier/mixture tests control V directly rather
+    than relying on randomness to land on a particular pattern."""
+    R = len(V_values)
+    null_left = np.full((R, n_cols), t - 1.0)
+    for r, v in enumerate(V_values):
+        assert v <= n_cols
+        null_left[r, :v] = t + 1.0
+    null_right = null_left.copy()
+    return null_left, null_right
+
+
+def test_describe_threshold_matches_threshold_at_fdr_at_shared_t() -> None:
+    """The new, non-selecting path must agree numerically with the sweep
+    computed inside `threshold_at_fdr`, at a t the sweep itself contains --
+    this is the cross-check that the two code paths compute E_fp and the
+    fdp quantile the same way."""
+    rng = np.random.default_rng(RNG_SEED + 100)
+    n = 600
+    R = 40
+    obs_left = rng.normal(0, 1, size=n)
+    obs_right = rng.normal(0, 1, size=n)
+    null_left = rng.normal(0, 1, size=(R, n))
+    null_right = rng.normal(0, 1, size=(R, n))
+
+    fdp_quantile = 0.9
+    result = threshold_at_fdr(obs_left, obs_right, null_left, null_right, q=0.99, fdp_quantile=fdp_quantile)
+    sweep = result.sweep.sort_values("t").reset_index(drop=True)
+    assert not sweep.empty
+
+    row = sweep.iloc[len(sweep) // 2]
+    t = float(row["t"])
+
+    desc = describe_threshold(t, obs_left, obs_right, null_left, null_right, fdp_quantile=fdp_quantile)
+
+    assert desc.O == int(row["O"])
+    assert desc.E_fp == pytest.approx(float(row["E_fp"]))
+    assert desc.fdp_quantile_achieved == pytest.approx(float(row["fdp_quantile_achieved"]))
+
+
+def test_describe_threshold_nan_both_never_counts() -> None:
+    """A split with both branches NaN must never count, on observed or null side."""
+    t = 1.0
+    obs_left = np.array([np.nan, 5.0])
+    obs_right = np.array([np.nan, np.nan])
+    # index 0: both branches NaN -> must not count.
+    # index 1: left=5 (>= t), right=NaN -> counts once via the real branch.
+
+    null_left = np.array([[np.nan, 5.0], [np.nan, np.nan]])
+    null_right = np.array([[np.nan, np.nan], [np.nan, np.nan]])
+    # row 0: index0 both NaN (skip), index1 left=5 counts -> V=1
+    # row 1: both columns both-NaN -> V=0
+
+    desc = describe_threshold(t, obs_left, obs_right, null_left, null_right)
+    assert desc.O == 1
+    assert list(desc.V) == [1, 0]
+
+
+def test_describe_threshold_mc_pvalue_floor_and_ceiling() -> None:
+    rng = np.random.default_rng(RNG_SEED + 101)
+    R = 37
+
+    # Every replicate's V is strictly below O: obs clears t everywhere,
+    # null never does.
+    n = 5
+    obs_left = np.full(n, 10.0)
+    obs_right = np.full(n, -100.0)
+    null_left = np.full((R, n), 0.0)
+    null_right = np.full((R, n), 0.0)
+    t = 5.0
+
+    desc = describe_threshold(t, obs_left, obs_right, null_left, null_right)
+    assert desc.O == n
+    assert (desc.V < desc.O).all()
+    assert desc.mc_pvalue == pytest.approx(1.0 / (1.0 + R))
+
+    # Every replicate's V is >= O: a single test where both obs and every
+    # null replicate clear t.
+    obs_left2 = np.array([t])
+    obs_right2 = np.array([-100.0])
+    null_left2 = np.full((R, 1), t + 1.0)
+    null_right2 = np.full((R, 1), -100.0)
+
+    desc2 = describe_threshold(t, obs_left2, obs_right2, null_left2, null_right2)
+    assert desc2.O == 1
+    assert (desc2.V >= desc2.O).all()
+    assert desc2.mc_pvalue == pytest.approx(1.0)
+
+    _ = rng  # rng not needed beyond seeding convention; kept for consistency
+
+
+def test_describe_threshold_inadequacy_note_not_clipped() -> None:
+    """When the null alone out-produces the observed data, E_fp_over_O > 1
+    must be reported unclipped, with an explanatory note attached."""
+    n = 50
+    R = 10
+    t = 1.0
+    obs_left = np.full(n, t + 1.0)  # O = n
+    obs_right = np.full(n, -100.0)
+    null_left = np.full((R, n), t + 1.0)  # every null test also clears t -> V = n for every replicate
+    null_right = np.full((R, n), -100.0)
+
+    desc = describe_threshold(t, obs_left, obs_right, null_left, null_right)
+    assert desc.O == n
+    assert desc.E_fp == pytest.approx(float(n))
+    assert desc.E_fp_over_O == pytest.approx(1.0)  # O == n here, so not yet > 1
+
+    # Now make the null exceed the observed count: fewer obs discoveries, same null.
+    obs_left2 = obs_left.copy()
+    obs_left2[: n // 2] = -100.0  # only half the observed splits clear t now
+    desc2 = describe_threshold(t, obs_left2, obs_right, null_left, null_right)
+    assert desc2.O == n // 2
+    assert desc2.E_fp_over_O == pytest.approx(float(n) / (n // 2))
+    assert desc2.E_fp_over_O > 1.0
+    assert any("not interpretable as a false-discovery proportion" in note for note in desc2.notes)
+    # Not clipped to 1.0:
+    assert desc2.E_fp_over_O == pytest.approx(2.0)
+
+
+def test_clopper_pearson_edge_cases_and_middle_case_matches_scipy() -> None:
+    n = 10
+    R = 10
+    t = 1.0
+    ci_level = 0.95
+    alpha = 1.0 - ci_level
+
+    obs_left = np.full(n, t - 1.0)
+    obs_right = np.full(n, t - 1.0)
+    null_left, null_right = _null_with_exact_V([2] * R, n_cols=n, t=t)
+
+    # k = 0: no replicate is labelled high.
+    labels_k0 = np.zeros(R, dtype=bool)
+    desc_k0 = describe_threshold(
+        t, obs_left, obs_right, null_left, null_right, labels=labels_k0, ci_level=ci_level
+    )
+    assert desc_k0.mixture["pi_low"] == 0.0
+
+    # k = R: every replicate is labelled high.
+    labels_kR = np.ones(R, dtype=bool)
+    desc_kR = describe_threshold(
+        t, obs_left, obs_right, null_left, null_right, labels=labels_kR, ci_level=ci_level
+    )
+    assert desc_kR.mixture["pi_high"] == 1.0
+
+    # Middle case k = 3: check against scipy.stats.beta.ppf directly.
+    k = 3
+    labels_mid = np.zeros(R, dtype=bool)
+    labels_mid[:k] = True
+    desc_mid = describe_threshold(
+        t, obs_left, obs_right, null_left, null_right, labels=labels_mid, ci_level=ci_level
+    )
+    expected_low = float(beta.ppf(alpha / 2.0, k, R - k + 1))
+    expected_high = float(beta.ppf(1.0 - alpha / 2.0, k + 1, R - k))
+    assert desc_mid.mixture["pi_low"] == pytest.approx(expected_low)
+    assert desc_mid.mixture["pi_high"] == pytest.approx(expected_high)
+    assert desc_mid.mixture["pi_hat"] == pytest.approx(k / R)
+
+
+def test_falsifiers_fire_on_hand_built_overlap_case() -> None:
+    """n_high=1 with an overlapping low replicate should trip all three flags."""
+    n = 6
+    t = 1.0
+    V_values = [5, 6, 1, 1, 1, 1]  # replicate 0 is the sole "high" one
+    null_left, null_right = _null_with_exact_V(V_values, n_cols=n, t=t)
+    labels = np.array([True, False, False, False, False, False])
+
+    obs_left = np.full(n, t - 1.0)
+    obs_right = np.full(n, t - 1.0)
+
+    desc = describe_threshold(t, obs_left, obs_right, null_left, null_right, labels=labels)
+    falsifiers = desc.mixture["falsifiers"]
+    assert falsifiers["low_state_exceeds_high_minimum"]["value"] is True
+    assert falsifiers["n_high_below_2"]["value"] is True
+    assert falsifiers["labels_not_separating"]["value"] is True
+
+
+def test_falsifiers_clean_on_cleanly_separated_case() -> None:
+    """A cleanly separated two-state pattern should trip none of the flags."""
+    n = 15
+    t = 1.0
+    V_high = [10, 11, 12]
+    V_low = [1, 2, 3, 4, 5, 6, 7]
+    V_values = V_high + V_low
+    null_left, null_right = _null_with_exact_V(V_values, n_cols=n, t=t)
+    labels = np.array([True] * len(V_high) + [False] * len(V_low))
+
+    obs_left = np.full(n, t - 1.0)
+    obs_right = np.full(n, t - 1.0)
+
+    desc = describe_threshold(t, obs_left, obs_right, null_left, null_right, labels=labels)
+    falsifiers = desc.mixture["falsifiers"]
+    assert falsifiers["low_state_exceeds_high_minimum"]["value"] is False
+    assert falsifiers["n_high_below_2"]["value"] is False
+    assert falsifiers["labels_not_separating"]["value"] is False
+
+
+def test_group_composition_uneven_groups() -> None:
+    n = 10
+    t = 1.0
+    V_values = [2] * 7
+    null_left, null_right = _null_with_exact_V(V_values, n_cols=n, t=t)
+    obs_left = np.full(n, t - 1.0)
+    obs_right = np.full(n, t - 1.0)
+
+    # 7 replicates split unevenly: group "a" has 2, group "b" has 5.
+    groups = np.array(["a", "a", "b", "b", "b", "b", "b"])
+    labels = np.array([True, False, True, False, False, False, False])
+
+    desc = describe_threshold(t, obs_left, obs_right, null_left, null_right, labels=labels, groups=groups)
+    assert desc.group_composition == {
+        "a": {"n": 2, "n_high": 1},
+        "b": {"n": 5, "n_high": 1},
+    }
+
+
+def test_describe_threshold_curve_sorted_and_o_non_increasing_with_t() -> None:
+    rng = np.random.default_rng(RNG_SEED + 102)
+    n = 4000
+    R = 60
+    obs_left = rng.normal(0, 1, size=n)
+    obs_right = rng.normal(0, 1, size=n)
+    null_left = rng.normal(0, 1, size=(R, n))
+    null_right = rng.normal(0, 1, size=(R, n))
+
+    call_counts = [400, 50, 800, 10]
+    df = describe_threshold_curve(obs_left, obs_right, null_left, null_right, call_counts=call_counts)
+
+    assert list(df["target_calls"]) == sorted(call_counts)
+
+    # As the threshold t rises, O must be monotonically non-increasing.
+    by_t_desc = df.sort_values("t", ascending=False)
+    assert (np.diff(by_t_desc["O"].to_numpy()) >= 0).all()  # O non-decreasing as t falls == non-increasing as t rises
+
+
+def test_threshold_description_to_dict_round_trips_through_json() -> None:
+    rng = np.random.default_rng(RNG_SEED + 103)
+    n = 300
+    R = 20
+    obs_left = rng.normal(0, 1, size=n)
+    obs_right = rng.normal(0, 1, size=n)
+    null_left = rng.normal(0, 1, size=(R, n))
+    null_right = rng.normal(0, 1, size=(R, n))
+    labels = rng.integers(0, 2, size=R).astype(bool)
+    groups = np.array([f"g{i % 3}" for i in range(R)])
+
+    desc = describe_threshold(0.5, obs_left, obs_right, null_left, null_right, labels=labels, groups=groups)
+    payload = json.dumps(desc.to_dict())
+    round_tripped = json.loads(payload)
+
+    assert round_tripped["O"] == desc.O
+    assert round_tripped["V"] == list(int(v) for v in desc.V)
+    assert round_tripped["mixture"]["falsifiers"]["n_high_below_2"]["value"] in (True, False)
+
+
+def test_describe_threshold_raises_on_nonfinite_t() -> None:
+    n = 10
+    R = 5
+    obs_left = np.zeros(n)
+    obs_right = np.zeros(n)
+    null_left = np.zeros((R, n))
+    null_right = np.zeros((R, n))
+    with pytest.raises(ValueError):
+        describe_threshold(np.nan, obs_left, obs_right, null_left, null_right)
+    with pytest.raises(ValueError):
+        describe_threshold(np.inf, obs_left, obs_right, null_left, null_right)
+
+
+def test_describe_threshold_raises_on_mismatched_shapes() -> None:
+    n = 10
+    R = 5
+    obs_left = np.zeros(n)
+    obs_right = np.zeros(n + 1)  # mismatched length
+    null_left = np.zeros((R, n))
+    null_right = np.zeros((R, n))
+    with pytest.raises(ValueError):
+        describe_threshold(0.0, obs_left, obs_right, null_left, null_right)
+
+    obs_right2 = np.zeros(n)
+    null_right2 = np.zeros((R, n + 1))  # mismatched null shape
+    with pytest.raises(ValueError):
+        describe_threshold(0.0, obs_left, obs_right2, null_left, null_right2)
