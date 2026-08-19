@@ -69,6 +69,14 @@ DEFAULT_OUT_DIR = REPO_ROOT / "results" / "badasp_scoring" / "null_calibration"
 # run produces.
 DEFAULT_ERROR_PROFILE_CALLS = (51, 81, 240, 500, 795, 1500, 2023)
 
+# Minimum number of scorable (finite split-statistic) tests required inside
+# a --min-clade-filter stratum before an error profile is reported for it.
+# Below this floor the reported O, t, and error-rate description would rest
+# on too few tests to be informative, so the run is refused outright rather
+# than silently reporting a number computed on a handful of tests. This is a
+# reporting-floor choice, not a value derived from any particular dataset.
+MIN_SCORABLE_TESTS_IN_STRATUM = 100
+
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -388,18 +396,26 @@ def load_replicate_groups_csv(path: Path, used_files: List[Path]) -> Tuple[np.nd
     return groups, f"--replicate-groups-csv {path} (explicit override)"
 
 
+_OPERATING_POINT_FORMS = (
+    "'calls:<int>' (e.g. 'calls:795'), 't:<float>' (e.g. 't:1.5'), or "
+    "'pct:<float>' (e.g. 'pct:0.003' for the top 0.3%)"
+)
+
+
 def parse_operating_point_spec(raw: str) -> Tuple[str, float]:
-    """Parse the --operating-point flag: 'calls:<int>' or 't:<float>'.
+    """Parse the --operating-point flag: 'calls:<int>', 't:<float>', or
+    'pct:<float>'.
 
     Never selects anything itself -- this only validates and unpacks the
-    string the caller already chose; resolving 'calls:<int>' into an actual
-    threshold value happens in `main`, where the observed statistic is
-    available.
+    string the caller already chose; resolving 'calls:<int>' or 'pct:<float>'
+    into an actual threshold value happens in `main`, where the observed
+    statistic (and, if --min-clade-filter is given, the stratum it is
+    restricted to) is available.
     """
     if ":" not in raw:
         raise SystemExit(
             f"--operating-point {raw!r} not understood; accepted forms are "
-            "'calls:<int>' (e.g. 'calls:795') or 't:<float>' (e.g. 't:1.5')."
+            f"{_OPERATING_POINT_FORMS}."
         )
     kind, _, value_str = raw.partition(":")
     if kind == "calls":
@@ -408,8 +424,8 @@ def parse_operating_point_spec(raw: str) -> Tuple[str, float]:
         except ValueError:
             raise SystemExit(
                 f"--operating-point {raw!r} not understood; 'calls:<int>' "
-                "needs an integer call count. Accepted forms are "
-                "'calls:<int>' (e.g. 'calls:795') or 't:<float>' (e.g. 't:1.5')."
+                f"needs an integer call count. Accepted forms are "
+                f"{_OPERATING_POINT_FORMS}."
             )
     if kind == "t":
         try:
@@ -417,12 +433,27 @@ def parse_operating_point_spec(raw: str) -> Tuple[str, float]:
         except ValueError:
             raise SystemExit(
                 f"--operating-point {raw!r} not understood; 't:<float>' needs "
-                "a numeric threshold. Accepted forms are 'calls:<int>' (e.g. "
-                "'calls:795') or 't:<float>' (e.g. 't:1.5')."
+                f"a numeric threshold. Accepted forms are {_OPERATING_POINT_FORMS}."
             )
+    if kind == "pct":
+        try:
+            pct_value = float(value_str)
+        except ValueError:
+            raise SystemExit(
+                f"--operating-point {raw!r} not understood; 'pct:<float>' "
+                f"needs a numeric percentile in the open interval (0, 1). "
+                f"Accepted forms are {_OPERATING_POINT_FORMS}."
+            )
+        if not (0.0 < pct_value < 1.0):
+            raise SystemExit(
+                f"--operating-point {raw!r} not understood; 'pct:<float>' "
+                f"needs a value strictly between 0 and 1 (e.g. 'pct:0.003' "
+                f"for the top 0.3%); got {pct_value}."
+            )
+        return "pct", pct_value
     raise SystemExit(
         f"--operating-point {raw!r} not understood; accepted forms are "
-        "'calls:<int>' (e.g. 'calls:795') or 't:<float>' (e.g. 't:1.5')."
+        f"{_OPERATING_POINT_FORMS}."
     )
 
 
@@ -1120,12 +1151,39 @@ def parse_args(argv=None) -> argparse.Namespace:
              "threshold, reported alongside -- never instead of -- the "
              "FDP-exceedance criterion above. Accepted forms: 'calls:<int>' "
              "(t is set to the quantile of the primary observed split "
-             "statistic giving that many calls) or 't:<float>' (t given "
+             "statistic giving that many calls), 't:<float>' (t given "
              "directly, on whichever scale --conditioning produces: raw score "
-             "for 'none', z for 'cell'). Off by default; when given, adds an "
-             "'error_profile' block to thresholds.json and an "
+             "for 'none', z for 'cell'), or 'pct:<float>' (t is set to the "
+             "quantile of the primary observed split statistic marking the "
+             "top P fraction, e.g. 'pct:0.003' for the top 0.3%). When "
+             "--min-clade-filter is also given, both 'calls:<int>' and "
+             "'pct:<float>' are resolved WITHIN that stratum (the quantile "
+             "and the call count are relative to the filtered rows, not to "
+             "all tests) -- see --min-clade-filter. Off by default; when "
+             "given, adds an 'error_profile' block to thresholds.json and an "
              "error_profile_curve.csv, and unblocks the diagnostics that "
              "otherwise skip when the FDP criterion finds no threshold.",
+    )
+    parser.add_argument(
+        "--min-clade-filter", type=int, default=None,
+        help="Restrict the --operating-point error-profile report to tests "
+             "where min(clade_size_left, clade_size_right) >= N, using the "
+             "observed table's own clade_size_left/clade_size_right columns "
+             "(the null replicates are row-aligned to that table, so the "
+             "same boolean mask is applied to them). This is the reporting "
+             "analogue of scoring.py's --min-clade floor (src/badasp/"
+             "scoring.py requires both child clades to clear that floor "
+             "before a split is scored at all); this flag filters at report "
+             "time, on an already-scored table, rather than re-scoring. Off "
+             "by default (no filtering). Affects only the 'error_profile' "
+             "block of thresholds.json, error_profile_curve.csv, and the "
+             "'called'/'in_stratum' columns of per_test_calls.csv -- "
+             "thresholds['t'], criterion_met, zero_discoveries, note, the "
+             "FWER thresholds, threshold_sweep.csv, and global_rule_baseline "
+             "are computed on the unfiltered data exactly as without this "
+             f"flag. Exits with a clear error if fewer than "
+             f"{MIN_SCORABLE_TESTS_IN_STRATUM} scorable tests remain in the "
+             "stratum.",
     )
     parser.add_argument(
         "--error-profile-calls", type=str, default=None,
@@ -1289,22 +1347,77 @@ def main(argv=None) -> int:
     diag_t: Optional[float] = result.t
     diag_threshold_source: Optional[str] = None
     op_t: Optional[float] = None
+    op_kind: Optional[str] = None
+
+    # --min-clade-filter: the reporting analogue of scoring.py's --min-clade
+    # floor (src/badasp/scoring.py requires both child clades to clear that
+    # floor before a split is even scored; this filters an already-scored
+    # table at report time instead). Computed here, independently of
+    # --operating-point, so per_test_calls.csv's 'in_stratum'/'called'
+    # columns below can use it even if the block below is never entered.
+    # This NEVER touches result.t, criterion_met, zero_discoveries, note, the
+    # FWER thresholds, threshold_sweep.csv, or global_rule_baseline -- those
+    # were all already computed above, on the unfiltered stat_left/stat_right
+    # etc., and this mask is not retroactively applied to them.
+    stratum_mask: Optional[np.ndarray] = None
+    if args.min_clade_filter is not None:
+        stratum_mask = (
+            np.minimum(
+                keys["clade_size_left"].to_numpy(dtype=float),
+                keys["clade_size_right"].to_numpy(dtype=float),
+            )
+            >= args.min_clade_filter
+        )
 
     if args.operating_point is not None:
         op_kind, op_value = parse_operating_point_spec(args.operating_point)
-        finite_primary = obs_stat[np.isfinite(obs_stat)]
+
+        # Every calculation from here on is restricted to the stratum mask
+        # (trivially "every test" when --min-clade-filter was not given, so
+        # the unfiltered behaviour falls out as the mask-is-all-True case).
+        mask = stratum_mask if stratum_mask is not None else np.ones(n_tests, dtype=bool)
+        n_tests_in_stratum = int(mask.sum())
+
+        stat_left_s, stat_right_s = stat_left[mask], stat_right[mask]
+        null_stat_left_s, null_stat_right_s = null_stat_left[:, mask], null_stat_right[:, mask]
+        obs_stat_s = obs_stat[mask]
+        null_ac_s = null_ac[:, mask]
+
+        finite_stratum = obs_stat_s[np.isfinite(obs_stat_s)]
+        n_scorable_in_stratum = int(finite_stratum.size)
+
+        if args.min_clade_filter is not None and n_scorable_in_stratum < MIN_SCORABLE_TESTS_IN_STRATUM:
+            raise SystemExit(
+                f"--min-clade-filter {args.min_clade_filter} leaves only "
+                f"{n_scorable_in_stratum} scorable test(s) (finite split "
+                f"statistic) among the {n_tests_in_stratum} test(s) with "
+                f"min(clade_size_left, clade_size_right) >= "
+                f"{args.min_clade_filter} (out of {n_tests} tests total); "
+                f"at least {MIN_SCORABLE_TESTS_IN_STRATUM} scorable tests "
+                "are required to report an error profile on this stratum."
+            )
+
         if op_kind == "calls":
-            if finite_primary.size == 0:
+            if finite_stratum.size == 0:
                 raise SystemExit(
                     "--operating-point calls:N requires at least one finite "
-                    "observed split statistic; none are finite here."
+                    "observed split statistic in the stratum; none are "
+                    "finite here."
                 )
             n_calls = int(op_value)
-            frac = n_calls / finite_primary.size
-            op_t = float(np.quantile(finite_primary, 1.0 - frac))
+            frac = n_calls / finite_stratum.size
+            op_t = float(np.quantile(finite_stratum, 1.0 - frac))
+        elif op_kind == "pct":
+            if finite_stratum.size == 0:
+                raise SystemExit(
+                    "--operating-point pct:P requires at least one finite "
+                    "observed split statistic in the stratum; none are "
+                    "finite here."
+                )
+            op_t = float(np.quantile(finite_stratum, 1.0 - op_value))
         else:  # "t"
             op_t = float(op_value)
-        op_O = int(np.sum(finite_primary >= op_t))
+        op_O = int(np.sum(finite_stratum >= op_t))
 
         if result.t is None:
             diag_t = op_t
@@ -1320,7 +1433,7 @@ def main(argv=None) -> int:
         else:
             groups_arr, groups_route = infer_replicate_groups(used_files, npz_dir)
 
-        per_rep_p_ac_minus1 = np.mean(null_ac == -1, axis=1)
+        per_rep_p_ac_minus1 = np.mean(null_ac_s == -1, axis=1)
         elevated_labels = per_rep_p_ac_minus1 > args.elevated_pac_threshold
 
         if args.error_profile_calls is not None:
@@ -1372,12 +1485,44 @@ def main(argv=None) -> int:
             "why the reported error rate is not selection-biased."
         )
 
+        stratum_active = args.min_clade_filter is not None
+        if stratum_active:
+            operating_point_note = (
+                "t, O, and (for form='pct') 'percentile' below are all "
+                "computed WITHIN the stratum recorded in 'stratum' below "
+                f"(n_scorable_in_stratum={n_scorable_in_stratum} tests with "
+                f"min(clade_size_left, clade_size_right) >= "
+                f"{args.min_clade_filter}), NOT over the full "
+                f"n_tests_total={n_tests} tests in the observed table."
+            )
+        else:
+            operating_point_note = (
+                "No --min-clade-filter given: t, O, and (for form='pct') "
+                "'percentile' below are computed over all tests (the "
+                "trivial stratum, i.e. every test)."
+            )
+
         error_profile = {
-            "operating_point": {"raw": args.operating_point, "t": op_t, "O": op_O},
+            "operating_point": {
+                "raw": args.operating_point,
+                "form": op_kind,
+                "percentile": op_value if op_kind == "pct" else None,
+                "t": op_t,
+                "O": op_O,
+                "scope": "stratum" if stratum_active else "all_tests",
+                "note": operating_point_note,
+            },
+            "stratum": {
+                "min_clade_filter": args.min_clade_filter,
+                "n_tests_total": int(n_tests),
+                "n_tests_in_stratum": n_tests_in_stratum,
+                "n_scorable_in_stratum": n_scorable_in_stratum,
+                "fraction_retained": (n_tests_in_stratum / n_tests) if n_tests else None,
+            },
             "selection_rule": selection_rule,
-            "description": _describe_at(op_t, stat_left, stat_right, null_stat_left, null_stat_right, groups_arr),
+            "description": _describe_at(op_t, stat_left_s, stat_right_s, null_stat_left_s, null_stat_right_s, groups_arr),
             "description_cluster_bootstrap": _describe_cluster_at(
-                op_t, stat_left, stat_right, null_stat_left, null_stat_right, groups_arr, groups_route
+                op_t, stat_left_s, stat_right_s, null_stat_left_s, null_stat_right_s, groups_arr, groups_route
             ),
             "provenance": {
                 "replicate_group_resolution": groups_route,
@@ -1386,7 +1531,7 @@ def main(argv=None) -> int:
         }
 
         curve_df = describe_threshold_curve(
-            stat_left, stat_right, null_stat_left, null_stat_right,
+            stat_left_s, stat_right_s, null_stat_left_s, null_stat_right_s,
             call_counts=curve_calls,
             labels=elevated_labels, label_statistic=per_rep_p_ac_minus1,
             groups=groups_arr, fdp_quantile=args.fdp_quantile,
@@ -1403,15 +1548,20 @@ def main(argv=None) -> int:
             # so the two blocks stay structurally comparable -- see the "note"
             # field below, which flags this rather than pretending the two t
             # values are on the same scale.
-            obs_stat_raw = _split_statistic(obs_left, obs_right)
+            obs_left_s, obs_right_s = obs_left[mask], obs_right[mask]
+            null_left_s, null_right_s = null_left[:, mask], null_right[:, mask]
+            obs_stat_raw = _split_statistic(obs_left_s, obs_right_s)
             finite_raw = obs_stat_raw[np.isfinite(obs_stat_raw)]
             if op_kind == "calls" and finite_raw.size > 0:
                 op_t_raw = float(np.quantile(finite_raw, 1.0 - (int(op_value) / finite_raw.size)))
                 raw_note = None
+            elif op_kind == "pct" and finite_raw.size > 0:
+                op_t_raw = float(np.quantile(finite_raw, 1.0 - op_value))
+                raw_note = None
             else:
                 op_t_raw = op_t
                 raw_note = (
-                    None if op_kind == "calls" else
+                    None if op_kind in ("calls", "pct") else
                     "t was given directly via 't:<float>' on the primary "
                     "(z) scale; the same numeric value is reused here against "
                     "the raw score, which is comparable only in the sense "
@@ -1422,9 +1572,9 @@ def main(argv=None) -> int:
             baseline_profile = {
                 "operating_point": {"raw": args.operating_point, "t": op_t_raw, "O": op_O_raw},
                 "selection_rule": selection_rule,
-                "description": _describe_at(op_t_raw, obs_left, obs_right, null_left, null_right, groups_arr),
+                "description": _describe_at(op_t_raw, obs_left_s, obs_right_s, null_left_s, null_right_s, groups_arr),
                 "description_cluster_bootstrap": _describe_cluster_at(
-                    op_t_raw, obs_left, obs_right, null_left, null_right, groups_arr, groups_route
+                    op_t_raw, obs_left_s, obs_right_s, null_left_s, null_right_s, groups_arr, groups_route
                 ),
             }
             if raw_note is not None:
@@ -1516,11 +1666,22 @@ def main(argv=None) -> int:
                 result.t, keys["position"].to_numpy(),
                 keys["clade_size_right"].to_numpy(float), model, tail,
             )
-    if diag_t is not None:
+    if args.min_clade_filter is not None:
+        # --min-clade-filter is the only thing allowed to change 'called'
+        # (see the flag's help text): outside the stratum 'called' is always
+        # False, and within it, the operating point's own threshold (op_t)
+        # takes precedence over the FDP-exceedance diag_t whenever an
+        # --operating-point was actually given, so that 'called'.sum()
+        # equals the stratum call count O reported in error_profile.
+        call_t = op_t if op_t is not None else diag_t
+        if call_t is not None:
+            per_test["called"] = stratum_mask & (obs_stat >= call_t)
+        per_test["in_stratum"] = stratum_mask
+    elif diag_t is not None:
         per_test["called"] = obs_stat >= diag_t
     per_test.to_csv(args.out_dir / "per_test_calls.csv", index=False)
     print(f"Wrote {args.out_dir / 'per_test_calls.csv'} ({len(per_test):,} rows"
-          + (f", {int(per_test['called'].sum()):,} called)" if diag_t is not None else ")"))
+          + (f", {int(per_test['called'].sum()):,} called)" if "called" in per_test.columns else ")"))
 
     # --- Diagnostics ----------------------------------------------------------
     diagnostics: Dict[str, object] = {}

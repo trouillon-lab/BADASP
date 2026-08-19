@@ -672,3 +672,155 @@ def test_replicate_groups_csv_overrides_automatic_resolution(tmp_path):
     assert gc is not None
     assert set(gc.keys()) == {"grpX"}
     assert gc["grpX"]["n"] == 6
+
+
+# ---------------------------------------------------------------------------
+# --min-clade-filter and --operating-point pct:<float>
+# ---------------------------------------------------------------------------
+#
+# The fixture's clade_size_left/clade_size_right are drawn (via _build_fixture
+# -> _write_observed_scores) from rng.integers(5, 500, ...) with a fixed seed,
+# so for a given n the number of rows passing a given --min-clade-filter is a
+# deterministic (if not hand-derivable) property of that seed. The values
+# used below (n=600, filter=250 -> 153 rows in stratum; filter=500 -> 0 rows)
+# were found by running the same draw once and reading off the counts, not
+# hand-picked to make a test pass after the fact.
+
+
+def test_min_clade_filter_reduces_test_count_and_records_stratum(tmp_path):
+    obs_path, run_dir = _build_fixture(tmp_path, n=600, R=15, plant=False)
+    df = pd.read_csv(obs_path)
+    n_tests_total = len(df)
+    expected_in_stratum = int((np.minimum(df["clade_size_left"], df["clade_size_right"]) >= 250).sum())
+    assert 100 <= expected_in_stratum < n_tests_total  # the filter must actually reduce the count
+
+    out_dir = tmp_path / "calib_stratum"
+    rc = cst.main([
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--out-dir", str(out_dir), "--target-fdr", "0.01", "--fdp-quantile", "0.95",
+        "--conditioning", "none",
+        "--min-clade-filter", "250", "--operating-point", "calls:20",
+        "--error-profile-calls", "5,20,50",
+        "--bootstrap-resamples", "50",
+    ])
+    assert rc == 0
+    thresholds = json.loads((out_dir / "thresholds.json").read_text())
+    stratum = thresholds["error_profile"]["stratum"]
+    assert stratum["min_clade_filter"] == 250
+    assert stratum["n_tests_total"] == n_tests_total
+    assert stratum["n_tests_in_stratum"] == expected_in_stratum
+    assert stratum["n_scorable_in_stratum"] == expected_in_stratum  # no NaNs in this fixture
+    assert stratum["fraction_retained"] == pytest.approx(expected_in_stratum / n_tests_total)
+
+    op = thresholds["error_profile"]["operating_point"]
+    assert op["form"] == "calls"
+    assert op["scope"] == "stratum"
+
+
+def test_operating_point_pct_and_calls_agree_within_stratum(tmp_path):
+    """A 'calls:<int>' operating point and the 'pct:<float>' operating point
+    giving the exact same within-stratum fraction must resolve to the same
+    t -- both go through the identical
+    ``np.quantile(finite_stratum, 1 - fraction)`` call on the identical
+    filtered array, so this is an equality, not merely an approximation.
+    """
+    obs_path, run_dir = _build_fixture(tmp_path, n=600, R=15, plant=False)
+    df = pd.read_csv(obs_path)
+    n_in_stratum = int((np.minimum(df["clade_size_left"], df["clade_size_right"]) >= 250).sum())
+    n_calls = 15
+    pct = n_calls / n_in_stratum  # exact same float division `main` performs for calls:<int>
+
+    common_args = [
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--target-fdr", "0.01", "--fdp-quantile", "0.95", "--conditioning", "none",
+        "--min-clade-filter", "250", "--error-profile-calls", "5,20,50",
+        "--bootstrap-resamples", "50",
+    ]
+
+    out_calls = tmp_path / "calib_calls"
+    cst.main(common_args + ["--out-dir", str(out_calls), "--operating-point", f"calls:{n_calls}"])
+    out_pct = tmp_path / "calib_pct"
+    cst.main(common_args + ["--out-dir", str(out_pct), "--operating-point", f"pct:{pct!r}"])
+
+    t_calls = json.loads((out_calls / "thresholds.json").read_text())["error_profile"]["operating_point"]["t"]
+    t_pct = json.loads((out_pct / "thresholds.json").read_text())["error_profile"]["operating_point"]["t"]
+    assert t_calls == pytest.approx(t_pct, rel=1e-12)
+
+
+def test_min_clade_filter_called_column_respects_stratum(tmp_path):
+    obs_path, run_dir = _build_fixture(tmp_path, n=600, R=15, plant=True)
+    out_dir = tmp_path / "calib_called_stratum"
+    rc = cst.main([
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--out-dir", str(out_dir), "--target-fdr", "0.20", "--fdp-quantile", "0.95",
+        "--conditioning", "none",
+        "--min-clade-filter", "250", "--operating-point", "pct:0.1",
+        "--error-profile-calls", "5,20,50",
+        "--bootstrap-resamples", "50",
+    ])
+    assert rc == 0
+    per_test = pd.read_csv(out_dir / "per_test_calls.csv")
+    thresholds = json.loads((out_dir / "thresholds.json").read_text())
+    O = thresholds["error_profile"]["operating_point"]["O"]
+
+    assert "in_stratum" in per_test.columns
+    assert not per_test.loc[~per_test["in_stratum"], "called"].any()
+    assert int(per_test["called"].sum()) == O
+
+
+def test_min_clade_filter_too_few_scorable_tests_exits(tmp_path):
+    obs_path, run_dir = _build_fixture(tmp_path, n=600, R=15, plant=False)
+    out_dir = tmp_path / "calib_too_few"
+    with pytest.raises(SystemExit, match=r"0 scorable"):
+        cst.main([
+            "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+            "--out-dir", str(out_dir), "--target-fdr", "0.01", "--fdp-quantile", "0.95",
+            "--conditioning", "none",
+            "--min-clade-filter", "500", "--operating-point", "calls:20",
+        ])
+
+
+def test_operating_point_pct_out_of_range_rejected(tmp_path):
+    obs_path, run_dir = _build_fixture(tmp_path, n=300, R=15, plant=False)
+    out_dir = tmp_path / "calib_bad_pct"
+    for bad in ("pct:0", "pct:1", "pct:1.5", "pct:-0.1"):
+        with pytest.raises(SystemExit, match=r"between 0 and 1"):
+            cst.main([
+                "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+                "--out-dir", str(out_dir), "--operating-point", bad,
+            ])
+
+
+def test_min_clade_filter_invariant_unfiltered_thresholds_unchanged(tmp_path):
+    """The central invariant of --min-clade-filter: it must not change
+    thresholds['t'], criterion_met, or threshold_sweep.csv relative to a run
+    without it -- those are computed on the unfiltered data exactly as
+    before; only the error_profile block, error_profile_curve.csv, and the
+    per_test_calls.csv 'called'/'in_stratum' columns are allowed to differ.
+    """
+    obs_path, run_dir = _build_fixture(tmp_path, n=600, R=15, plant=True)
+
+    out_unfiltered = tmp_path / "calib_unfiltered"
+    cst.main([
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--out-dir", str(out_unfiltered), "--target-fdr", "0.20", "--fdp-quantile", "0.95",
+        "--conditioning", "none",
+    ])
+    out_filtered = tmp_path / "calib_filtered"
+    cst.main([
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--out-dir", str(out_filtered), "--target-fdr", "0.20", "--fdp-quantile", "0.95",
+        "--conditioning", "none",
+        "--min-clade-filter", "250", "--operating-point", "pct:0.1",
+        "--error-profile-calls", "5,20,50",
+        "--bootstrap-resamples", "50",
+    ])
+
+    t_unfiltered = json.loads((out_unfiltered / "thresholds.json").read_text())
+    t_filtered = json.loads((out_filtered / "thresholds.json").read_text())
+    assert t_filtered["t"] == t_unfiltered["t"]
+    assert t_filtered["criterion_met"] == t_unfiltered["criterion_met"]
+
+    sweep_unfiltered = pd.read_csv(out_unfiltered / "threshold_sweep.csv")
+    sweep_filtered = pd.read_csv(out_filtered / "threshold_sweep.csv")
+    pd.testing.assert_frame_equal(sweep_unfiltered, sweep_filtered)
