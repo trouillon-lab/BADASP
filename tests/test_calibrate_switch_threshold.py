@@ -824,3 +824,184 @@ def test_min_clade_filter_invariant_unfiltered_thresholds_unchanged(tmp_path):
     sweep_unfiltered = pd.read_csv(out_unfiltered / "threshold_sweep.csv")
     sweep_filtered = pd.read_csv(out_filtered / "threshold_sweep.csv")
     pd.testing.assert_frame_equal(sweep_unfiltered, sweep_filtered)
+
+
+# ---------------------------------------------------------------------------
+# --comparison-null-run-dir: the two-null error bracket
+# ---------------------------------------------------------------------------
+
+
+def _build_comparison_null_dir(tmp_path: Path, name: str, n: int, R: int, seed: int) -> Path:
+    """A second, independently-built null run directory in the same
+    <dir>/npz/rep_*.npz layout `load_null_replicates` (and therefore
+    --comparison-null-run-dir) expects, reusing `_write_null_replicates` so
+    it is the identical on-disk shape as the primary fixture's own null.
+    """
+    rng = np.random.default_rng(seed)
+    comp_run_dir = tmp_path / name
+    _write_null_replicates(comp_run_dir / "npz", n, R, rng)
+    return comp_run_dir
+
+
+def test_comparison_null_without_operating_point_exits(tmp_path):
+    obs_path, run_dir = _build_fixture(tmp_path, n=300, R=15, plant=False)
+    comp_run_dir = _build_comparison_null_dir(tmp_path, "comp_null_no_op", n=300, R=5, seed=101)
+    out_dir = tmp_path / "calib_comp_no_op"
+    with pytest.raises(SystemExit, match="--operating-point"):
+        cst.main([
+            "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+            "--out-dir", str(out_dir),
+            "--comparison-null-run-dir", str(comp_run_dir),
+        ])
+
+
+def test_comparison_null_reports_bracket_at_common_threshold(tmp_path):
+    """error_profile['comparison'] exists, is evaluated at the SAME t the
+    primary run's own error_profile['description'] resolved (never a
+    threshold separately derived from the comparison null), and its bracket
+    correctly brackets [min, max] of the two nulls' fdp_mean with consistent
+    naming.
+    """
+    obs_path, run_dir = _build_fixture(tmp_path, n=600, R=15, plant=True)
+    comp_run_dir = _build_comparison_null_dir(tmp_path, "comp_null", n=600, R=7, seed=202)
+    out_dir = tmp_path / "calib_comp"
+    rc = cst.main([
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--out-dir", str(out_dir), "--target-fdr", "0.20", "--fdp-quantile", "0.95",
+        "--conditioning", "none",
+        "--operating-point", "pct:0.02",
+        "--comparison-null-run-dir", str(comp_run_dir),
+        "--error-profile-calls", "5,20,50",
+        "--bootstrap-resamples", "50",
+    ])
+    assert rc == 0
+    thresholds = json.loads((out_dir / "thresholds.json").read_text())
+    ep = thresholds["error_profile"]
+    comparison = ep["comparison"]
+
+    assert comparison["null_run_dir"] == str(comp_run_dir)
+    assert comparison["R"] == 7
+    assert len(comparison["null_replicate_files"]) == 7
+    # The essential requirement: both nulls evaluated at ONE common t.
+    assert comparison["description"]["t"] == ep["description"]["t"]
+
+    bracket = comparison["bracket"]
+    assert bracket["fdp_low"] <= bracket["fdp_high"]
+    assert bracket["bracket_width"] == pytest.approx(bracket["fdp_high"] - bracket["fdp_low"])
+
+    primary_mean = ep["description"]["fdp_mean"]
+    comp_mean = comparison["description"]["fdp_mean"]
+    if primary_mean <= comp_mean:
+        assert bracket["which_null_is_low"] == "primary"
+        assert bracket["which_null_is_high"] == "comparison"
+        assert bracket["fdp_low"] == pytest.approx(primary_mean)
+        assert bracket["fdp_high"] == pytest.approx(comp_mean)
+    else:
+        assert bracket["which_null_is_low"] == "comparison"
+        assert bracket["which_null_is_high"] == "primary"
+        assert bracket["fdp_low"] == pytest.approx(comp_mean)
+        assert bracket["fdp_high"] == pytest.approx(primary_mean)
+
+    caveat = comparison["caveat"].lower()
+    assert "opposite" in caveat
+    assert "o/e" in caveat or "observed/expected" in caveat
+
+    curve = pd.read_csv(out_dir / "error_profile_curve.csv")
+    assert "comparison_fdp_mean" in curve.columns
+    assert curve["comparison_fdp_mean"].notna().all()
+
+
+def test_comparison_null_mismatched_test_count_rejected(tmp_path):
+    """A comparison null aligned to a different-sized observed table is
+    rejected by load_null_replicates' own length-mismatch guard -- no
+    second loader was written for this flag.
+    """
+    obs_path, run_dir = _build_fixture(tmp_path, n=300, R=15, plant=False)
+    comp_run_dir = _build_comparison_null_dir(tmp_path, "comp_null_bad_n", n=250, R=5, seed=303)
+    out_dir = tmp_path / "calib_comp_bad_n"
+    with pytest.raises(ValueError, match="aligned to a different"):
+        cst.main([
+            "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+            "--out-dir", str(out_dir), "--target-fdr", "0.01", "--fdp-quantile", "0.95",
+            "--operating-point", "calls:20",
+            "--comparison-null-run-dir", str(comp_run_dir),
+            "--bootstrap-resamples", "50",
+        ])
+
+
+def test_comparison_null_does_not_alter_primary_computation(tmp_path):
+    """Section-1 invariant: thresholds['t'], criterion_met, zero_discoveries,
+    note, the FWER thresholds, threshold_sweep.csv, global_rule_baseline, and
+    error_profile['description'] must be byte-identical with vs without
+    --comparison-null-run-dir -- the flag only ever ADDS
+    error_profile['comparison'] and error_profile_curve.csv's
+    'comparison_fdp_mean' column.
+    """
+    obs_path, run_dir = _build_fixture(tmp_path, n=600, R=15, plant=True)
+    comp_run_dir = _build_comparison_null_dir(tmp_path, "comp_null_inv", n=600, R=6, seed=404)
+
+    common_args = [
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--target-fdr", "0.20", "--fdp-quantile", "0.95", "--conditioning", "none",
+        "--operating-point", "pct:0.02", "--bootstrap-resamples", "50",
+        "--error-profile-calls", "5,20,50",
+    ]
+    out_without = tmp_path / "calib_without_comp"
+    rc_without = cst.main(common_args + ["--out-dir", str(out_without)])
+    out_with = tmp_path / "calib_with_comp"
+    rc_with = cst.main(
+        common_args + ["--out-dir", str(out_with), "--comparison-null-run-dir", str(comp_run_dir)]
+    )
+    assert rc_without == 0
+    assert rc_with == 0
+
+    t_without = json.loads((out_without / "thresholds.json").read_text())
+    t_with = json.loads((out_with / "thresholds.json").read_text())
+
+    for key in (
+        "t", "O_t", "E_fp", "E_fp_over_O", "fdp_quantile_achieved",
+        "criterion_met", "zero_discoveries", "note",
+        "fwer_per_position_threshold", "fwer_global_threshold",
+        "global_rule_baseline",
+    ):
+        assert t_with[key] == t_without[key], f"{key} differs with vs without --comparison-null-run-dir"
+
+    assert "comparison" not in t_without["error_profile"]
+    assert "comparison" in t_with["error_profile"]
+    ep_without = {k: v for k, v in t_without["error_profile"].items() if k != "comparison"}
+    ep_with = {k: v for k, v in t_with["error_profile"].items() if k != "comparison"}
+    assert ep_without == ep_with
+
+    sweep_without = pd.read_csv(out_without / "threshold_sweep.csv")
+    sweep_with = pd.read_csv(out_with / "threshold_sweep.csv")
+    pd.testing.assert_frame_equal(sweep_without, sweep_with)
+
+    curve_without = pd.read_csv(out_without / "error_profile_curve.csv")
+    curve_with = pd.read_csv(out_with / "error_profile_curve.csv")
+    assert "comparison_fdp_mean" not in curve_without.columns
+    assert "comparison_fdp_mean" in curve_with.columns
+    pd.testing.assert_frame_equal(
+        curve_without, curve_with.drop(columns=["comparison_fdp_mean"])
+    )
+
+
+def test_thresholds_json_serializable_with_comparison_null(tmp_path):
+    """Guards against numpy types leaking into thresholds.json via the new
+    error_profile['comparison'] block (mirrors
+    test_thresholds_json_fully_serializable_with_operating_point).
+    """
+    obs_path, run_dir = _build_fixture(tmp_path, n=300, R=15, plant=False)
+    comp_run_dir = _build_comparison_null_dir(tmp_path, "comp_null_json", n=300, R=5, seed=505)
+    out_dir = tmp_path / "calib_comp_json"
+    rc = cst.main([
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--out-dir", str(out_dir), "--target-fdr", "0.01", "--fdp-quantile", "0.95",
+        "--operating-point", "calls:20",
+        "--comparison-null-run-dir", str(comp_run_dir),
+        "--error-profile-calls", "5,20,50",
+        "--bootstrap-resamples", "50",
+    ])
+    assert rc == 0
+    parsed = json.loads((out_dir / "thresholds.json").read_text())
+    _assert_json_primitive(parsed)
+    assert "comparison" in parsed["error_profile"]

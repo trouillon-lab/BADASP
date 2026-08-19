@@ -1227,11 +1227,42 @@ def parse_args(argv=None) -> argparse.Namespace:
              "overriding automatic resolution via infer_replicate_groups. "
              "Used only when --operating-point is given.",
     )
+    parser.add_argument(
+        "--comparison-null-run-dir", type=Path, default=None,
+        help="A second, independently-built null replicate run directory "
+             "(same expected layout as --null-run-dir: <dir>/npz/rep_*.npz, "
+             "loaded with the same load_null_replicates and its length-"
+             "mismatch guard, against the SAME observed table). Two "
+             "independently-built nulls that err in measured opposite "
+             "directions bracket the false-discovery proportion rather than "
+             "either bounding it alone; when given, this is reported as "
+             "error_profile['comparison'], evaluated at the SAME threshold "
+             "t the primary run resolves for --operating-point (never at a "
+             "separately-derived threshold of its own), plus a "
+             "'comparison_fdp_mean' column in error_profile_curve.csv. "
+             "Only meaningful together with --operating-point (that is what "
+             "fixes the common t both nulls are compared at); given without "
+             "it, this exits with an explanatory error. Never alters the "
+             "primary computation (thresholds['t'], criterion_met, "
+             "zero_discoveries, note, the FWER thresholds, "
+             "threshold_sweep.csv, global_rule_baseline, or "
+             "error_profile['description']) -- it only adds the additional "
+             "'comparison' block.",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.comparison_null_run_dir is not None and args.operating_point is None:
+        raise SystemExit(
+            "--comparison-null-run-dir requires --operating-point: the "
+            "comparison null is only ever evaluated at the threshold t the "
+            "primary run resolves for a given --operating-point (never at a "
+            "threshold derived separately from the comparison null itself), "
+            "so without --operating-point there is no common t to compare "
+            "the two nulls at."
+        )
     args.out_dir.mkdir(parents=True, exist_ok=True)
     plots_dir = args.out_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
@@ -1530,12 +1561,130 @@ def main(argv=None) -> int:
             },
         }
 
+        # --- Optional: bracket the error rate with a second, independently-
+        # built null replicate set --------------------------------------------
+        # Off by default. Read-only with respect to everything computed above
+        # this point (op_t, error_profile, etc. are used but never mutated)
+        # and with respect to the primary computation elsewhere in main --
+        # this block only ever *adds* error_profile["comparison"] and, below,
+        # a "comparison_fdp_mean" column to error_profile_curve.csv.
+        #
+        # The comparison null is deliberately evaluated at op_t -- the SAME
+        # threshold error_profile["description"] above was just computed at
+        # -- rather than at a threshold derived from the comparison null's
+        # own data. Two nulls can only usefully bracket the false-discovery
+        # proportion if both numbers describe the same rule at the same
+        # threshold; comparing them at two separately-chosen thresholds would
+        # not be a bracket on anything.
+        comp_stat_left_s = comp_stat_right_s = None
+        comp_elevated_labels = comp_per_rep_p_ac_minus1 = comp_groups_arr = None
+        if args.comparison_null_run_dir is not None:
+            comp_npz_dir = args.comparison_null_run_dir / "npz"
+            if not comp_npz_dir.exists():
+                comp_npz_dir = args.comparison_null_run_dir
+            print(f"Loading comparison null replicates from {comp_npz_dir}...")
+            comp_left, comp_right, comp_ac, comp_used_files = load_null_replicates(
+                comp_npz_dir, n_tests
+            )
+            R_comp = comp_left.shape[0]
+            print(f"  {R_comp} comparison replicate(s) loaded")
+
+            if args.conditioning == "cell":
+                comp_stat_left_full, comp_stat_right_full = apply_conditioning(
+                    comp_left, comp_right, keys, tail, model
+                )
+            else:
+                comp_stat_left_full, comp_stat_right_full = comp_left, comp_right
+            comp_stat_left_s = comp_stat_left_full[:, mask]
+            comp_stat_right_s = comp_stat_right_full[:, mask]
+            comp_ac_s = comp_ac[:, mask]
+
+            comp_per_rep_p_ac_minus1 = np.mean(comp_ac_s == -1, axis=1)
+            comp_elevated_labels = comp_per_rep_p_ac_minus1 > args.elevated_pac_threshold
+            comp_groups_arr, comp_groups_route = infer_replicate_groups(comp_used_files, comp_npz_dir)
+
+            comp_description = describe_threshold(
+                op_t, stat_left_s, stat_right_s, comp_stat_left_s, comp_stat_right_s,
+                labels=comp_elevated_labels, label_statistic=comp_per_rep_p_ac_minus1,
+                groups=comp_groups_arr, fdp_quantile=args.fdp_quantile,
+                n_bootstrap=args.bootstrap_resamples, bootstrap_seed=args.bootstrap_seed,
+                bootstrap_unit="replicate",
+            ).to_dict()
+            comp_description["n_bootstrap"] = int(args.bootstrap_resamples)
+            comp_description["bootstrap_seed"] = int(args.bootstrap_seed)
+            comp_description["bootstrap_unit"] = "replicate"
+
+            primary_fdp_mean = error_profile["description"]["fdp_mean"]
+            comparison_fdp_mean = comp_description["fdp_mean"]
+            if primary_fdp_mean <= comparison_fdp_mean:
+                low_name, high_name = "primary", "comparison"
+                fdp_low, fdp_high = primary_fdp_mean, comparison_fdp_mean
+            else:
+                low_name, high_name = "comparison", "primary"
+                fdp_low, fdp_high = comparison_fdp_mean, primary_fdp_mean
+
+            error_profile["comparison"] = {
+                "null_run_dir": str(args.comparison_null_run_dir),
+                "R": int(R_comp),
+                "null_replicate_files": [str(f) for f in comp_used_files],
+                "description": comp_description,
+                "description_note": (
+                    f"description.t ({comp_description['t']!r}) is exactly "
+                    "error_profile['description']['t'] above (the primary "
+                    "run's own operating-point threshold, itself derived from "
+                    "the observed data, not from either null) -- the "
+                    "comparison null is never given a separately-derived "
+                    "threshold of its own; both nulls are compared at this "
+                    "one common t."
+                ),
+                "provenance": {"replicate_group_resolution": comp_groups_route},
+                "bracket": {
+                    "fdp_low": fdp_low,
+                    "fdp_high": fdp_high,
+                    "bracket_width": fdp_high - fdp_low,
+                    "which_null_is_low": low_name,
+                    "which_null_is_high": high_name,
+                },
+                "caveat": (
+                    "This [fdp_low, fdp_high] bracket on the false-discovery "
+                    "proportion (the fraction of calls at this threshold "
+                    "expected to be false, i.e. produced by the null alone) "
+                    "is only as good as the claim that the primary and "
+                    "comparison nulls err in measured OPPOSITE directions at "
+                    "this operating point -- one over-predicting false calls, "
+                    "the other under-predicting them. This calculation does "
+                    "not itself test that claim: the evidence for "
+                    "opposite-direction error comes from the held-out, "
+                    "signal-free observed/expected (O/E) diagnostic reported "
+                    "elsewhere in the calibration, not from anything computed "
+                    "here. If the two nulls do not actually err in opposite "
+                    "directions, [fdp_low, fdp_high] is not a valid bound on "
+                    "the true false-discovery proportion."
+                ),
+            }
+
         curve_df = describe_threshold_curve(
             stat_left_s, stat_right_s, null_stat_left_s, null_stat_right_s,
             call_counts=curve_calls,
             labels=elevated_labels, label_statistic=per_rep_p_ac_minus1,
             groups=groups_arr, fdp_quantile=args.fdp_quantile,
         )
+        if comp_stat_left_s is not None:
+            # Each anchor's threshold is derived purely from the primary
+            # (observed) split statistic by describe_threshold_curve above,
+            # not from either null -- see its docstring. Reusing that same
+            # per-anchor t against the comparison null here keeps every row
+            # comparable to the primary row it sits next to.
+            comp_fdp_means = []
+            for t_anchor in curve_df["t"]:
+                comp_anchor_desc = describe_threshold(
+                    float(t_anchor), stat_left_s, stat_right_s,
+                    comp_stat_left_s, comp_stat_right_s,
+                    labels=comp_elevated_labels, label_statistic=comp_per_rep_p_ac_minus1,
+                    groups=comp_groups_arr, fdp_quantile=args.fdp_quantile,
+                )
+                comp_fdp_means.append(comp_anchor_desc.fdp_mean)
+            curve_df["comparison_fdp_mean"] = comp_fdp_means
         curve_df.to_csv(args.out_dir / "error_profile_curve.csv", index=False)
         print(f"Wrote {args.out_dir / 'error_profile_curve.csv'} "
               f"({len(curve_df)} reporting anchor(s))")
