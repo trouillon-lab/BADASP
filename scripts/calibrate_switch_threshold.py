@@ -62,6 +62,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = REPO_ROOT / "config" / "snakemake.yaml"
 DEFAULT_OUT_DIR = REPO_ROOT / "results" / "badasp_scoring" / "null_calibration"
 
+# Pre-registered reporting-curve anchor call counts for --error-profile-calls's
+# default. These are used only when --operating-point is given and
+# --error-profile-calls is not; they were picked in advance as reporting
+# points of interest, not chosen after looking at what any particular null
+# run produces.
+DEFAULT_ERROR_PROFILE_CALLS = (51, 81, 240, 500, 795, 1500, 2023)
+
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -69,6 +76,8 @@ from scripts.score_null_replicate import SCORE_COLUMNS  # noqa: E402
 from src.badasp.null_model import (  # noqa: E402
     ThresholdResult,
     as_bin_threshold_dict,
+    describe_threshold,
+    describe_threshold_curve,
     exceedance_flatness,
     load_observed_scores,
     maxT_fwer_thresholds,
@@ -194,6 +203,227 @@ def load_null_replicates(null_dir: Path, n_tests: int) -> Tuple[np.ndarray, np.n
         raise FileNotFoundError(f"No valid rep_*.npz replicates could be loaded from {null_dir}")
 
     return np.stack(left_chunks), np.stack(right_chunks), np.stack(ac_chunks), used
+
+
+def _rep_index(path: Path) -> Optional[int]:
+    """Extract the integer index from a ``rep_<digits>.npz`` filename, or
+    None if the name doesn't follow that convention. String parsing only
+    (no regex import) since this repo's rep_NNNN naming is fixed and simple.
+    """
+    stem = path.stem
+    if not stem.startswith("rep_"):
+        return None
+    suffix = stem[len("rep_"):]
+    return int(suffix) if suffix.isdigit() else None
+
+
+def infer_replicate_groups(used_files: List[Path], null_dir: Path) -> Tuple[Optional[np.ndarray], str]:
+    """Resolve each loaded replicate's simulate-invocation label, i.e. which
+    `simulate()` call produced it, WITHOUT ever guessing from the replicate's
+    position in `used_files`.
+
+    `null_dir` is the directory `used_files` were loaded from (the ``npz``
+    directory `load_null_replicates` was pointed at); its parent is treated
+    as "the run directory" for locating provenance files, mirroring how
+    `load_null_replicates`/`main` already resolve `run_manifest.json` next to
+    the ``npz`` directory.
+
+    Resolution order, first route that produces a label for every file in
+    `used_files` wins:
+
+    1. ``<null_dir>/../run_manifest.json`` written by `merge_null_runs.py`:
+       has a ``replicates`` list of ``{"merged_index": i, "source": path}``
+       dicts. Each `used_files` entry is matched to its `source` path by its
+       ``rep_NNNN`` index, the sources are grouped by the directory they came
+       from, and THIS SAME FUNCTION is called again on each such directory
+       (recursively) with that directory's own subset of source files, so a
+       merged set inherits whatever real per-invocation labels its
+       constituent runs have. If a constituent run itself has no resolvable
+       labels, every replicate merged from it is labelled with that run's own
+       directory name -- still real, recorded provenance (the `source` path
+       already on file), not an invented index-based split.
+    2. ``<null_dir>/../provenance.json`` written by
+       `stage_null_replicate_set.py`: a ``replicates`` list of
+       ``{"rep_id": "rep_0004", "invocation": "9", ...}`` dicts, matched to
+       `used_files` by `rep_id` (== filename stem).
+    3. ``<null_dir>/../logs/progress.jsonl``: one JSON object per line with
+       ``{"replicate": i, "batch": b, ...}`` fields, matched to `used_files`
+       by the `rep_NNNN` index.
+    4. Otherwise `(None, "<reason>")`. Deliberately NOT attempted: any
+       arithmetic on the replicate index (e.g. a `chunk = index // 10` rule)
+       -- that convention lives only inside an external sbatch script (see
+       `euler_run`'s generation) and is not recorded anywhere this function
+       can read, so inferring it here would fabricate provenance rather than
+       recover it.
+
+    Returns
+    -------
+    (groups, route) where `groups` is an object-dtype array of length
+    `len(used_files)` (or None if unresolved) and `route` is a human-readable
+    string naming which route was used (or, if unresolved, why).
+    """
+    null_dir = Path(null_dir)
+    run_dir = null_dir.parent
+
+    # --- Route 1: merge_null_runs.py's run_manifest.json --------------------
+    manifest_path = run_dir / "run_manifest.json"
+    if manifest_path.exists():
+        manifest = None
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            manifest = None
+        replicates = manifest.get("replicates") if isinstance(manifest, dict) else None
+        is_merge_manifest = (
+            isinstance(replicates, list) and len(replicates) > 0
+            and all(isinstance(e, dict) and "source" in e and "merged_index" in e for e in replicates)
+        )
+        if is_merge_manifest:
+            by_index = {int(e["merged_index"]): e["source"] for e in replicates}
+            indices = [_rep_index(f) for f in used_files]
+            if all(i is not None and i in by_index for i in indices):
+                labels = np.empty(len(used_files), dtype=object)
+                sources_by_dir: Dict[Path, List[Tuple[int, Path]]] = {}
+                for pos, i in enumerate(indices):
+                    src_path = Path(by_index[i])
+                    if not src_path.is_absolute():
+                        src_path = REPO_ROOT / src_path
+                    sources_by_dir.setdefault(src_path.parent, []).append((pos, src_path))
+
+                for src_npz_dir, entries in sources_by_dir.items():
+                    positions = [p for p, _ in entries]
+                    sub_files = [f for _, f in entries]
+                    sub_labels, _sub_route = infer_replicate_groups(sub_files, src_npz_dir)
+                    run_name = src_npz_dir.parent.name
+                    if sub_labels is None:
+                        for pos in positions:
+                            labels[pos] = run_name
+                    else:
+                        for pos, lbl in zip(positions, sub_labels):
+                            labels[pos] = f"{run_name}:{lbl}"
+                return labels, (
+                    f"run_manifest.json at {manifest_path} (merge_null_runs.py's "
+                    "replicates[].source), resolved per originating source "
+                    "directory, recursing into each source's own provenance "
+                    "where available"
+                )
+
+    # --- Route 2: stage_null_replicate_set.py's provenance.json -------------
+    provenance_path = run_dir / "provenance.json"
+    if provenance_path.exists():
+        provenance = None
+        try:
+            provenance = json.loads(provenance_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            provenance = None
+        replicates = provenance.get("replicates") if isinstance(provenance, dict) else None
+        is_stage_provenance = (
+            isinstance(replicates, list) and len(replicates) > 0
+            and all(isinstance(e, dict) and "rep_id" in e and "invocation" in e for e in replicates)
+        )
+        if is_stage_provenance:
+            by_rep_id = {e["rep_id"]: e["invocation"] for e in replicates}
+            stems = [f.stem for f in used_files]
+            if all(s in by_rep_id for s in stems):
+                return (
+                    np.array([by_rep_id[s] for s in stems], dtype=object),
+                    f"provenance.json at {provenance_path} "
+                    "(stage_null_replicate_set.py's replicates[].invocation)",
+                )
+
+    # --- Route 3: logs/progress.jsonl ---------------------------------------
+    progress_path = run_dir / "logs" / "progress.jsonl"
+    if progress_path.exists():
+        by_replicate: Dict[int, object] = {}
+        try:
+            for line in progress_path.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                if isinstance(rec, dict) and "replicate" in rec and "batch" in rec:
+                    by_replicate[int(rec["replicate"])] = rec["batch"]
+        except (OSError, json.JSONDecodeError):
+            by_replicate = {}
+        if by_replicate:
+            indices = [_rep_index(f) for f in used_files]
+            if all(i is not None and i in by_replicate for i in indices):
+                return (
+                    np.array([by_replicate[i] for i in indices], dtype=object),
+                    f"logs/progress.jsonl at {progress_path} "
+                    "({'replicate','batch'} records)",
+                )
+
+    return None, (
+        f"no usable run_manifest.json (replicates[].source) at {manifest_path}, "
+        f"no provenance.json (replicates[].rep_id/.invocation) at "
+        f"{provenance_path}, and no logs/progress.jsonl (replicate/batch "
+        f"records) at {progress_path}; replicate provenance cannot be "
+        "inferred (arithmetic on the replicate index is deliberately not "
+        "attempted -- see infer_replicate_groups docstring)."
+    )
+
+
+def load_replicate_groups_csv(path: Path, used_files: List[Path]) -> Tuple[np.ndarray, str]:
+    """Explicit override for `infer_replicate_groups`: a two-column CSV with
+    headers `rep_file,invocation`, matched to `used_files` by filename (not
+    by row order), so the CSV need not list files in the same order they
+    were loaded. Every loaded replicate must have a matching row.
+    """
+    table = pd.read_csv(path)
+    if not {"rep_file", "invocation"}.issubset(table.columns):
+        raise SystemExit(
+            f"--replicate-groups-csv {path} must have columns 'rep_file' and "
+            f"'invocation'; found {list(table.columns)}."
+        )
+    by_name = {Path(str(row["rep_file"])).name: row["invocation"] for _, row in table.iterrows()}
+    missing = [f.name for f in used_files if f.name not in by_name]
+    if missing:
+        raise SystemExit(
+            f"--replicate-groups-csv {path} has no row for {len(missing)} loaded "
+            f"replicate(s) (e.g. {missing[:5]}); every loaded replicate must be "
+            "covered by the CSV."
+        )
+    groups = np.array([by_name[f.name] for f in used_files], dtype=object)
+    return groups, f"--replicate-groups-csv {path} (explicit override)"
+
+
+def parse_operating_point_spec(raw: str) -> Tuple[str, float]:
+    """Parse the --operating-point flag: 'calls:<int>' or 't:<float>'.
+
+    Never selects anything itself -- this only validates and unpacks the
+    string the caller already chose; resolving 'calls:<int>' into an actual
+    threshold value happens in `main`, where the observed statistic is
+    available.
+    """
+    if ":" not in raw:
+        raise SystemExit(
+            f"--operating-point {raw!r} not understood; accepted forms are "
+            "'calls:<int>' (e.g. 'calls:795') or 't:<float>' (e.g. 't:1.5')."
+        )
+    kind, _, value_str = raw.partition(":")
+    if kind == "calls":
+        try:
+            return "calls", float(int(value_str))
+        except ValueError:
+            raise SystemExit(
+                f"--operating-point {raw!r} not understood; 'calls:<int>' "
+                "needs an integer call count. Accepted forms are "
+                "'calls:<int>' (e.g. 'calls:795') or 't:<float>' (e.g. 't:1.5')."
+            )
+    if kind == "t":
+        try:
+            return "t", float(value_str)
+        except ValueError:
+            raise SystemExit(
+                f"--operating-point {raw!r} not understood; 't:<float>' needs "
+                "a numeric threshold. Accepted forms are 'calls:<int>' (e.g. "
+                "'calls:795') or 't:<float>' (e.g. 't:1.5')."
+            )
+    raise SystemExit(
+        f"--operating-point {raw!r} not understood; accepted forms are "
+        "'calls:<int>' (e.g. 'calls:795') or 't:<float>' (e.g. 't:1.5')."
+    )
 
 
 def check_observed_scores_consistency(observed_scores: Path, manifest: Optional[dict]) -> Optional[str]:
@@ -884,6 +1114,61 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--cv-folds", type=int, default=4,
                         help="Replicate-level folds for the conditioned rule's "
                              "cross-validation.")
+    parser.add_argument(
+        "--operating-point", type=str, default=None,
+        help="Describe (not select) the error rate of an externally chosen "
+             "threshold, reported alongside -- never instead of -- the "
+             "FDP-exceedance criterion above. Accepted forms: 'calls:<int>' "
+             "(t is set to the quantile of the primary observed split "
+             "statistic giving that many calls) or 't:<float>' (t given "
+             "directly, on whichever scale --conditioning produces: raw score "
+             "for 'none', z for 'cell'). Off by default; when given, adds an "
+             "'error_profile' block to thresholds.json and an "
+             "error_profile_curve.csv, and unblocks the diagnostics that "
+             "otherwise skip when the FDP criterion finds no threshold.",
+    )
+    parser.add_argument(
+        "--error-profile-calls", type=str, default=None,
+        help="Comma-separated call counts for the describe_threshold_curve "
+             "report written when --operating-point is given. These are "
+             "reporting anchors declared in advance of inspecting this run's "
+             "results, not call counts chosen after looking at them. Default "
+             f"when --operating-point is given: {','.join(str(c) for c in DEFAULT_ERROR_PROFILE_CALLS)}.",
+    )
+    parser.add_argument(
+        "--bootstrap-resamples", type=int, default=20000,
+        help="Nonparametric bootstrap resamples for the --operating-point "
+             "error-rate description (null_model.describe_threshold's "
+             "n_bootstrap). Used only when --operating-point is given.",
+    )
+    parser.add_argument(
+        "--bootstrap-seed", type=int, default=20260819,
+        help="Seed for the --operating-point bootstrap, so the reported "
+             "interval is reproducible from this recorded value rather than "
+             "unlogged global RNG state. Used only when --operating-point is "
+             "given.",
+    )
+    parser.add_argument(
+        "--elevated-pac-threshold", type=float, default=0.17,
+        help="P(AC=-1) value above which a null replicate is labelled "
+             "'elevated' for describe_threshold's two-state-mixture report "
+             "(used only when --operating-point is given). This cut is "
+             "purely descriptive, not a validated boundary: its own "
+             "falsifier checks (null_model.describe_threshold's "
+             "mixture.falsifiers, computed on the per-replicate P(AC=-1) "
+             "values themselves, not on this cut's effect on V) are "
+             "reported right next to it -- those checks are what tell the "
+             "reader whether a two-state description of the null "
+             "replicates is actually supported by the data at hand, and no "
+             "particular outcome should be assumed without reading them.",
+    )
+    parser.add_argument(
+        "--replicate-groups-csv", type=Path, default=None,
+        help="Optional two-column CSV (headers 'rep_file,invocation') giving "
+             "each loaded replicate's simulate-invocation label explicitly, "
+             "overriding automatic resolution via infer_replicate_groups. "
+             "Used only when --operating-point is given.",
+    )
     return parser.parse_args(argv)
 
 
@@ -987,6 +1272,165 @@ def main(argv=None) -> int:
         )
     )
 
+    # obs_stat/null_stat are the primary (possibly cell-conditioned) split
+    # statistics; moved up from the per-test-table section below because the
+    # optional --operating-point block (next) needs them too.
+    obs_stat = _split_statistic(stat_left, stat_right)
+    null_stat = _split_statistic(null_stat_left, null_stat_right)
+
+    # --- Optional: describe (not select) the error rate of an externally
+    # chosen operating point ------------------------------------------------
+    # Off by default. When given, this NEVER touches result.t, criterion_met,
+    # zero_discoveries or note -- it only adds an additional, clearly-labelled
+    # description of a threshold the caller picked by their own rule (e.g.
+    # "call the top N splits"), so a number is reported even when the
+    # FDP-exceedance criterion above found nothing.
+    error_profile: Optional[dict] = None
+    diag_t: Optional[float] = result.t
+    diag_threshold_source: Optional[str] = None
+    op_t: Optional[float] = None
+
+    if args.operating_point is not None:
+        op_kind, op_value = parse_operating_point_spec(args.operating_point)
+        finite_primary = obs_stat[np.isfinite(obs_stat)]
+        if op_kind == "calls":
+            if finite_primary.size == 0:
+                raise SystemExit(
+                    "--operating-point calls:N requires at least one finite "
+                    "observed split statistic; none are finite here."
+                )
+            n_calls = int(op_value)
+            frac = n_calls / finite_primary.size
+            op_t = float(np.quantile(finite_primary, 1.0 - frac))
+        else:  # "t"
+            op_t = float(op_value)
+        op_O = int(np.sum(finite_primary >= op_t))
+
+        if result.t is None:
+            diag_t = op_t
+            diag_threshold_source = (
+                "this threshold came from the --operating-point rule "
+                f"({args.operating_point!r}), NOT the FDP-exceedance "
+                "criterion above, which found no threshold meeting its "
+                "target."
+            )
+
+        if args.replicate_groups_csv is not None:
+            groups_arr, groups_route = load_replicate_groups_csv(args.replicate_groups_csv, used_files)
+        else:
+            groups_arr, groups_route = infer_replicate_groups(used_files, npz_dir)
+
+        per_rep_p_ac_minus1 = np.mean(null_ac == -1, axis=1)
+        elevated_labels = per_rep_p_ac_minus1 > args.elevated_pac_threshold
+
+        if args.error_profile_calls is not None:
+            curve_calls = [int(tok) for tok in args.error_profile_calls.split(",") if tok.strip()]
+        else:
+            curve_calls = list(DEFAULT_ERROR_PROFILE_CALLS)
+
+        def _describe_at(
+            t_value: float, ol: np.ndarray, orr: np.ndarray, nl: np.ndarray, nr: np.ndarray,
+            groups_for_desc: Optional[np.ndarray],
+        ) -> dict:
+            desc = describe_threshold(
+                t_value, ol, orr, nl, nr,
+                labels=elevated_labels, label_statistic=per_rep_p_ac_minus1, groups=groups_for_desc,
+                fdp_quantile=args.fdp_quantile,
+                n_bootstrap=args.bootstrap_resamples,
+                bootstrap_seed=args.bootstrap_seed,
+                bootstrap_unit="replicate",
+            ).to_dict()
+            desc["n_bootstrap"] = int(args.bootstrap_resamples)
+            desc["bootstrap_seed"] = int(args.bootstrap_seed)
+            desc["bootstrap_unit"] = "replicate"
+            return desc
+
+        def _describe_cluster_at(
+            t_value: float, ol: np.ndarray, orr: np.ndarray, nl: np.ndarray, nr: np.ndarray,
+            groups_for_desc: Optional[np.ndarray], reason_if_none: str,
+        ) -> dict:
+            if groups_for_desc is None:
+                return {"skipped": reason_if_none}
+            desc = describe_threshold(
+                t_value, ol, orr, nl, nr,
+                labels=elevated_labels, label_statistic=per_rep_p_ac_minus1, groups=groups_for_desc,
+                fdp_quantile=args.fdp_quantile,
+                n_bootstrap=args.bootstrap_resamples,
+                bootstrap_seed=args.bootstrap_seed,
+                bootstrap_unit="group",
+            ).to_dict()
+            desc["n_bootstrap"] = int(args.bootstrap_resamples)
+            desc["bootstrap_seed"] = int(args.bootstrap_seed)
+            desc["bootstrap_unit"] = "group"
+            return desc
+
+        selection_rule = (
+            f"t was fixed by the caller's --operating-point rule "
+            f"({args.operating_point!r}) and was NOT chosen by optimising any "
+            "null-derived quantity (e.g. minimising the achieved FDP or "
+            "maximising O over a grid, as threshold_at_fdr does) -- this is "
+            "why the reported error rate is not selection-biased."
+        )
+
+        error_profile = {
+            "operating_point": {"raw": args.operating_point, "t": op_t, "O": op_O},
+            "selection_rule": selection_rule,
+            "description": _describe_at(op_t, stat_left, stat_right, null_stat_left, null_stat_right, groups_arr),
+            "description_cluster_bootstrap": _describe_cluster_at(
+                op_t, stat_left, stat_right, null_stat_left, null_stat_right, groups_arr, groups_route
+            ),
+            "provenance": {
+                "replicate_group_resolution": groups_route,
+                "elevated_pac_threshold": float(args.elevated_pac_threshold),
+            },
+        }
+
+        curve_df = describe_threshold_curve(
+            stat_left, stat_right, null_stat_left, null_stat_right,
+            call_counts=curve_calls,
+            labels=elevated_labels, label_statistic=per_rep_p_ac_minus1,
+            groups=groups_arr, fdp_quantile=args.fdp_quantile,
+        )
+        curve_df.to_csv(args.out_dir / "error_profile_curve.csv", index=False)
+        print(f"Wrote {args.out_dir / 'error_profile_curve.csv'} "
+              f"({len(curve_df)} reporting anchor(s))")
+
+        if args.conditioning == "cell":
+            # Mirror global_rule_baseline: the same error_profile, computed on
+            # the UNCONDITIONED statistic, for comparison. When the operating
+            # point was given as an absolute 't:<float>', that literal number
+            # is reused here even though it was chosen on the z scale, purely
+            # so the two blocks stay structurally comparable -- see the "note"
+            # field below, which flags this rather than pretending the two t
+            # values are on the same scale.
+            obs_stat_raw = _split_statistic(obs_left, obs_right)
+            finite_raw = obs_stat_raw[np.isfinite(obs_stat_raw)]
+            if op_kind == "calls" and finite_raw.size > 0:
+                op_t_raw = float(np.quantile(finite_raw, 1.0 - (int(op_value) / finite_raw.size)))
+                raw_note = None
+            else:
+                op_t_raw = op_t
+                raw_note = (
+                    None if op_kind == "calls" else
+                    "t was given directly via 't:<float>' on the primary "
+                    "(z) scale; the same numeric value is reused here against "
+                    "the raw score, which is comparable only in the sense "
+                    "that both are literally the same number -- it is NOT a "
+                    "rescaled equivalent threshold."
+                )
+            op_O_raw = int(np.sum(finite_raw >= op_t_raw)) if finite_raw.size else 0
+            baseline_profile = {
+                "operating_point": {"raw": args.operating_point, "t": op_t_raw, "O": op_O_raw},
+                "selection_rule": selection_rule,
+                "description": _describe_at(op_t_raw, obs_left, obs_right, null_left, null_right, groups_arr),
+                "description_cluster_bootstrap": _describe_cluster_at(
+                    op_t_raw, obs_left, obs_right, null_left, null_right, groups_arr, groups_route
+                ),
+            }
+            if raw_note is not None:
+                baseline_profile["note"] = raw_note
+            error_profile["global_rule_baseline"] = baseline_profile
+
     thresholds_json = {
         "flavour": flavour,
         "R": R,
@@ -1026,6 +1470,8 @@ def main(argv=None) -> int:
             "consistency_check_note": consistency_note,
         },
     }
+    if error_profile is not None:
+        thresholds_json["error_profile"] = error_profile
     (args.out_dir / "thresholds.json").write_text(
         json.dumps(thresholds_json, indent=2, default=_json_default) + "\n"
     )
@@ -1040,8 +1486,8 @@ def main(argv=None) -> int:
     # {(event_type, clade_bin): t} dict, so this table -- not that dict --
     # is what a reader should cite. It ships each test's own raw-score
     # threshold so it is visible which positions were held to a higher bar.
-    obs_stat = _split_statistic(stat_left, stat_right)
-    null_stat = _split_statistic(null_stat_left, null_stat_right)
+    # (obs_stat/null_stat were computed earlier, before thresholds.json, so
+    # the optional --operating-point block above could use them too.)
     p_values, q_values = per_test_pvalues(obs_stat, null_stat)
     per_test = keys.copy()
     per_test["badasp_score_left"] = obs_left
@@ -1070,18 +1516,20 @@ def main(argv=None) -> int:
                 result.t, keys["position"].to_numpy(),
                 keys["clade_size_right"].to_numpy(float), model, tail,
             )
-    if result.t is not None:
-        per_test["called"] = obs_stat >= result.t
+    if diag_t is not None:
+        per_test["called"] = obs_stat >= diag_t
     per_test.to_csv(args.out_dir / "per_test_calls.csv", index=False)
     print(f"Wrote {args.out_dir / 'per_test_calls.csv'} ({len(per_test):,} rows"
-          + (f", {int(per_test['called'].sum()):,} called)" if result.t is not None else ")"))
+          + (f", {int(per_test['called'].sum()):,} called)" if diag_t is not None else ")"))
 
     # --- Diagnostics ----------------------------------------------------------
     diagnostics: Dict[str, object] = {}
 
     diagnostics["self_calibration"] = self_calibration_diagnostic(
-        null_stat_left, null_stat_right, result.t, args.holdout_fraction, seed
+        null_stat_left, null_stat_right, diag_t, args.holdout_fraction, seed
     )
+    if diag_threshold_source is not None and "skipped" not in diagnostics["self_calibration"]:
+        diagnostics["self_calibration"]["threshold_source"] = diag_threshold_source
 
     if args.conditioning == "cell":
         diagnostics["conditioned_cross_validation"] = conditioned_cv_diagnostic(
@@ -1093,26 +1541,32 @@ def main(argv=None) -> int:
 
     site_rates = load_site_rates(args.site_rate_file)
     flatness_df, flatness_note = compute_flatness_diagnostics(
-        null_stat, keys, result.t, site_rates, args.num_bins_decile, args.num_bins_quartile
+        null_stat, keys, diag_t, site_rates, args.num_bins_decile, args.num_bins_quartile
     )
     if not flatness_df.empty:
         flatness_df.to_csv(args.out_dir / "exceedance_flatness.csv", index=False)
         plot_flatness(flatness_df, plots_dir / "exceedance_flatness.png")
+    if diag_threshold_source is not None and "skipped" not in flatness_note:
+        flatness_note["threshold_source"] = diag_threshold_source
     diagnostics["exceedance_flatness"] = {**flatness_note, "n_rows": int(len(flatness_df))}
 
     diagnostics["ac_plus1_control"] = ac_plus1_control(
-        obs_stat, null_stat, keys["ac"].to_numpy(), result.t, null_ac=null_ac
+        obs_stat, null_stat, keys["ac"].to_numpy(), diag_t, null_ac=null_ac
     )
-    if result.t is not None:
+    if diag_threshold_source is not None and "skipped" not in diagnostics["ac_plus1_control"]:
+        diagnostics["ac_plus1_control"]["threshold_source"] = diag_threshold_source
+    if diag_t is not None:
         plot_ac_plus1_control(obs_stat, null_stat, keys["ac"].to_numpy(), plots_dir / "ac_plus1_control.png")
 
     diagnostics["p_ac_minus1"] = p_ac_minus1_comparison(keys["ac"].to_numpy(), null_ac)
 
     diagnostics["head_to_head_vs_percentile_rule"] = head_to_head_vs_percentile_rule(
-        keys, obs_left, obs_right, result.t, args.percentile_comparison,
+        keys, obs_left, obs_right, diag_t, args.percentile_comparison,
         args.num_bins_decile,
-        calibrated_calls=(obs_stat >= result.t) if (model is not None and result.t is not None) else None,
+        calibrated_calls=(obs_stat >= diag_t) if (model is not None and diag_t is not None) else None,
     )
+    if diag_threshold_source is not None and "skipped" not in diagnostics["head_to_head_vs_percentile_rule"]:
+        diagnostics["head_to_head_vs_percentile_rule"]["threshold_source"] = diag_threshold_source
 
     # --- Legacy bin-threshold dict (compatibility shim) ---------------------
     # The four downstream analysis scripts consume

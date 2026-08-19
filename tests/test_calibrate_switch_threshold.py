@@ -369,3 +369,306 @@ def test_legacy_bin_dict_is_emitted_and_flagged_lossy(tmp_path):
     assert bins["lossy_projection"] is True
     assert bins["source_of_truth"] == "per_test_calls.csv"
     assert len(bins["per_bin_threshold"]) > 1
+
+
+# ---------------------------------------------------------------------------
+# --operating-point / error_profile (describe-only threshold reporting)
+# ---------------------------------------------------------------------------
+
+
+def test_error_profile_absent_without_operating_point(tmp_path):
+    """The additive invariant: with no --operating-point, nothing new appears."""
+    obs_path, run_dir = _build_fixture(tmp_path, n=300, R=15, plant=False)
+    out_dir = tmp_path / "calib_no_op"
+    rc = cst.main([
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--out-dir", str(out_dir), "--target-fdr", "0.01", "--fdp-quantile", "0.95",
+    ])
+    assert rc == 0
+    thresholds = json.loads((out_dir / "thresholds.json").read_text())
+    assert "error_profile" not in thresholds
+    assert not (out_dir / "error_profile_curve.csv").exists()
+
+
+def test_operating_point_calls_reports_error_profile_on_pure_noise(tmp_path):
+    """--operating-point works even when the FDP criterion finds nothing:
+    error_profile is populated while t/criterion_met stay honest (None/False).
+    Uses a larger n so the default --error-profile-calls anchors (up to 2023)
+    are within the number of finite observed split statistics available.
+    """
+    obs_path, run_dir = _build_fixture(tmp_path, n=2200, R=15, plant=False)
+    out_dir = tmp_path / "calib_op_noise"
+    rc = cst.main([
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--out-dir", str(out_dir), "--target-fdr", "0.01", "--fdp-quantile", "0.95",
+        "--operating-point", "calls:20",
+        "--bootstrap-resamples", "50", "--bootstrap-seed", "1",
+    ])
+    assert rc == 0
+    thresholds = json.loads((out_dir / "thresholds.json").read_text())
+    assert thresholds["criterion_met"] is False
+    assert thresholds["t"] is None
+    assert thresholds["note"]
+
+    ep = thresholds["error_profile"]
+    assert ep["operating_point"]["raw"] == "calls:20"
+    assert ep["operating_point"]["t"] is not None
+    assert ep["description"]["O"] == ep["operating_point"]["O"]
+    assert ep["description"]["n_bootstrap"] == 50
+    assert ep["description"]["bootstrap_unit"] == "replicate"
+    assert "NOT chosen by optimising" in ep["selection_rule"]
+    assert "replicate_group_resolution" in ep["provenance"]
+
+    assert (out_dir / "error_profile_curve.csv").exists()
+    curve = pd.read_csv(out_dir / "error_profile_curve.csv")
+    assert list(curve["target_calls"]) == sorted(cst.DEFAULT_ERROR_PROFILE_CALLS)
+
+
+def test_operating_point_custom_error_profile_calls(tmp_path):
+    obs_path, run_dir = _build_fixture(tmp_path, n=300, R=15, plant=False)
+    out_dir = tmp_path / "calib_op_custom_curve"
+    rc = cst.main([
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--out-dir", str(out_dir), "--target-fdr", "0.01", "--fdp-quantile", "0.95",
+        "--operating-point", "calls:20",
+        "--error-profile-calls", "5,20,50",
+        "--bootstrap-resamples", "50",
+    ])
+    assert rc == 0
+    curve = pd.read_csv(out_dir / "error_profile_curve.csv")
+    assert list(curve["target_calls"]) == [5, 20, 50]
+
+
+def test_gated_diagnostics_unblocked_with_operating_point(tmp_path):
+    """self_calibration, exceedance_flatness, ac_plus1_control and
+    head_to_head_vs_percentile_rule normally short-circuit with 'skipped'
+    when the FDP criterion finds no t; --operating-point unblocks them
+    without touching thresholds.json's own criterion fields.
+    """
+    obs_path, run_dir = _build_fixture(tmp_path, n=300, R=15, plant=False)
+    out_dir = tmp_path / "calib_gated"
+    rc = cst.main([
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--out-dir", str(out_dir), "--target-fdr", "0.01", "--fdp-quantile", "0.95",
+        "--operating-point", "calls:20",
+        "--error-profile-calls", "5,20,50",
+        "--bootstrap-resamples", "50",
+    ])
+    assert rc == 0
+
+    diagnostics = json.loads((out_dir / "diagnostics.json").read_text())
+    for key in ("self_calibration", "exceedance_flatness", "head_to_head_vs_percentile_rule"):
+        d = diagnostics[key]
+        assert "skipped" not in d
+        assert "threshold_source" in d
+        assert "operating-point" in d["threshold_source"]
+    assert "threshold_source" in diagnostics["ac_plus1_control"]
+    assert (out_dir / "plots" / "ac_plus1_control.png").exists()
+
+    thresholds = json.loads((out_dir / "thresholds.json").read_text())
+    assert thresholds["criterion_met"] is False
+    assert thresholds["t"] is None
+    assert thresholds["zero_discoveries"] is False
+    assert thresholds["note"]
+
+
+def test_per_test_calls_called_column_only_with_operating_point(tmp_path):
+    obs_path, run_dir = _build_fixture(tmp_path, n=300, R=15, plant=False)
+
+    out_dir_no_flag = tmp_path / "calib_called_no_flag"
+    cst.main([
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--out-dir", str(out_dir_no_flag), "--target-fdr", "0.01", "--fdp-quantile", "0.95",
+    ])
+    per_test_no_flag = pd.read_csv(out_dir_no_flag / "per_test_calls.csv")
+    assert "called" not in per_test_no_flag.columns
+
+    out_dir = tmp_path / "calib_called"
+    rc = cst.main([
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--out-dir", str(out_dir), "--target-fdr", "0.01", "--fdp-quantile", "0.95",
+        "--operating-point", "calls:20",
+        "--error-profile-calls", "5,20,50",
+        "--bootstrap-resamples", "50",
+    ])
+    assert rc == 0
+    per_test = pd.read_csv(out_dir / "per_test_calls.csv")
+    assert "called" in per_test.columns
+    thresholds = json.loads((out_dir / "thresholds.json").read_text())
+    assert int(per_test["called"].sum()) == thresholds["error_profile"]["operating_point"]["O"]
+
+
+def test_operating_point_malformed_exits_naming_accepted_forms(tmp_path):
+    obs_path, run_dir = _build_fixture(tmp_path, n=300, R=15, plant=False)
+    out_dir = tmp_path / "calib_bad_op"
+    with pytest.raises(SystemExit, match="calls:<int>"):
+        cst.main([
+            "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+            "--out-dir", str(out_dir), "--operating-point", "bogus",
+        ])
+
+
+def _assert_json_primitive(value, path="$"):
+    if isinstance(value, dict):
+        for k, v in value.items():
+            _assert_json_primitive(v, f"{path}.{k}")
+    elif isinstance(value, list):
+        for i, v in enumerate(value):
+            _assert_json_primitive(v, f"{path}[{i}]")
+    else:
+        assert isinstance(value, (str, int, float, bool)) or value is None, (
+            f"non-JSON-primitive type {type(value)} at {path}: {value!r}"
+        )
+
+
+def test_thresholds_json_fully_serializable_with_operating_point(tmp_path):
+    """Guards against numpy types leaking into thresholds.json -- including
+    via a --replicate-groups-csv column that pandas infers as int64 because
+    every invocation label happens to look numeric.
+    """
+    obs_path, run_dir = _build_fixture(tmp_path, n=300, R=6, plant=False)
+    npz_dir = run_dir / "npz"
+    files = sorted(npz_dir.glob("rep_*.npz"))
+    csv_path = tmp_path / "groups.csv"
+    rows = ["rep_file,invocation"] + [f"{f.name},{100 + i}" for i, f in enumerate(files)]
+    csv_path.write_text("\n".join(rows) + "\n")
+
+    out_dir = tmp_path / "calib_serializable"
+    rc = cst.main([
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--out-dir", str(out_dir), "--target-fdr", "0.01", "--fdp-quantile", "0.95",
+        "--operating-point", "calls:20",
+        "--error-profile-calls", "5,20,50",
+        "--replicate-groups-csv", str(csv_path),
+        "--bootstrap-resamples", "50",
+    ])
+    assert rc == 0
+    parsed = json.loads((out_dir / "thresholds.json").read_text())
+    _assert_json_primitive(parsed)
+
+
+# ---------------------------------------------------------------------------
+# infer_replicate_groups: the four provenance-resolution routes
+# ---------------------------------------------------------------------------
+
+
+def _touch_npz_files(npz_dir: Path, n: int) -> list:
+    npz_dir.mkdir(parents=True, exist_ok=True)
+    files = []
+    for i in range(n):
+        f = npz_dir / f"rep_{i:04d}.npz"
+        f.write_bytes(b"")
+        files.append(f)
+    return files
+
+
+def test_infer_replicate_groups_route2_provenance_json(tmp_path):
+    run_dir = tmp_path / "staged"
+    npz_dir = run_dir / "npz"
+    files = _touch_npz_files(npz_dir, 3)
+    provenance = {
+        "replicates": [
+            {"rep_id": "rep_0000", "invocation": "5"},
+            {"rep_id": "rep_0001", "invocation": "6"},
+            {"rep_id": "rep_0002", "invocation": "7"},
+        ]
+    }
+    (run_dir / "provenance.json").write_text(json.dumps(provenance))
+
+    groups, route = cst.infer_replicate_groups(files, npz_dir)
+    assert groups is not None
+    assert list(groups) == ["5", "6", "7"]
+    assert "provenance.json" in route
+
+
+def test_infer_replicate_groups_route3_progress_jsonl(tmp_path):
+    run_dir = tmp_path / "batch"
+    npz_dir = run_dir / "npz"
+    files = _touch_npz_files(npz_dir, 3)
+    logs_dir = run_dir / "logs"
+    logs_dir.mkdir()
+    records = [{"replicate": i, "batch": i // 2} for i in range(3)]
+    (logs_dir / "progress.jsonl").write_text("\n".join(json.dumps(r) for r in records) + "\n")
+
+    groups, route = cst.infer_replicate_groups(files, npz_dir)
+    assert groups is not None
+    assert list(groups) == [0, 0, 1]
+    assert "progress.jsonl" in route
+
+
+def test_infer_replicate_groups_route4_none_with_reason(tmp_path):
+    run_dir = tmp_path / "bare"
+    npz_dir = run_dir / "npz"
+    files = _touch_npz_files(npz_dir, 2)
+
+    groups, reason = cst.infer_replicate_groups(files, npz_dir)
+    assert groups is None
+    assert "index" in reason  # explains the arithmetic-on-index fallback is refused
+
+
+def test_infer_replicate_groups_route1_merge_manifest_recurses(tmp_path):
+    """A merged run_manifest.json (merge_null_runs.py's shape) resolves by
+    recursing into each source directory's own provenance; a source with no
+    resolvable provenance of its own falls back to its run-directory name
+    (real recorded provenance, not index arithmetic) -- mirroring pooled_41's
+    actual euler_run (bare) + treelen_scan (has provenance.json) composition.
+    """
+    sub_a = tmp_path / "subA"
+    sub_a_npz = sub_a / "npz"
+    sub_a_files = _touch_npz_files(sub_a_npz, 2)
+    (sub_a / "provenance.json").write_text(json.dumps({
+        "replicates": [
+            {"rep_id": "rep_0000", "invocation": "100"},
+            {"rep_id": "rep_0001", "invocation": "101"},
+        ]
+    }))
+
+    sub_b = tmp_path / "subB"
+    sub_b_npz = sub_b / "npz"
+    sub_b_files = _touch_npz_files(sub_b_npz, 1)  # bare: no provenance anywhere
+
+    merged = tmp_path / "merged"
+    merged_npz = merged / "npz"
+    merged_npz.mkdir(parents=True)
+    all_sources = sub_a_files + sub_b_files
+    merged_files = []
+    replicates_manifest = []
+    for idx, src in enumerate(all_sources):
+        dst = merged_npz / f"rep_{idx:04d}.npz"
+        dst.write_bytes(b"")
+        merged_files.append(dst)
+        replicates_manifest.append({"merged_index": idx, "source": str(src)})
+    (merged / "run_manifest.json").write_text(json.dumps({"replicates": replicates_manifest}))
+
+    groups, route = cst.infer_replicate_groups(merged_files, merged_npz)
+    assert groups is not None
+    assert "run_manifest.json" in route
+    assert list(groups) == ["subA:100", "subA:101", "subB"]
+
+
+def test_replicate_groups_csv_overrides_automatic_resolution(tmp_path):
+    obs_path, run_dir = _build_fixture(tmp_path, n=300, R=6, plant=False)
+    npz_dir = run_dir / "npz"
+    files = sorted(npz_dir.glob("rep_*.npz"))
+    csv_path = tmp_path / "groups.csv"
+    rows = ["rep_file,invocation"] + [f"{f.name},grpX" for f in files]
+    csv_path.write_text("\n".join(rows) + "\n")
+
+    out_dir = tmp_path / "calib_groups_csv"
+    rc = cst.main([
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--out-dir", str(out_dir), "--target-fdr", "0.01", "--fdp-quantile", "0.95",
+        "--operating-point", "calls:20",
+        "--error-profile-calls", "5,20,50",
+        "--replicate-groups-csv", str(csv_path),
+        "--bootstrap-resamples", "50",
+    ])
+    assert rc == 0
+    thresholds = json.loads((out_dir / "thresholds.json").read_text())
+    prov = thresholds["error_profile"]["provenance"]["replicate_group_resolution"]
+    assert "--replicate-groups-csv" in prov
+    assert "explicit override" in prov
+    gc = thresholds["error_profile"]["description"]["group_composition"]
+    assert gc is not None
+    assert set(gc.keys()) == {"grpX"}
+    assert gc["grpX"]["n"] == 6
