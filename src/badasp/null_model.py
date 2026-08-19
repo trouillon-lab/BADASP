@@ -600,9 +600,11 @@ def describe_threshold(
     null_right: np.ndarray,
     *,
     labels: Optional[np.ndarray] = None,
+    label_statistic: Optional[np.ndarray] = None,
     groups: Optional[np.ndarray] = None,
     fdp_quantile: float = 0.90,
     ci_level: float = 0.95,
+    gap_ratio_threshold: float = 2.0,
     n_bootstrap: int = 0,
     bootstrap_seed: Optional[int] = None,
     bootstrap_unit: str = "replicate",
@@ -668,15 +670,37 @@ def describe_threshold(
       rather than a normal-theory standard error on `V_r` directly, because
       the two-state pattern means the ordinary CLT-based SE is the wrong
       description of the uncertainty here.
-    * `mixture["falsifiers"]`: three sanity checks on the label itself, not
-      on the mixture math — each is a `{"value": bool, "explanation": str}`
+    * `mixture["falsifiers"]`: sanity checks on the label itself, not on the
+      mixture math — each is at least a `{"value": bool, "explanation": str}`
       pair describing what a `True` value would mean:
         - `"low_state_exceeds_high_minimum"`: a low-labelled replicate has
           `V` at or above the minimum `V` among high-labelled replicates.
         - `"n_high_below_2"`: fewer than 2 replicates are labelled
           high-state, so the binomial interval is essentially uninformative.
-        - `"labels_not_separating"`: the `V` ranges of the two groups
-          overlap at all.
+        - `"gap_not_dominant"`: computed on `label_statistic` (the
+          per-replicate scalar the labels were cut from), not on `V`. Sort
+          `label_statistic`, take consecutive differences, and compute
+          `gap_ratio = largest_gap / second_largest_gap`. A genuinely
+          bimodal `label_statistic` shows one dominant gap separating the
+          two states; a continuous, right-skewed sample instead shows
+          several comparable gaps. `True` when
+          `gap_ratio < gap_ratio_threshold`, i.e. the largest gap is not
+          clearly dominant, which is evidence against a real two-state
+          structure in `label_statistic` (independent of where the cut was
+          placed). The dict also carries `gap_ratio`, `largest_gap`,
+          `second_largest_gap`, and `largest_gap_between` (the two
+          `label_statistic` values the largest gap sits between).
+        - `"cut_not_at_largest_gap"`: also computed on `label_statistic`.
+          The label cut is reconstructed empirically as the interval between
+          `max(label_statistic[~labels])` and `min(label_statistic[labels])`;
+          `True` when that interval's endpoints do not coincide with the
+          largest gap's endpoints, i.e. the cut used to build `labels` was
+          not placed at the most prominent break in `label_statistic`. The
+          dict also carries `cut_between` and `cut_gap_width`.
+        - `"gap_not_dominant"` and `"cut_not_at_largest_gap"` are both
+          `{"value": None, "skipped": str}` instead of the usual shape when
+          `label_statistic` is not supplied, since neither can be computed
+          from `V` alone.
       None of these being True is not proof the label is correct; any of
       them being True is evidence the two-state label does not hold here.
 
@@ -729,6 +753,18 @@ def describe_threshold(
         Null branch scores.
     labels : Optional[np.ndarray], shape (R,), bool
         True marks a "high-state" null replicate.
+    label_statistic : Optional[np.ndarray], shape (R,)
+        The per-replicate scalar `labels` was derived from by cutting it at
+        some threshold (e.g. per-replicate P(AC=-1)). Used only to compute
+        the `"gap_not_dominant"` and `"cut_not_at_largest_gap"` falsifiers in
+        `mixture["falsifiers"]`, which test whether `label_statistic` itself
+        looks bimodal and whether the cut lands on its largest gap — as
+        opposed to testing separation on `V`, which conflates the label's
+        validity with whether the cut happens to also split `V` (V can be
+        strongly correlated with `label_statistic` even when the labelling
+        cut itself is arbitrary). Ignored when `labels` is None. When
+        `labels` is given without `label_statistic`, both falsifiers are
+        reported as skipped rather than silently omitted.
     groups : Optional[np.ndarray], shape (R,)
         Which simulate invocation each replicate came from.
     fdp_quantile : float
@@ -737,6 +773,11 @@ def describe_threshold(
     ci_level : float
         Confidence level for the Clopper-Pearson interval on `pi_hat`, and
         (when `n_bootstrap > 0`) for the bootstrap percentile interval.
+    gap_ratio_threshold : float
+        Threshold on `gap_ratio` (largest gap / second-largest gap in sorted
+        `label_statistic`) below which `"gap_not_dominant"` fires. Default
+        2.0, i.e. the largest gap must be at least twice the second-largest
+        gap for the sample to be called dominantly bimodal.
     n_bootstrap : int
         Number of bootstrap resamples. `0` (default) skips the bootstrap
         entirely.
@@ -848,14 +889,97 @@ def describe_threshold(
 
         if n_high > 0 and n_low > 0:
             high_min = float(V_high.min())
-            low_max = float(V_low.max())
-            high_max = float(V_high.max())
-            low_min = float(V_low.min())
             low_state_exceeds_high_minimum = bool(np.any(V_low >= high_min))
-            labels_not_separating = not (low_max < high_min or high_max < low_min)
         else:
             low_state_exceeds_high_minimum = False
-            labels_not_separating = False
+
+        # gap_not_dominant / cut_not_at_largest_gap: checks on the labelling
+        # variable's own distribution (label_statistic), not on V. This
+        # replaces the old "labels_not_separating" check on V, which was
+        # uninformative: V is strongly monotone in label_statistic, so
+        # whether V happens to separate tests only the cut, not whether
+        # label_statistic is genuinely bimodal.
+        if label_statistic is None:
+            skip_reason = (
+                "label_statistic was not provided to describe_threshold, so this "
+                "check on the labelling variable's own distribution could not be "
+                "computed."
+            )
+            gap_not_dominant_entry = {"value": None, "skipped": skip_reason}
+            cut_not_at_largest_gap_entry = {"value": None, "skipped": skip_reason}
+        else:
+            label_statistic_arr = np.asarray(label_statistic, dtype=np.float64)
+            if label_statistic_arr.shape[0] != R:
+                raise ValueError("label_statistic must have length R (one entry per null replicate).")
+
+            sorted_stat = np.sort(label_statistic_arr)
+            diffs = np.diff(sorted_stat)
+            if diffs.size == 0:
+                # R <= 1: no gaps at all, nothing to compare.
+                gap_ratio = float("nan")
+                largest_gap = float("nan")
+                second_largest_gap = float("nan")
+                largest_gap_between = [None, None]
+            else:
+                order = np.argsort(diffs)[::-1]  # descending
+                largest_idx = int(order[0])
+                largest_gap = float(diffs[largest_idx])
+                largest_gap_between = [float(sorted_stat[largest_idx]), float(sorted_stat[largest_idx + 1])]
+                if diffs.size >= 2:
+                    second_largest_gap = float(diffs[int(order[1])])
+                    gap_ratio = float("inf") if second_largest_gap == 0 else largest_gap / second_largest_gap
+                else:
+                    # Only one gap exists (R == 2): trivially dominant.
+                    second_largest_gap = None
+                    gap_ratio = float("inf")
+
+            gap_not_dominant_value = bool(np.isfinite(gap_ratio) and gap_ratio < gap_ratio_threshold)
+            gap_not_dominant_entry = {
+                "value": gap_not_dominant_value,
+                "explanation": (
+                    f"If True, the largest gap in sorted label_statistic is not clearly "
+                    f"dominant over the second-largest gap (gap_ratio < "
+                    f"{gap_ratio_threshold:g}). A genuinely bimodal label_statistic shows "
+                    "one dominant gap separating the two states, whereas a continuous, "
+                    "right-skewed sample shows several comparable gaps -- so a small "
+                    "gap_ratio is evidence against a real two-state structure in "
+                    "label_statistic, independent of where the label cut was placed."
+                ),
+                "gap_ratio": gap_ratio,
+                "largest_gap": largest_gap,
+                "second_largest_gap": second_largest_gap,
+                "largest_gap_between": largest_gap_between,
+            }
+
+            if n_high > 0 and n_low > 0:
+                cut_low = float(np.max(label_statistic_arr[~labels_arr]))
+                cut_high = float(np.min(label_statistic_arr[labels_arr]))
+                cut_gap_width = cut_high - cut_low
+                cut_between = [cut_low, cut_high]
+                cut_matches_largest_gap = (
+                    largest_gap_between[0] is not None
+                    and np.isclose(cut_low, largest_gap_between[0])
+                    and np.isclose(cut_high, largest_gap_between[1])
+                )
+                cut_not_at_largest_gap_value = bool(not cut_matches_largest_gap)
+            else:
+                cut_gap_width = None
+                cut_between = [None, None]
+                cut_not_at_largest_gap_value = False
+
+            cut_not_at_largest_gap_entry = {
+                "value": cut_not_at_largest_gap_value,
+                "explanation": (
+                    "If True, the label cut -- reconstructed empirically as the interval "
+                    "between max(label_statistic[~labels]) and min(label_statistic[labels]) "
+                    "-- does not coincide with the largest gap in sorted label_statistic, "
+                    "meaning the cut used to build labels was not placed at the most "
+                    "prominent break in the data."
+                ),
+                "cut_between": cut_between,
+                "cut_gap_width": cut_gap_width,
+                "largest_gap_between": largest_gap_between,
+            }
 
         falsifiers = {
             "low_state_exceeds_high_minimum": {
@@ -874,14 +998,8 @@ def describe_threshold(
                     "successes to be informative."
                 ),
             },
-            "labels_not_separating": {
-                "value": bool(labels_not_separating),
-                "explanation": (
-                    "If True, the V ranges of the low- and high-labelled replicates "
-                    "overlap, so the two-state label is not a clean partition of the "
-                    "observed spread of V."
-                ),
-            },
+            "gap_not_dominant": gap_not_dominant_entry,
+            "cut_not_at_largest_gap": cut_not_at_largest_gap_entry,
         }
 
         mixture = {

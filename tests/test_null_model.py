@@ -707,7 +707,7 @@ def test_clopper_pearson_edge_cases_and_middle_case_matches_scipy() -> None:
 
 
 def test_falsifiers_fire_on_hand_built_overlap_case() -> None:
-    """n_high=1 with an overlapping low replicate should trip all three flags."""
+    """n_high=1 with an overlapping low replicate should trip both V-based flags."""
     n = 6
     t = 1.0
     V_values = [5, 6, 1, 1, 1, 1]  # replicate 0 is the sole "high" one
@@ -721,11 +721,10 @@ def test_falsifiers_fire_on_hand_built_overlap_case() -> None:
     falsifiers = desc.mixture["falsifiers"]
     assert falsifiers["low_state_exceeds_high_minimum"]["value"] is True
     assert falsifiers["n_high_below_2"]["value"] is True
-    assert falsifiers["labels_not_separating"]["value"] is True
 
 
 def test_falsifiers_clean_on_cleanly_separated_case() -> None:
-    """A cleanly separated two-state pattern should trip none of the flags."""
+    """A cleanly separated two-state pattern should trip neither V-based flag."""
     n = 15
     t = 1.0
     V_high = [10, 11, 12]
@@ -741,7 +740,141 @@ def test_falsifiers_clean_on_cleanly_separated_case() -> None:
     falsifiers = desc.mixture["falsifiers"]
     assert falsifiers["low_state_exceeds_high_minimum"]["value"] is False
     assert falsifiers["n_high_below_2"]["value"] is False
-    assert falsifiers["labels_not_separating"]["value"] is False
+
+
+# ---------------------------------------------------------------------------
+# describe_threshold: gap-based falsifiers on label_statistic
+# ---------------------------------------------------------------------------
+#
+# These replace the removed "labels_not_separating" check, which tested
+# whether the *chosen cut* happened to separate V -- uninformative, since V
+# is strongly monotone in the labelling statistic and the check flips
+# depending on exactly where the cut is placed. The new checks instead look
+# at the labelling variable's own distribution (label_statistic).
+
+
+def test_gap_not_dominant_false_on_hand_built_bimodal_statistic() -> None:
+    """Two tight clusters separated by one big gap: the gap is dominant."""
+    n = 6
+    t = 1.0
+    V_values = [2] * 6
+    null_left, null_right = _null_with_exact_V(V_values, n_cols=n, t=t)
+    obs_left = np.full(n, t - 1.0)
+    obs_right = np.full(n, t - 1.0)
+
+    label_statistic = np.array([0.10, 0.11, 0.12, 0.60, 0.61, 0.62])
+    labels = np.array([False, False, False, True, True, True])
+
+    desc = describe_threshold(
+        t, obs_left, obs_right, null_left, null_right, labels=labels, label_statistic=label_statistic
+    )
+    gap_entry = desc.mixture["falsifiers"]["gap_not_dominant"]
+    assert gap_entry["value"] is False
+    assert gap_entry["gap_ratio"] == pytest.approx(48.0)
+    assert gap_entry["largest_gap"] == pytest.approx(0.48)
+    assert gap_entry["largest_gap_between"] == pytest.approx([0.12, 0.60])
+
+
+def test_gap_not_dominant_true_on_hand_built_continuous_right_skewed_statistic() -> None:
+    """Gaps that grow smoothly towards the tail: no single gap dominates."""
+    n = 8
+    t = 1.0
+    V_values = [2] * 8
+    null_left, null_right = _null_with_exact_V(V_values, n_cols=n, t=t)
+    obs_left = np.full(n, t - 1.0)
+    obs_right = np.full(n, t - 1.0)
+
+    label_statistic = np.array([0.10, 0.14, 0.19, 0.25, 0.32, 0.40, 0.50, 0.62])
+    labels = np.array([False] * 5 + [True] * 3)  # cut at 0.32/0.40, arbitrary w.r.t. the gaps
+
+    desc = describe_threshold(
+        t, obs_left, obs_right, null_left, null_right, labels=labels, label_statistic=label_statistic
+    )
+    gap_entry = desc.mixture["falsifiers"]["gap_not_dominant"]
+    assert gap_entry["value"] is True
+
+
+def test_cut_not_at_largest_gap_fires_when_cut_placed_away_from_gap() -> None:
+    n = 6
+    t = 1.0
+    V_values = [2] * 6
+    null_left, null_right = _null_with_exact_V(V_values, n_cols=n, t=t)
+    obs_left = np.full(n, t - 1.0)
+    obs_right = np.full(n, t - 1.0)
+
+    # The largest gap sits between 0.12 and 0.50; the cut below is placed
+    # inside the low cluster instead, away from that gap.
+    label_statistic = np.array([0.10, 0.11, 0.12, 0.50, 0.51, 0.52])
+    labels = np.array([False, False, True, True, True, True])
+
+    desc = describe_threshold(
+        t, obs_left, obs_right, null_left, null_right, labels=labels, label_statistic=label_statistic
+    )
+    cut_entry = desc.mixture["falsifiers"]["cut_not_at_largest_gap"]
+    assert cut_entry["value"] is True
+    assert cut_entry["cut_between"] == pytest.approx([0.11, 0.12])
+
+
+def test_cut_not_at_largest_gap_does_not_fire_when_cut_placed_at_gap() -> None:
+    n = 6
+    t = 1.0
+    V_values = [2] * 6
+    null_left, null_right = _null_with_exact_V(V_values, n_cols=n, t=t)
+    obs_left = np.full(n, t - 1.0)
+    obs_right = np.full(n, t - 1.0)
+
+    label_statistic = np.array([0.10, 0.11, 0.12, 0.50, 0.51, 0.52])
+    labels = np.array([False, False, False, True, True, True])  # cut exactly at the largest gap
+
+    desc = describe_threshold(
+        t, obs_left, obs_right, null_left, null_right, labels=labels, label_statistic=label_statistic
+    )
+    cut_entry = desc.mixture["falsifiers"]["cut_not_at_largest_gap"]
+    assert cut_entry["value"] is False
+    assert cut_entry["cut_between"] == pytest.approx([0.12, 0.50])
+
+
+def test_gap_falsifiers_skipped_when_label_statistic_is_none() -> None:
+    n = 6
+    t = 1.0
+    V_values = [2] * 6
+    null_left, null_right = _null_with_exact_V(V_values, n_cols=n, t=t)
+    obs_left = np.full(n, t - 1.0)
+    obs_right = np.full(n, t - 1.0)
+    labels = np.array([False, False, False, True, True, True])
+
+    desc = describe_threshold(t, obs_left, obs_right, null_left, null_right, labels=labels)
+    falsifiers = desc.mixture["falsifiers"]
+    assert falsifiers["gap_not_dominant"]["value"] is None
+    assert isinstance(falsifiers["gap_not_dominant"]["skipped"], str)
+    assert falsifiers["cut_not_at_largest_gap"]["value"] is None
+    assert isinstance(falsifiers["cut_not_at_largest_gap"]["skipped"], str)
+
+
+def test_gap_ratio_threshold_is_honoured() -> None:
+    """A gap_ratio of 1.5 is 'not dominant' at the default threshold (2.0)
+    but 'dominant' once the threshold is lowered below 1.5."""
+    n = 4
+    t = 1.0
+    V_values = [2] * 4
+    null_left, null_right = _null_with_exact_V(V_values, n_cols=n, t=t)
+    obs_left = np.full(n, t - 1.0)
+    obs_right = np.full(n, t - 1.0)
+
+    # Sorted diffs: [2, 2, 3] -> largest=3, second_largest=2, gap_ratio=1.5.
+    label_statistic = np.array([0.0, 2.0, 4.0, 7.0])
+    labels = np.array([False, False, True, True])
+
+    desc_default = describe_threshold(
+        t, obs_left, obs_right, null_left, null_right, labels=labels, label_statistic=label_statistic
+    )
+    desc_lowered = describe_threshold(
+        t, obs_left, obs_right, null_left, null_right,
+        labels=labels, label_statistic=label_statistic, gap_ratio_threshold=1.0,
+    )
+    assert desc_default.mixture["falsifiers"]["gap_not_dominant"]["gap_ratio"] == pytest.approx(1.5)
+    assert desc_default.mixture["falsifiers"]["gap_not_dominant"]["value"] is True
+    assert desc_lowered.mixture["falsifiers"]["gap_not_dominant"]["value"] is False
 
 
 def test_group_composition_uneven_groups() -> None:
