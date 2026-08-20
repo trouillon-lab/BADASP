@@ -1005,3 +1005,303 @@ def test_thresholds_json_serializable_with_comparison_null(tmp_path):
     parsed = json.loads((out_dir / "thresholds.json").read_text())
     _assert_json_primitive(parsed)
     assert "comparison" in parsed["error_profile"]
+
+
+# ---------------------------------------------------------------------------
+# --quantile-method: making the percentile-to-threshold convention explicit
+# ---------------------------------------------------------------------------
+#
+# "Call the top P fraction" does not name a threshold on its own. np.quantile
+# offers several methods for turning a probability into a value, and they
+# disagree whenever the requested probability falls between two neighbouring
+# order statistics of the observed split statistic (two adjacent values in the
+# sorted list of per-test statistics), which is the ordinary case when
+# P * n_scorable is not a whole number. These tests pin the flag's behaviour
+# and, crucially, pin the default to numpy's own default so the runs made
+# before the flag existed are still reproducible.
+
+_QM_COMMON_ARGS = [
+    "--target-fdr", "0.01", "--fdp-quantile", "0.95", "--conditioning", "none",
+    "--min-clade-filter", "250", "--error-profile-calls", "5,20,50",
+    "--bootstrap-resamples", "50",
+]
+
+
+def _qm_stratum_statistic(obs_path: Path, min_clade: int) -> np.ndarray:
+    """The finite within-stratum split statistics the script itself resolves
+    the operating point on, obtained through the script's own loader and
+    split-statistic helper rather than re-derived here.
+    """
+    obs_left, obs_right, keys = cst.load_observed_scores(obs_path)
+    mask = np.minimum(
+        keys["clade_size_left"].to_numpy(dtype=float),
+        keys["clade_size_right"].to_numpy(dtype=float),
+    ) >= min_clade
+    stat = cst._split_statistic(obs_left, obs_right)[mask]
+    return stat[np.isfinite(stat)]
+
+
+def _qm_drop_timestamps(obj):
+    """A JSON structure with every 'generated' wall-clock stamp removed, so
+    two runs of the same command can be compared for equality of content.
+    """
+    if isinstance(obj, dict):
+        return {k: _qm_drop_timestamps(v) for k, v in obj.items() if k != "generated"}
+    if isinstance(obj, list):
+        return [_qm_drop_timestamps(v) for v in obj]
+    return obj
+
+
+def test_quantile_method_unknown_rejected_naming_accepted_set(tmp_path):
+    obs_path, run_dir = _build_fixture(tmp_path, n=300, R=15, plant=False)
+    out_dir = tmp_path / "calib_bad_qm"
+    with pytest.raises(SystemExit) as excinfo:
+        cst.main([
+            "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+            "--out-dir", str(out_dir), "--quantile-method", "not_a_method",
+        ])
+    message = str(excinfo.value)
+    assert "not_a_method" in message
+    # the error must name the accepted set, not just say "invalid"
+    for accepted in cst.accepted_quantile_methods():
+        assert accepted in message
+    assert cst.DEFAULT_QUANTILE_METHOD in message
+
+
+def test_quantile_method_changes_threshold_and_call_count(tmp_path):
+    """Two methods that genuinely differ must move both t and O, on a fixture
+    where the requested percentile lands between two order statistics.
+
+    pct=0.1 over the 153-row stratum asks for 15.3 tests, i.e. a fraction
+    that cannot be met exactly by any integer number of calls, so the
+    conversion has a real free choice in it.
+    """
+    obs_path, run_dir = _build_fixture(tmp_path, n=600, R=15, plant=False)
+    pct = 0.1
+    finite_stratum = _qm_stratum_statistic(obs_path, 250)
+    n_scorable = int(finite_stratum.size)
+    # the premise of the test: the requested percentile is not on a data point
+    assert not float(pct * n_scorable).is_integer()
+
+    results = {}
+    for method in ("linear", "lower"):
+        out_dir = tmp_path / f"calib_qm_{method}"
+        rc = cst.main([
+            "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+            "--out-dir", str(out_dir), "--operating-point", f"pct:{pct}",
+            "--quantile-method", method, *_QM_COMMON_ARGS,
+        ])
+        assert rc == 0
+        op = json.loads((out_dir / "thresholds.json").read_text())["error_profile"]["operating_point"]
+        assert op["quantile_method"] == method
+        results[method] = (op["t"], op["O"])
+
+        # each run's own t and O are exactly what np.quantile with that
+        # method gives on the same within-stratum statistics
+        expected_t = float(np.quantile(finite_stratum, 1.0 - pct, method=method))
+        assert op["t"] == pytest.approx(expected_t, rel=1e-12)
+        assert op["O"] == int(np.sum(finite_stratum >= expected_t))
+
+    (t_linear, O_linear), (t_lower, O_lower) = results["linear"], results["lower"]
+    assert t_linear != t_lower
+    assert O_linear != O_lower
+
+
+def test_quantile_method_recorded_in_thresholds_json(tmp_path):
+    """The convention must be readable off the JSON alone, together with a
+    note saying it is a convention and what it costs.
+    """
+    obs_path, run_dir = _build_fixture(tmp_path, n=600, R=15, plant=False)
+    out_dir = tmp_path / "calib_qm_recorded"
+    rc = cst.main([
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--out-dir", str(out_dir), "--operating-point", "pct:0.1",
+        *_QM_COMMON_ARGS,
+    ])
+    assert rc == 0
+    op = json.loads((out_dir / "thresholds.json").read_text())["error_profile"]["operating_point"]
+    assert op["quantile_method"] == cst.DEFAULT_QUANTILE_METHOD
+    note = op["quantile_method_note"]
+    assert "convention-dependent" in note
+    assert "--quantile-method" in note
+    assert cst.DEFAULT_QUANTILE_METHOD in note
+    # the note must state the arithmetic that makes this bite, and that the
+    # call count can move, so a reader with only the JSON can see the risk
+    assert "n_scorable_in_stratum" in note
+    assert "not a whole number" in note
+    assert "order statistic" in note
+
+
+def test_quantile_method_default_matches_pre_flag_behaviour(tmp_path):
+    """The no-flag invariant: omitting --quantile-method must reproduce the
+    behaviour from before the flag existed -- a bare
+    ``np.quantile(finite_stratum, 1 - pct)`` call with no method argument --
+    and must differ from an explicit ``--quantile-method linear`` run in no
+    output file at all.
+    """
+    obs_path, run_dir = _build_fixture(tmp_path, n=600, R=15, plant=False)
+    pct = 0.1
+    finite_stratum = _qm_stratum_statistic(obs_path, 250)
+    # the pre-change call, verbatim: numpy's default method, unnamed
+    expected_t = float(np.quantile(finite_stratum, 1.0 - pct))
+    expected_O = int(np.sum(finite_stratum >= expected_t))
+
+    out_default = tmp_path / "calib_qm_default"
+    out_explicit = tmp_path / "calib_qm_explicit"
+    base = [
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--operating-point", f"pct:{pct}", *_QM_COMMON_ARGS,
+    ]
+    assert cst.main(base + ["--out-dir", str(out_default)]) == 0
+    assert cst.main(base + ["--out-dir", str(out_explicit),
+                            "--quantile-method", "linear"]) == 0
+
+    default_json = json.loads((out_default / "thresholds.json").read_text())
+    op = default_json["error_profile"]["operating_point"]
+    assert op["t"] == pytest.approx(expected_t, rel=1e-12)
+    assert op["O"] == expected_O
+    assert op["quantile_method"] == "linear"
+
+    # every written file is the same with and without the flag: CSVs byte for
+    # byte, JSONs after dropping the wall-clock 'generated' stamp (which
+    # differs between any two runs, flag or no flag)
+    default_files = sorted(p.name for p in out_default.iterdir() if p.is_file())
+    explicit_files = sorted(p.name for p in out_explicit.iterdir() if p.is_file())
+    assert default_files == explicit_files
+    assert "thresholds.json" in default_files  # the comparison must not be vacuous
+    for name in default_files:
+        left, right = out_default / name, out_explicit / name
+        if name.endswith(".json"):
+            assert _qm_drop_timestamps(json.loads(left.read_text())) == \
+                   _qm_drop_timestamps(json.loads(right.read_text())), name
+        else:
+            assert left.read_bytes() == right.read_bytes(), name
+
+    # and the only fields the flag introduced are the two recorded ones: every
+    # other key of the operating_point block is one that predates it
+    pre_flag_keys = {"raw", "form", "percentile", "t", "O", "scope", "note"}
+    assert set(op) == pre_flag_keys | {"quantile_method", "quantile_method_note"}
+
+
+# ---------------------------------------------------------------------------
+# --quantile-method reaching describe_threshold_curve / error_profile_curve.csv
+# ---------------------------------------------------------------------------
+#
+# A prior fix threaded --quantile-method through the --operating-point
+# resolution (the tests above) but missed describe_threshold_curve, the
+# function behind error_profile_curve.csv. That gap meant a run could report
+# one quantile convention in thresholds.json while error_profile_curve.csv
+# was silently produced under a different, hardcoded one (numpy's bare
+# default) -- two out of two files in the same --out-dir carrying two
+# different percentile-to-threshold conventions with nothing to distinguish
+# them. These tests pin that the flag now reaches the curve file too.
+
+
+def test_error_profile_curve_differs_between_quantile_methods_end_to_end(tmp_path):
+    """The regression test for the bug: two runs differing ONLY in
+    --quantile-method (linear vs hazen) must produce genuinely different
+    error_profile_curve.csv content, not a byte-identical file with only
+    thresholds.json's recorded method differing.
+
+    The observed scores are continuous (rng.normal, no ties), so for any
+    call-count anchor the requested probability 1 - target/n_scorable has
+    essentially zero chance of landing exactly on an order statistic --
+    'linear' and 'hazen' (a different interpolation convention) are
+    therefore expected to disagree at every anchor, not just one.
+    """
+    obs_path, run_dir = _build_fixture(tmp_path, n=600, R=15, plant=False)
+
+    curves = {}
+    for method in ("linear", "hazen"):
+        out_dir = tmp_path / f"calib_curve_{method}"
+        rc = cst.main([
+            "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+            "--out-dir", str(out_dir), "--operating-point", "pct:0.1",
+            "--quantile-method", method, *_QM_COMMON_ARGS,
+        ])
+        assert rc == 0
+        curve_path = out_dir / "error_profile_curve.csv"
+        assert curve_path.exists()
+        curves[method] = pd.read_csv(curve_path)
+
+    linear_df, hazen_df = curves["linear"], curves["hazen"]
+
+    # Same anchors requested in both runs (a precondition for a meaningful
+    # comparison, not the thing under test).
+    assert list(linear_df["target_calls"]) == list(hazen_df["target_calls"])
+    assert len(linear_df) > 0
+
+    # Each file must self-report the method that produced it.
+    assert (linear_df["quantile_method"] == "linear").all()
+    assert (hazen_df["quantile_method"] == "hazen").all()
+
+    # The bug: these two files must NOT be byte-identical, and specifically
+    # the "t" (and, downstream of t, "O") columns -- not just the method
+    # label -- must differ.
+    linear_bytes = (tmp_path / "calib_curve_linear" / "error_profile_curve.csv").read_bytes()
+    hazen_bytes = (tmp_path / "calib_curve_hazen" / "error_profile_curve.csv").read_bytes()
+    assert linear_bytes != hazen_bytes
+
+    t_differs = ~np.isclose(linear_df["t"].to_numpy(), hazen_df["t"].to_numpy())
+    assert t_differs.any(), "linear and hazen must disagree on t for at least one anchor"
+
+    # Cross-check against the exact conversion the script performs: t at each
+    # anchor is np.quantile of the script's own within-stratum finite split
+    # statistic, at probability 1 - target_calls / n_scorable, under the
+    # named method.
+    finite_stratum = _qm_stratum_statistic(obs_path, 250)
+    n_scorable = finite_stratum.size
+    for df, method in ((linear_df, "linear"), (hazen_df, "hazen")):
+        for target, t in zip(df["target_calls"], df["t"]):
+            expected_t = float(np.quantile(finite_stratum, 1.0 - target / n_scorable, method=method))
+            assert t == pytest.approx(expected_t, rel=1e-12)
+
+
+def test_error_profile_curve_default_path_matches_pre_flag_quantile_and_adds_only_the_new_column(tmp_path):
+    """The default-path invariant for the curve file, mirroring
+    test_quantile_method_default_matches_pre_flag_behaviour above but for
+    error_profile_curve.csv specifically (the file the original fix missed).
+
+    Before --quantile-method existed, describe_threshold_curve's t at each
+    anchor came from a bare ``np.quantile(finite_obs, 1 - target/n, )`` call
+    with no method argument -- i.e. whatever numpy's own default resolves
+    to. A run made today with no --quantile-method flag must reproduce
+    those exact t/O values; the only change introduced by the fix is the
+    new constant 'quantile_method' column.
+    """
+    obs_path, run_dir = _build_fixture(tmp_path, n=600, R=15, plant=False)
+    out_dir = tmp_path / "calib_curve_default"
+    rc = cst.main([
+        "--null-run-dir", str(run_dir), "--observed-scores", str(obs_path),
+        "--out-dir", str(out_dir), "--operating-point", "pct:0.1",
+        *_QM_COMMON_ARGS,
+    ])
+    assert rc == 0
+    curve_df = pd.read_csv(out_dir / "error_profile_curve.csv")
+
+    # The new column is present and constant, recording numpy's own default.
+    assert "quantile_method" in curve_df.columns
+    assert (curve_df["quantile_method"] == cst.DEFAULT_QUANTILE_METHOD).all()
+    assert cst.DEFAULT_QUANTILE_METHOD == "linear"
+
+    # Every other column is exactly what the pre-flag bare np.quantile call
+    # (no method= argument at all) would have produced -- the ground truth
+    # this fix must not disturb.
+    finite_stratum = _qm_stratum_statistic(obs_path, 250)
+    n_scorable = finite_stratum.size
+    for target, t, O in zip(curve_df["target_calls"], curve_df["t"], curve_df["O"]):
+        expected_t = float(np.quantile(finite_stratum, 1.0 - target / n_scorable))  # bare call, pre-flag behaviour
+        assert t == pytest.approx(expected_t, rel=1e-12)
+        assert O == int(np.sum(finite_stratum >= expected_t))
+
+    # The column set is exactly the pre-flag set plus the one new column.
+    # main() always calls describe_threshold_curve with labels= set (the
+    # elevated-p_AC labels), so the mixture columns are part of the pre-flag
+    # set too -- only 'quantile_method' is new.
+    pre_flag_columns = {
+        "target_calls", "t", "O", "E_fp", "E_fp_over_O", "O_over_E_fp",
+        "fdp_median", "fdp_min", "fdp_max", "mc_pvalue", "n_ge_observed",
+        "pi_hat", "fdp_at_pi_hat", "fdp_at_pi_low", "fdp_at_pi_high",
+    }
+    fdp_q_columns = {c for c in curve_df.columns if c.startswith("fdp_q") and c != "fdp_quantile"}
+    assert set(curve_df.columns) == pre_flag_columns | fdp_q_columns | {"quantile_method"}

@@ -77,6 +77,30 @@ DEFAULT_ERROR_PROFILE_CALLS = (51, 81, 240, 500, 795, 1500, 2023)
 # reporting-floor choice, not a value derived from any particular dataset.
 MIN_SCORABLE_TESTS_IN_STRATUM = 100
 
+# Convention used to turn a requested percentile into a threshold. "The top
+# P fraction" does not name a threshold on its own: np.quantile implements
+# several methods for converting a probability into a value, and they return
+# different values whenever the requested probability falls between two
+# neighbouring order statistics (two adjacent values in the sorted list of
+# per-test split statistics), which is the ordinary case when P * n_scorable
+# is not a whole number. 'linear' is numpy's own default, so it is what any
+# run that did not name a method used; it is the default here for exactly
+# that reason, and it is written into the output so the convention is
+# recorded rather than left implicit.
+DEFAULT_QUANTILE_METHOD = "linear"
+
+# Candidate method names, taken from np.quantile's public documentation (the
+# nine Hyndman-Fan methods plus the four older discontinuous aliases). This
+# list is used only to build error/help text: whether a given name is
+# actually usable is decided by asking the installed numpy itself (see
+# accepted_quantile_methods / validate_quantile_method), never by this list.
+QUANTILE_METHOD_CANDIDATES = (
+    "inverted_cdf", "averaged_inverted_cdf", "closest_observation",
+    "interpolated_inverted_cdf", "hazen", "weibull", "linear",
+    "median_unbiased", "normal_unbiased",
+    "lower", "higher", "midpoint", "nearest",
+)
+
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -455,6 +479,111 @@ def parse_operating_point_spec(raw: str) -> Tuple[str, float]:
         f"--operating-point {raw!r} not understood; accepted forms are "
         f"{_OPERATING_POINT_FORMS}."
     )
+
+
+def accepted_quantile_methods() -> Tuple[str, ...]:
+    """The subset of QUANTILE_METHOD_CANDIDATES that np.quantile accepts in
+    this environment, established by trying each one on a tiny probe array
+    rather than by assuming anything about the installed numpy version.
+    """
+    probe = np.array([0.0, 1.0, 2.0])
+    usable = []
+    for method in QUANTILE_METHOD_CANDIDATES:
+        try:
+            np.quantile(probe, 0.5, method=method)
+        except Exception:
+            continue
+        usable.append(method)
+    return tuple(usable)
+
+
+def validate_quantile_method(method: str) -> str:
+    """Accept exactly what np.quantile accepts here, by handing the name to
+    np.quantile on a probe array; anything it refuses becomes a SystemExit
+    naming the accepted set. Returns the method unchanged when usable.
+    """
+    probe = np.array([0.0, 1.0, 2.0])
+    try:
+        np.quantile(probe, 0.5, method=method)
+    except Exception:
+        raise SystemExit(
+            f"--quantile-method {method!r} is not a quantile method "
+            f"np.quantile accepts in this environment (numpy "
+            f"{np.__version__}); accepted values are: "
+            f"{', '.join(accepted_quantile_methods())}. The default, "
+            f"{DEFAULT_QUANTILE_METHOD!r}, is numpy's own default."
+        )
+    return method
+
+
+def quantile_method_note(op_kind: str, op_value: float, method: str, n_scorable: int) -> str:
+    """Text for error_profile['operating_point']['quantile_method_note'].
+
+    Written so that a reader holding only thresholds.json -- no code, no
+    command line -- can see that the percentile-to-threshold step had a free
+    choice in it, which choice this run made, and how far the reported call
+    count could move had the other choice been made.
+    """
+    default_clause = (
+        "numpy's own default"
+        if method == DEFAULT_QUANTILE_METHOD
+        else f"NOT numpy's default, which is {DEFAULT_QUANTILE_METHOD!r}"
+    )
+    common = (
+        "Turning a requested percentile into the threshold t is "
+        "convention-dependent. np.quantile implements several methods "
+        "(settable with --quantile-method; the one used is recorded in "
+        "'quantile_method' next to this note) and they return different "
+        "values whenever the requested probability falls between two "
+        "neighbouring order statistics of the observed split statistic -- "
+        "that is, between two adjacent values in the sorted list of "
+        "per-test split statistics in this stratum. Since a split is called "
+        "when its statistic is >= t, sliding t between two adjacent order "
+        "statistics moves O (the number of called splits) by about one: a "
+        "split can enter or leave the reported call set from this choice "
+        f"alone, with no change to the data. This run used method={method!r} "
+        f"({default_clause}). The same method is also used for the "
+        "describe_threshold_curve anchors in error_profile_curve.csv "
+        "(recorded there in its own constant 'quantile_method' column), so "
+        "the operating point above and every curve row were resolved under "
+        "one consistent convention, not two silently different ones."
+    )
+    if op_kind == "pct":
+        product = op_value * n_scorable
+        exact = float(product).is_integer()
+        landing = (
+            "lands exactly on an order statistic, so the methods agree here "
+            "up to their differing treatment of that exact rank"
+            if exact
+            else "lands strictly between two order statistics, so the methods "
+                 "need not agree and the resolved t and O depend on which one "
+                 "is used"
+        )
+        specific = (
+            f"For this run the requested fraction {op_value!r} times "
+            f"n_scorable_in_stratum={n_scorable} is {product!r}, which is "
+            + ("a whole number" if exact else "not a whole number")
+            + f"; the requested percentile therefore {landing}."
+        )
+    elif op_kind == "calls":
+        n_calls = int(op_value)
+        specific = (
+            f"For this run the operating point was given as calls:{n_calls}, "
+            f"so t is the quantile at probability 1 - {n_calls}/{n_scorable} "
+            "of the same statistic. That probability likewise need not land "
+            "on an order statistic, so t -- and the achieved O, which is not "
+            "guaranteed to equal the requested call count -- is "
+            "convention-dependent in the same way."
+        )
+    else:
+        return (
+            "form='t': the threshold was supplied directly as a number, so no "
+            "percentile-to-threshold conversion was performed and "
+            f"'quantile_method' ({method!r}) did not affect t or O for this "
+            "run. It is recorded only to document what the run would have "
+            "used had a percentile been requested."
+        )
+    return common + " " + specific
 
 
 def check_observed_scores_consistency(observed_scores: Path, manifest: Optional[dict]) -> Optional[str]:
@@ -1173,6 +1302,30 @@ def parse_args(argv=None) -> argparse.Namespace:
              "otherwise skip when the FDP criterion finds no threshold.",
     )
     parser.add_argument(
+        "--quantile-method", type=str, default=DEFAULT_QUANTILE_METHOD,
+        help="numpy quantile method used to convert a requested percentile "
+             "into a threshold t, at every site in this script that does so: "
+             "--operating-point's 'pct:<float>' form and the quantile its "
+             "'calls:<int>' form derives (both for the primary stratum and, "
+             "under --conditioning cell, the global_rule_baseline raw-scale "
+             "recomputation), and the describe_threshold_curve anchors "
+             "written to error_profile_curve.csv. Handed straight to "
+             "np.quantile(method=...). Accepted values are whatever "
+             "np.quantile accepts in this environment "
+             f"({', '.join(accepted_quantile_methods())}); anything else "
+             f"exits with that list. Default {DEFAULT_QUANTILE_METHOD!r}, "
+             "which is numpy's own default and therefore the convention used "
+             "by any earlier run that did not name a method. This is not a "
+             "cosmetic choice: 'the top P fraction' does not name a threshold "
+             "on its own, and when P * n_scorable is not a whole number the "
+             "methods resolve to different t and the call count can move by "
+             "about +/-1. The value used is recorded in "
+             "error_profile['operating_point']['quantile_method'] (with the "
+             "consequence spelled out in the neighbouring "
+             "'quantile_method_note') and, for the curve, in the constant "
+             "'quantile_method' column of error_profile_curve.csv.",
+    )
+    parser.add_argument(
         "--min-clade-filter", type=int, default=None,
         help="Restrict the --operating-point error-profile report to tests "
              "where min(clade_size_left, clade_size_right) >= N, using the "
@@ -1262,6 +1415,10 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    # Validated unconditionally (not only when --operating-point is given) so
+    # an unusable method name fails immediately instead of surviving to the
+    # one code path that would have used it.
+    validate_quantile_method(args.quantile_method)
     if args.comparison_null_run_dir is not None and args.operating_point is None:
         raise SystemExit(
             "--comparison-null-run-dir requires --operating-point: the "
@@ -1445,7 +1602,7 @@ def main(argv=None) -> int:
                 )
             n_calls = int(op_value)
             frac = n_calls / finite_stratum.size
-            op_t = float(np.quantile(finite_stratum, 1.0 - frac))
+            op_t = float(np.quantile(finite_stratum, 1.0 - frac, method=args.quantile_method))
         elif op_kind == "pct":
             if finite_stratum.size == 0:
                 raise SystemExit(
@@ -1453,7 +1610,7 @@ def main(argv=None) -> int:
                     "observed split statistic in the stratum; none are "
                     "finite here."
                 )
-            op_t = float(np.quantile(finite_stratum, 1.0 - op_value))
+            op_t = float(np.quantile(finite_stratum, 1.0 - op_value, method=args.quantile_method))
         else:  # "t"
             op_t = float(op_value)
         op_O = int(np.sum(finite_stratum >= op_t))
@@ -1546,6 +1703,10 @@ def main(argv=None) -> int:
                 "raw": args.operating_point,
                 "form": op_kind,
                 "percentile": op_value if op_kind == "pct" else None,
+                "quantile_method": args.quantile_method,
+                "quantile_method_note": quantile_method_note(
+                    op_kind, op_value, args.quantile_method, n_scorable_in_stratum
+                ),
                 "t": op_t,
                 "O": op_O,
                 "scope": "stratum" if stratum_active else "all_tests",
@@ -1674,9 +1835,17 @@ def main(argv=None) -> int:
         curve_df = describe_threshold_curve(
             stat_left_s, stat_right_s, null_stat_left_s, null_stat_right_s,
             call_counts=curve_calls,
+            quantile_method=args.quantile_method,
             labels=elevated_labels, label_statistic=per_rep_p_ac_minus1,
             groups=groups_arr, fdp_quantile=args.fdp_quantile,
         )
+        # Recorded as a constant column (rather than only in thresholds.json)
+        # so error_profile_curve.csv is self-describing on its own: each
+        # target_calls' t/O above was derived via
+        # np.quantile(..., method=quantile_method), and a reader comparing
+        # two curve files does not have to also open thresholds.json to know
+        # whether they used the same percentile-to-threshold convention.
+        curve_df["quantile_method"] = args.quantile_method
         if comp_stat_left_s is not None:
             # Each anchor's threshold is derived purely from the primary
             # (observed) split statistic by describe_threshold_curve above,
@@ -1710,10 +1879,11 @@ def main(argv=None) -> int:
             obs_stat_raw = _split_statistic(obs_left_s, obs_right_s)
             finite_raw = obs_stat_raw[np.isfinite(obs_stat_raw)]
             if op_kind == "calls" and finite_raw.size > 0:
-                op_t_raw = float(np.quantile(finite_raw, 1.0 - (int(op_value) / finite_raw.size)))
+                op_t_raw = float(np.quantile(finite_raw, 1.0 - (int(op_value) / finite_raw.size),
+                                             method=args.quantile_method))
                 raw_note = None
             elif op_kind == "pct" and finite_raw.size > 0:
-                op_t_raw = float(np.quantile(finite_raw, 1.0 - op_value))
+                op_t_raw = float(np.quantile(finite_raw, 1.0 - op_value, method=args.quantile_method))
                 raw_note = None
             else:
                 op_t_raw = op_t
@@ -1727,7 +1897,9 @@ def main(argv=None) -> int:
                 )
             op_O_raw = int(np.sum(finite_raw >= op_t_raw)) if finite_raw.size else 0
             baseline_profile = {
-                "operating_point": {"raw": args.operating_point, "t": op_t_raw, "O": op_O_raw},
+                "operating_point": {"raw": args.operating_point,
+                                    "quantile_method": args.quantile_method,
+                                    "t": op_t_raw, "O": op_O_raw},
                 "selection_rule": selection_rule,
                 "description": _describe_at(op_t_raw, obs_left_s, obs_right_s, null_left_s, null_right_s, groups_arr),
                 "description_cluster_bootstrap": _describe_cluster_at(

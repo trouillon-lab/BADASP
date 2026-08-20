@@ -1105,6 +1105,25 @@ def describe_threshold(
     )
 
 
+def _validate_quantile_method(method: str) -> None:
+    """Confirm that `method` is a value the installed numpy's `np.quantile`
+    accepts, by trying it on a tiny probe array rather than hardcoding a
+    list of method names (the accepted set is a numpy-version detail, not
+    something this module should assume). Mirrors the probe-based check in
+    `scripts/calibrate_switch_threshold.py`'s `validate_quantile_method`,
+    except this one is called from a library function, so it raises
+    `ValueError` instead of exiting the process.
+    """
+    probe = np.array([0.0, 1.0, 2.0])
+    try:
+        np.quantile(probe, 0.5, method=method)
+    except Exception as exc:
+        raise ValueError(
+            f"quantile_method {method!r} is not a quantile method "
+            f"np.quantile accepts in this environment (numpy {np.__version__})."
+        ) from exc
+
+
 def describe_threshold_curve(
     obs_left: np.ndarray,
     obs_right: np.ndarray,
@@ -1112,17 +1131,30 @@ def describe_threshold_curve(
     null_right: np.ndarray,
     *,
     call_counts: Iterable[int],
+    quantile_method: str = "linear",
     **kwargs: object,
 ) -> pd.DataFrame:
     """`describe_threshold` evaluated at a curve of externally chosen call counts.
 
     For each `target` in `call_counts`, a threshold is derived purely from
     the *observed* split statistic as
-    ``t = np.quantile(finite_obs, 1 - target / finite_obs.size)`` and passed
-    to `describe_threshold` unchanged (`target` never touches the null).
-    Because the observed statistic has ties and atoms, the resulting `O` at
-    that `t` is not guaranteed to equal `target` exactly — it is documented
-    here as an approximate correspondence, not an exact one.
+    ``t = np.quantile(finite_obs, 1 - target / finite_obs.size, method=quantile_method)``
+    and passed to `describe_threshold` unchanged (`target` never touches the
+    null). Because the observed statistic has ties and atoms, the resulting
+    `O` at that `t` is not guaranteed to equal `target` exactly — it is
+    documented here as an approximate correspondence, not an exact one.
+
+    Turning a requested percentile into a threshold is itself
+    convention-dependent: numpy implements several interpolation methods
+    for converting a probability into a value from a finite sample, and they
+    return different results whenever the requested probability falls
+    between two neighbouring order statistics (two adjacent values in the
+    sorted observed split statistic) — the ordinary case whenever
+    ``target / finite_obs.size`` is not an exact rank. `quantile_method`
+    selects which of those conventions is used here; the default,
+    ``"linear"``, is numpy's own default for `np.quantile`, so it matches
+    whatever any caller who does not pass this argument would have gotten
+    before this parameter existed.
 
     All keyword arguments accepted by `describe_threshold`
     (`labels`, `groups`, `fdp_quantile`, `ci_level`) may be passed through
@@ -1134,6 +1166,11 @@ def describe_threshold_curve(
     null_left, null_right : np.ndarray, shape (R, n)
     call_counts : Iterable[int]
         Target observed-call counts to evaluate a threshold at.
+    quantile_method : str, keyword-only, default "linear"
+        Method name forwarded to `np.quantile(..., method=quantile_method)`
+        when converting each `target` call count into a threshold. Must be
+        one of the method names the installed numpy's `np.quantile` accepts;
+        an unaccepted value raises `ValueError`.
     **kwargs
         Forwarded to `describe_threshold` (see its docstring).
 
@@ -1146,6 +1183,7 @@ def describe_threshold_curve(
     ``pi_hat, fdp_at_pi_hat, fdp_at_pi_low, fdp_at_pi_high`` when `labels`
     is among `kwargs`.
     """
+    _validate_quantile_method(quantile_method)
     obs_left = np.asarray(obs_left, dtype=np.float64)
     obs_right = np.asarray(obs_right, dtype=np.float64)
     obs_stat = _split_statistic(obs_left, obs_right)
@@ -1161,7 +1199,7 @@ def describe_threshold_curve(
         if finite_obs.size == 0:
             raise ValueError("All observed split statistics are NaN; cannot derive a threshold from call_counts.")
         frac = target / finite_obs.size
-        t = float(np.quantile(finite_obs, 1.0 - frac))
+        t = float(np.quantile(finite_obs, 1.0 - frac, method=quantile_method))
         desc = describe_threshold(t, obs_left, obs_right, null_left, null_right, **kwargs)
 
         row = {

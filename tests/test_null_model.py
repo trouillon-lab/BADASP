@@ -1089,3 +1089,83 @@ def test_bootstrap_off_by_default_leaves_other_fields_unchanged() -> None:
     ):
         assert getattr(baseline, field) == getattr(explicit_off, field)
     assert np.array_equal(baseline.V, explicit_off.V)
+
+
+# ---------------------------------------------------------------------------
+# describe_threshold_curve(quantile_method=...)
+# ---------------------------------------------------------------------------
+#
+# Turning a requested percentile into a threshold t is convention-dependent:
+# np.quantile offers several methods ("linear", "lower", ...) for turning a
+# probability into a value from a finite sample, and they disagree only when
+# the requested probability falls strictly between two neighbouring order
+# statistics (two adjacent values of the sorted finite observed split
+# statistic) -- not when it lands exactly on one of those values.
+
+
+def test_describe_threshold_curve_quantile_method_changes_t_between_order_statistics_and_agrees_on_data_point() -> None:
+    """Fixture: the finite observed split statistic is exactly 0..9 (n=10,
+    achieved via obs_left=0..9 and an obs_right far below every obs_left
+    value, so fmax(left, right) == obs_left with no ties).
+
+    At target_calls=5, the requested quantile probability is
+    1 - 5/10 = 0.5, and the 'linear' method's virtual index is
+    0.5 * (10 - 1) = 4.5 -- strictly between order statistics 4 and 5 -- so
+    'linear' and 'lower' must disagree there (4.5 vs 4.0).
+
+    At target_calls=0, the probability is 1.0, which lands exactly on the
+    maximum (index 9, an existing data point, no interpolation needed), so
+    every method must agree there (both give 9.0).
+    """
+    rng = np.random.default_rng(RNG_SEED + 900)
+    n = 10
+    obs_left = np.arange(n, dtype=np.float64)
+    obs_right = np.full(n, -100.0)
+    R = 5
+    null_left = rng.normal(0, 1, size=(R, n))
+    null_right = np.full((R, n), -100.0)
+
+    df_linear = describe_threshold_curve(
+        obs_left, obs_right, null_left, null_right,
+        call_counts=[0, 5], quantile_method="linear",
+    )
+    df_lower = describe_threshold_curve(
+        obs_left, obs_right, null_left, null_right,
+        call_counts=[0, 5], quantile_method="lower",
+    )
+
+    t_linear = dict(zip(df_linear["target_calls"], df_linear["t"]))
+    t_lower = dict(zip(df_lower["target_calls"], df_lower["t"]))
+
+    # Between two order statistics (target_calls=5): the conventions disagree.
+    assert t_linear[5] == pytest.approx(4.5)
+    assert t_lower[5] == pytest.approx(4.0)
+    assert t_linear[5] != t_lower[5]
+
+    # Exactly on a data point (target_calls=0, the maximum): they agree.
+    assert t_linear[0] == pytest.approx(9.0)
+    assert t_lower[0] == pytest.approx(9.0)
+    assert t_linear[0] == t_lower[0]
+
+    # The default (no quantile_method given) must match the explicit
+    # "linear" call -- numpy's own default is what any pre-existing caller
+    # that never named a method already got.
+    df_default = describe_threshold_curve(
+        obs_left, obs_right, null_left, null_right, call_counts=[0, 5],
+    )
+    assert list(df_default["t"]) == list(df_linear["t"])
+
+
+def test_describe_threshold_curve_invalid_quantile_method_raises_value_error() -> None:
+    rng = np.random.default_rng(RNG_SEED + 901)
+    n = 50
+    obs_left = rng.normal(0, 1, size=n)
+    obs_right = rng.normal(0, 1, size=n)
+    null_left = rng.normal(0, 1, size=(5, n))
+    null_right = rng.normal(0, 1, size=(5, n))
+
+    with pytest.raises(ValueError):
+        describe_threshold_curve(
+            obs_left, obs_right, null_left, null_right,
+            call_counts=[5], quantile_method="not_a_real_quantile_method",
+        )
